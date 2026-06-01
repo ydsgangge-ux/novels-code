@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+gangge_debug*.log
+
+# Project specific
+gangge_projects/
+.gangge/
+.gangge_data/
+
+# Desktop
+desktop/__pycache__/
+
+# Test / Coverage
+.pytest_cache/
+htmlcov/
+.coverage

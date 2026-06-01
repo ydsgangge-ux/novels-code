@@ -1,0 +1,95 @@
+{
+  "_comment": "Gangge Code MCP Server 配置文件，放在项目根目录的 .gangge/ 目录下",
+  "_doc": "transport 支持 stdio（本地进程）和 sse（远程HTTP）两种",
+
+  "servers": [
+
+    {
+      "_comment": "─── AutoCAD / 中望CAD / 浩辰CAD（Windows，需安装 multiCAD-mcp）───",
+      "name": "autocad",
+      "transport": "stdio",
+      "command": "node",
+      "args": ["C:/Users/你的用户名/AppData/Roaming/npm/node_modules/multicad-mcp/index.js"],
+      "env": {
+        "CAD_TYPE": "autocad"
+      },
+      "enabled": false,
+      "timeout": 60,
+      "_install": "npm install -g multicad-mcp",
+      "_supported_cad": ["AutoCAD 2020+", "ZWCAD 2022+", "GstarCAD 2022+", "BricsCAD V22+"]
+    },
+
+    {
+      "_comment": "─── FreeCAD（跨平台，开源）───",
+      "name": "freecad",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["/path/to/freecad-mcp/server.py"],
+      "env": {
+        "FREECAD_PATH": "C:/Program Files/FreeCAD 0.21/bin"
+      },
+      "enabled": false,
+      "timeout": 60,
+      "_install": "pip install freecad-mcp",
+      "_github": "https://github.com/nneshlur/freecad-mcp"
+    },
+
+    {
+      "_comment": "─── Fusion 360（需要 Autodesk 账号）───",
+      "name": "fusion360",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["/path/to/fusion360-mcp-server/main.py"],
+      "enabled": false,
+      "timeout": 90,
+      "_note": "需要先在 Fusion 360 里安装对应插件"
+    },
+
+    {
+      "_comment": "─── SolidWorks（Windows，需要 SolidWorks 许可证）───",
+      "name": "solidworks",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["/path/to/solidworks-mcp/server.py"],
+      "env": {
+        "SW_VERSION": "2024"
+      },
+      "enabled": false,
+      "timeout": 120,
+      "_github": "https://github.com/modelcontextprotocol/servers"
+    },
+
+    {
+      "_comment": "─── 通用 SSE 远程 MCP Server 示例（如部署在局域网服务器上）───",
+      "name": "remote_cad_server",
+      "transport": "sse",
+      "url": "http://192.168.1.100:3000/sse",
+      "enabled": false,
+      "timeout": 30,
+      "_note": "适合把 MCP Server 部署在有 CAD 软件的 Windows 机器上，Gangge 跑在 Mac/Linux"
+    },
+
+    {
+      "_comment": "─── CodeGraph 代码知识图谱（提供代码搜索、调用链追踪、影响分析）───",
+      "name": "codegraph",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@anthropic/codegraph", "serve", "--mcp"],
+      "env": {},
+      "enabled": false,
+      "timeout": 30,
+      "_install": "npm install -g @anthropic/codegraph",
+      "_tools": ["codegraph_search", "codegraph_context", "codegraph_trace", "codegraph_callers", "codegraph_callees", "codegraph_impact", "codegraph_node", "codegraph_explore", "codegraph_files", "codegraph_status"],
+      "_note": "先在项目目录运行 codegraph init 建立索引，然后启用此 MCP Server。对小说项目可索引世界观文件、角色配置等，提供语义搜索能力。"
+    }
+
+  ],
+
+  "_quick_start": {
+    "step1": "复制本文件到你的项目 .gangge/ 目录",
+    "step2": "把你要用的 server 的 enabled 改成 true",
+    "step3": "修改 command/args/env 里的路径",
+    "step4": "gangge '用 AutoCAD 画一个半径50的圆，圆心在100,100'",
+    "step5": "LLM 会自动调用 autocad__draw_circle 工具"
+  }
+}
