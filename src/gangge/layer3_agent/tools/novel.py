@@ -58,6 +58,52 @@ def _get_books_dir(workspace: str) -> Path:
     return Path(workspace) / "books"
 
 
+def _has_arcs(outline_path: Path) -> bool:
+    if not outline_path.exists():
+        return False
+    try:
+        data = json.loads(outline_path.read_text(encoding="utf-8"))
+        arcs = data.get("arcs", [])
+        return len(arcs) > 0
+    except Exception:
+        return False
+
+
+def _ensure_default_arc(sm, title: str = ""):
+    outline_path = sm.state_dir / "outline.json"
+    outline_data = {}
+    if outline_path.exists():
+        try:
+            outline_data = json.loads(outline_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    arcs = outline_data.get("arcs", [])
+    if arcs:
+        return
+
+    arc_name = f"{title}·第一篇" if title else "第一篇"
+    default_arc = {
+        "name": arc_name,
+        "order": 1,
+        "goal": "",
+        "summary": "",
+        "sequences": [],
+        "status": "pending",
+    }
+    arcs.append(default_arc)
+    outline_data["arcs"] = arcs
+    if "title" not in outline_data:
+        outline_data["title"] = title or ""
+        outline_data["logline"] = ""
+        outline_data["total_goal"] = ""
+    outline_path.parent.mkdir(parents=True, exist_ok=True)
+    outline_path.write_text(
+        json.dumps(outline_data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _ensure_setup(workspace: str, book_id: str, genre: str = "", title: str = "") -> SetupLoader | None:
     """确保 setup_state.json 存在。如果不存在，自动用模板初始化。"""
     sm = StateManager(workspace, book_id)
@@ -306,6 +352,12 @@ class NovelSetupTool(BaseTool):
             char_names = "、".join(c.name for c in project_state.characters.values())
             loc_count = len(project_state.locations)
             faction_count = len(project_state.factions)
+
+            outline_path = sm.state_dir / "outline.json"
+            if not outline_path.exists() or not _has_arcs(outline_path):
+                title = config_data.get("title", "我的小说")
+                _ensure_default_arc(sm, title)
+
             return ToolResult(
                 output=(
                     f"世界观配置完成！\n"
@@ -314,7 +366,8 @@ class NovelSetupTool(BaseTool):
                     f"  势力：{faction_count} 个\n"
                     f"  世界规则：{len(project_state.world_rules)} 条\n"
                     f"  种子事件：{len(project_state.seed_events)} 个\n\n"
-                    f"下一步：使用 novel_outline 生成故事大纲。"
+                    f"📌 已自动创建第一个篇章，请前往「篇章」Tab 查看。\n"
+                    f"选择篇章后点击「生成大纲」为该篇章生成3幕结构大纲。"
                 )
             )
         except FileNotFoundError as e:
@@ -443,8 +496,38 @@ class NovelOutlineTool(BaseTool):
                 encoding="utf-8",
             )
         else:
+            outline_data_existing = {}
+            if outline_path.exists():
+                try:
+                    outline_data_existing = json.loads(outline_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            arcs = outline_data_existing.get("arcs", [])
+            if arcs:
+                target_arc = None
+                for arc in arcs:
+                    if arc.get("status") in ("pending", ""):
+                        target_arc = arc
+                        break
+                if not target_arc:
+                    target_arc = arcs[0]
+                target_arc["sequences"] = [s if isinstance(s, dict) else s.model_dump() for s in outline.sequences]
+                target_arc["status"] = "outlined"
+                arc_name = target_arc.get("name", "")
+            else:
+                arc_name = f"{title}·第一篇" if title else "第一篇"
+                arcs.append({
+                    "name": arc_name,
+                    "order": 1,
+                    "sequences": [s if isinstance(s, dict) else s.model_dump() for s in outline.sequences],
+                    "status": "outlined",
+                })
+            outline_data_existing["arcs"] = arcs
+            outline_data_existing["title"] = outline.title
+            outline_data_existing["logline"] = outline.logline
+            outline_data_existing["total_goal"] = ""
             outline_path.write_text(
-                json.dumps(outline_data, ensure_ascii=False, indent=2),
+                json.dumps(outline_data_existing, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
@@ -457,12 +540,12 @@ class NovelOutlineTool(BaseTool):
 
         return ToolResult(
             output=(
-                f"{'篇章' + arc_name + '的' if arc_name else '故事'}大纲已生成！\n"
+                f"{'篇章「' + arc_name + '」的' if arc_name else '故事'}大纲已生成！\n"
                 f"  书名：{outline.title}\n"
                 f"  Logline：{outline.logline}\n"
                 f"  序列数：{len(outline.sequences)}\n\n"
                 f"序列概览：\n{seq_summary}\n\n"
-                f"下一步：确认大纲合理后，使用 novel_chapter_outlines 将序列展开为章纲。"
+                f"📌 请前往「大纲」Tab 查看大纲内容。确认合理后，在「篇章」Tab 点击「展开章纲」生成逐章章节大纲。"
             ),
             metadata={"book_id": book_id, "outline_id": outline.id, "arc_name": arc_name},
         )
@@ -547,8 +630,32 @@ class NovelChapterOutlinesTool(BaseTool):
                 except Exception:
                     pass
         else:
-            outline = StoryOutlineSchema.model_validate(outline_data)
-            sequences = outline.sequences
+            arcs = outline_data.get("arcs", [])
+            if arcs:
+                target_arc = None
+                for arc in arcs:
+                    if arc.get("status") == "outlined" and arc.get("sequences"):
+                        target_arc = arc
+                        break
+                if not target_arc:
+                    for arc in arcs:
+                        if arc.get("sequences"):
+                            target_arc = arc
+                            break
+                if target_arc:
+                    arc_name = target_arc.get("name", "")
+                    arc_seqs = target_arc.get("sequences", [])
+                    sequences = []
+                    for s in arc_seqs:
+                        try:
+                            sequences.append(SequenceSchema.model_validate(s))
+                        except Exception:
+                            pass
+                else:
+                    return ToolResult(output="所有篇章尚无序列，请先生成大纲", is_error=True)
+            else:
+                outline = StoryOutlineSchema.model_validate(outline_data)
+                sequences = outline.sequences
 
         protagonist = next(
             (c for c in loader.characters.values() if c.id == loader.config.protagonist_id),
@@ -599,9 +706,9 @@ class NovelChapterOutlinesTool(BaseTool):
 
         return ToolResult(
             output=(
-                f"章纲已生成！共 {len(all_outlines)} 章\n\n"
+                f"{'篇章「' + arc_name + '」的' if arc_name else ''}章纲已生成！共 {len(all_outlines)} 章\n\n"
                 f"{ch_summary}\n\n"
-                f"下一步：使用 novel_write_chapter 逐章写作。"
+                f"📌 请前往「章节」Tab 查看章纲。确认后使用 novel_write_chapter 逐章写作。"
             )
         )
 
@@ -735,7 +842,7 @@ class NovelNewArcTool(BaseTool):
                 f"  篇章概要：{new_arc_summary}\n"
                 f"  篇章目标：{new_arc_goal}\n"
                 f"  总目标：{total_goal}\n\n"
-                f"下一步：使用 novel_outline 为这个新篇章生成三幕结构大纲。"
+                f"📌 请前往「篇章」Tab 查看新篇章，选择后点击「生成大纲」为该篇章生成三幕结构大纲。"
             ),
             metadata={"book_id": book_id, "arc_id": arc_id},
         )
