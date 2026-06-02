@@ -886,6 +886,14 @@ class AgenticLoop:
                 completion_keywords = ["任务完成", "🎉", "全部完成", "已完成所有", "所有文件已创建"]
                 has_completion = any(kw in text for kw in completion_keywords)
 
+                wait_user_keywords = [
+                    "等待用户", "等你操作", "等你确认", "请先", "请手动",
+                    "请在", "需要你操作", "需要你确认", "等你", "请点击",
+                    "请前往", "请到", "请选择", "用户确认后", "确认后再",
+                    "不要生成大纲", "不要写正文", "到此为止",
+                ]
+                has_wait_user = any(kw in text for kw in wait_user_keywords)
+
                 # ── Allow long planning text without forcing retry ──
                 # When the LLM outputs a lengthy planning response (e.g., for a large file),
                 # one round of "thinking" is acceptable. Don't penalize it.
@@ -899,7 +907,9 @@ class AgenticLoop:
                 should_force_retry = False
                 force_reason = ""
 
-                if is_long_planning:
+                if has_wait_user:
+                    pass
+                elif is_long_planning:
                     pass
                 elif round_num <= 2 and not has_modified_files and not any_tool_succeeded:
                     should_force_retry = True
