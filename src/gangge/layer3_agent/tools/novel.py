@@ -2067,6 +2067,7 @@ class NovelEditTool(BaseTool):
                     "update_outline", "update_chapter_outline",
                     "update_location", "delete_location",
                     "update_faction", "delete_faction",
+                    "update_arc", "delete_arc",
                     "rewrite_chapter",
                 ],
                 "description": "编辑操作类型",
@@ -2120,6 +2121,10 @@ class NovelEditTool(BaseTool):
                 return self._update_faction(sm, data)
             elif edit_type == "delete_faction":
                 return self._delete_faction(sm, data)
+            elif edit_type == "update_arc":
+                return self._update_arc(sm, data)
+            elif edit_type == "delete_arc":
+                return self._delete_arc(sm, data)
             elif edit_type == "rewrite_chapter":
                 return self._rewrite_chapter(sm, data)
             else:
@@ -2385,6 +2390,56 @@ class NovelEditTool(BaseTool):
         setup_path.write_text(json.dumps(setup, ensure_ascii=False, indent=2), encoding="utf-8")
         removed = before - len(world["factions"])
         return ToolResult(output=f"已删除 {removed} 个势力：{faction_id}")
+
+    def _update_arc(self, sm: StateManager, data: dict) -> ToolResult:
+        arc_name = data.get("arc_name", "")
+        new_name = data.get("new_name", "")
+        if not arc_name:
+            return ToolResult(output="请提供 arc_name（要编辑的篇章名）", is_error=True)
+
+        outline_path = sm.state_dir / "outline_state.json"
+        if not outline_path.exists():
+            return ToolResult(output="大纲文件不存在", is_error=True)
+
+        outline = json.loads(outline_path.read_text(encoding="utf-8"))
+        arcs = outline.get("arcs", [])
+        updated = False
+        for arc in arcs:
+            if arc.get("name") == arc_name:
+                if new_name and new_name != arc_name:
+                    arc["name"] = new_name
+                if "arc_goal" in data:
+                    arc["goal"] = data["arc_goal"]
+                if "arc_summary" in data:
+                    arc["summary"] = data["arc_summary"]
+                updated = True
+                break
+
+        if not updated:
+            return ToolResult(output=f"未找到篇章：{arc_name}", is_error=True)
+
+        outline_path.write_text(json.dumps(outline, ensure_ascii=False, indent=2), encoding="utf-8")
+        return ToolResult(output=f"篇章「{arc_name}」已更新")
+
+    def _delete_arc(self, sm: StateManager, data: dict) -> ToolResult:
+        arc_name = data.get("arc_name", "")
+        if not arc_name:
+            return ToolResult(output="请提供 arc_name", is_error=True)
+
+        outline_path = sm.state_dir / "outline_state.json"
+        if not outline_path.exists():
+            return ToolResult(output="大纲文件不存在", is_error=True)
+
+        outline = json.loads(outline_path.read_text(encoding="utf-8"))
+        arcs = outline.get("arcs", [])
+        before = len(arcs)
+        outline["arcs"] = [a for a in arcs if a.get("name") != arc_name]
+        removed = before - len(outline["arcs"])
+        if removed == 0:
+            return ToolResult(output=f"未找到篇章：{arc_name}", is_error=True)
+
+        outline_path.write_text(json.dumps(outline, ensure_ascii=False, indent=2), encoding="utf-8")
+        return ToolResult(output=f"已删除篇章「{arc_name}」")
 
     def _rewrite_chapter(self, sm: StateManager, data: dict) -> ToolResult:
         ch_num = data.get("chapter_number", 0)
