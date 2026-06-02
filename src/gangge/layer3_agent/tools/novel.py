@@ -335,11 +335,13 @@ class NovelOutlineTool(BaseTool):
         "AI 基于 Dramatica 叙事理论自动生成三幕结构故事大纲。"
         "如果尚未配置世界观，会自动用模板初始化。"
         "生成的大纲包含多个序列，每个序列有叙事目标、戏剧功能、关键事件和结尾钩子。"
+        "如果提供 arc_name，则为指定篇章生成大纲并写入该篇章的 sequences 中。"
     )
     input_schema = {
         "type": "object",
         "properties": {
             "book_id": {"type": "string", "description": "书籍 ID"},
+            "arc_name": {"type": "string", "description": "篇章名称（可选），为指定篇章生成大纲"},
         },
         "required": ["book_id"],
     }
@@ -354,6 +356,7 @@ class NovelOutlineTool(BaseTool):
             return ToolResult(output=err, is_error=True)
 
         book_id = kwargs.get("book_id", "")
+        arc_name = kwargs.get("arc_name", "")
         if not book_id:
             return ToolResult(output="请提供 book_id", is_error=True)
 
@@ -406,10 +409,44 @@ class NovelOutlineTool(BaseTool):
         )
 
         outline_path = sm.state_dir / "outline.json"
-        outline_path.write_text(
-            json.dumps(outline.model_dump() if hasattr(outline, 'model_dump') else str(outline), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        outline_data = outline.model_dump() if hasattr(outline, 'model_dump') else {}
+
+        if arc_name:
+            outline_data_existing = {}
+            if outline_path.exists():
+                try:
+                    outline_data_existing = json.loads(outline_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            arcs = outline_data_existing.get("arcs", [])
+            found = False
+            for arc in arcs:
+                if arc.get("name") == arc_name:
+                    arc["sequences"] = [s if isinstance(s, dict) else s.model_dump() for s in outline.sequences]
+                    arc["status"] = "outlined"
+                    found = True
+                    break
+            if not found:
+                arcs.append({
+                    "name": arc_name,
+                    "order": len(arcs) + 1,
+                    "sequences": [s if isinstance(s, dict) else s.model_dump() for s in outline.sequences],
+                    "status": "outlined",
+                })
+            outline_data_existing["arcs"] = arcs
+            if "title" not in outline_data_existing:
+                outline_data_existing["title"] = outline.title
+                outline_data_existing["logline"] = outline.logline
+                outline_data_existing["total_goal"] = ""
+            outline_path.write_text(
+                json.dumps(outline_data_existing, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            outline_path.write_text(
+                json.dumps(outline_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
         seq_summary = "\n".join(
             f"  {i+1}. 序列{s.number}（第{s.act}幕）：{s.summary}\n"
@@ -420,14 +457,14 @@ class NovelOutlineTool(BaseTool):
 
         return ToolResult(
             output=(
-                f"故事大纲已生成！\n"
+                f"{'篇章' + arc_name + '的' if arc_name else '故事'}大纲已生成！\n"
                 f"  书名：{outline.title}\n"
                 f"  Logline：{outline.logline}\n"
                 f"  序列数：{len(outline.sequences)}\n\n"
                 f"序列概览：\n{seq_summary}\n\n"
-                f"下一步：使用 novel_chapter_outlines 将序列展开为章纲。"
+                f"下一步：确认大纲合理后，使用 novel_chapter_outlines 将序列展开为章纲。"
             ),
-            metadata={"book_id": book_id, "outline_id": outline.id},
+            metadata={"book_id": book_id, "outline_id": outline.id, "arc_name": arc_name},
         )
 
 
@@ -436,6 +473,7 @@ class NovelChapterOutlinesTool(BaseTool):
     description = (
         "将故事大纲的序列展开为逐章章纲。"
         "每个章纲包含：章节号、标题、摘要、节拍序列、情感弧线、必完任务。"
+        "如果提供 arc_name，则只展开指定篇章的序列。"
     )
     input_schema = {
         "type": "object",
@@ -444,6 +482,10 @@ class NovelChapterOutlinesTool(BaseTool):
             "sequence_index": {
                 "type": "integer",
                 "description": "要展开的序列索引（从0开始），不填则展开全部",
+            },
+            "arc_name": {
+                "type": "string",
+                "description": "篇章名称（可选），只展开指定篇章的序列",
             },
         },
         "required": ["book_id"],
@@ -460,6 +502,7 @@ class NovelChapterOutlinesTool(BaseTool):
 
         book_id = kwargs.get("book_id", "")
         seq_idx = kwargs.get("sequence_index", None)
+        arc_name = kwargs.get("arc_name", "")
         if not book_id:
             return ToolResult(output="请提供 book_id", is_error=True)
 
@@ -484,7 +527,28 @@ class NovelChapterOutlinesTool(BaseTool):
 
         outline_data = json.loads(outline_path.read_text(encoding="utf-8"))
         from gangge.dramatica.narrative import StoryOutlineSchema, SequenceSchema
-        outline = StoryOutlineSchema.model_validate(outline_data)
+
+        if arc_name:
+            arcs = outline_data.get("arcs", [])
+            target_arc = None
+            for arc in arcs:
+                if arc.get("name") == arc_name:
+                    target_arc = arc
+                    break
+            if not target_arc:
+                return ToolResult(output=f"未找到篇章：{arc_name}", is_error=True)
+            arc_seqs = target_arc.get("sequences", [])
+            if not arc_seqs:
+                return ToolResult(output=f"篇章「{arc_name}」尚无序列，请先生成大纲", is_error=True)
+            sequences = []
+            for s in arc_seqs:
+                try:
+                    sequences.append(SequenceSchema.model_validate(s))
+                except Exception:
+                    pass
+        else:
+            outline = StoryOutlineSchema.model_validate(outline_data)
+            sequences = outline.sequences
 
         protagonist = next(
             (c for c in loader.characters.values() if c.id == loader.config.protagonist_id),
@@ -496,7 +560,6 @@ class NovelChapterOutlinesTool(BaseTool):
             TruthFileKey.STORY_BIBLE,
         ])
 
-        sequences = outline.sequences
         if seq_idx is not None:
             if 0 <= seq_idx < len(sequences):
                 sequences = [sequences[seq_idx]]

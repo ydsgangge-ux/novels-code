@@ -1499,8 +1499,8 @@ class NovelRightPanel(QWidget):
 
         self._tabs.addTab(self._create_dashboard_tab(), "仪表盘")
         self._tabs.addTab(self._create_characters_tab(), "角色")
-        self._tabs.addTab(self._create_outline_tab(), "大纲")
         self._tabs.addTab(self._create_arcs_tab(), "篇章")
+        self._tabs.addTab(self._create_outline_tab(), "大纲")
         self._tabs.addTab(self._create_chapters_tab(), "章节")
         self._tabs.addTab(self._create_world_tab(), "世界观")
         self._tabs.addTab(self._create_tracking_tab(), "追踪")
@@ -1689,6 +1689,23 @@ class NovelRightPanel(QWidget):
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(6)
 
+        filter_row = QHBoxLayout()
+        filter_label = QLabel("篇章筛选：")
+        filter_label.setStyleSheet("color:#8b949e;font-size:11px;")
+        filter_row.addWidget(filter_label)
+        self._outline_arc_filter = QComboBox()
+        self._outline_arc_filter.addItem("全部篇章", "")
+        self._outline_arc_filter.setStyleSheet(
+            "QComboBox{background:#0d1117;border:1px solid #30363d;border-radius:4px;"
+            "color:#c9d1d9;padding:4px 8px;min-width:120px;}"
+            "QComboBox::drop-down{border:none;}"
+            "QComboBox QAbstractItemView{background:#161b22;color:#c9d1d9;selection-background-color:#1f6feb;}"
+        )
+        self._outline_arc_filter.currentIndexChanged.connect(self._refresh_outline)
+        filter_row.addWidget(self._outline_arc_filter)
+        filter_row.addStretch()
+        lay.addLayout(filter_row)
+
         self._outline_info = QLabel("尚未生成大纲")
         self._outline_info.setStyleSheet("color:#8b949e;font-size:11px;padding:4px;")
         lay.addWidget(self._outline_info)
@@ -1781,18 +1798,30 @@ class NovelRightPanel(QWidget):
         )
         btn_del.clicked.connect(self._delete_selected_arc)
         btn_row.addWidget(btn_del)
+
+        btn_row.addStretch()
+
+        btn_gen_outline = QPushButton("生成大纲")
+        btn_gen_outline.setStyleSheet(
+            "QPushButton{background:#da8b1a;border:none;border-radius:4px;"
+            "color:#fff;padding:4px 12px;font-weight:bold;font-size:11px;}"
+            "QPushButton:hover{background:#e6a030;}"
+        )
+        btn_gen_outline.setToolTip("为选中的篇章生成3幕结构大纲")
+        btn_gen_outline.clicked.connect(self._generate_arc_outline)
+        btn_row.addWidget(btn_gen_outline)
         btn_expand = QPushButton("展开章纲")
         btn_expand.setStyleSheet(
             "QPushButton{background:#8957e5;border:none;border-radius:4px;"
             "color:#fff;padding:4px 12px;font-size:11px;}"
             "QPushButton:hover{background:#a371f7;}"
         )
-        btn_expand.clicked.connect(lambda: self._emit_action("generate_chapter_outlines"))
+        btn_expand.setToolTip("为选中的篇章展开章节大纲（消耗较多Token）")
+        btn_expand.clicked.connect(self._expand_arc_chapter_outlines)
         btn_row.addWidget(btn_expand)
         btn = QPushButton("刷新")
         btn.clicked.connect(self._refresh_arcs)
         btn_row.addWidget(btn)
-        btn_row.addStretch()
         lay.addLayout(btn_row)
 
         self._arc_data_cache = []
@@ -2727,6 +2756,13 @@ class NovelRightPanel(QWidget):
         self._outline_info.setText("尚未生成大纲")
         if not self._workspace or not self._book_id:
             return
+
+        selected_arc = ""
+        if hasattr(self, '_outline_arc_filter'):
+            idx = self._outline_arc_filter.currentIndex()
+            if idx > 0:
+                selected_arc = self._outline_arc_filter.currentData() or ""
+
         outline_path = Path(self._workspace) / "books" / self._book_id / "state" / "outline.json"
         if not outline_path.exists():
             return
@@ -2736,13 +2772,41 @@ class NovelRightPanel(QWidget):
             info_parts = [f"<b>{data.get('title', '大纲')}</b> | Logline: {data.get('logline', '')}"]
             if total_goal:
                 info_parts.append(f" | 🎯 总目标: {total_goal}")
+            if selected_arc:
+                info_parts.append(f" | 📖 筛选: {selected_arc}")
             self._outline_info.setText("".join(info_parts))
+
+            if hasattr(self, '_outline_arc_filter'):
+                prev_arc = self._outline_arc_filter.currentData() or ""
+                self._outline_arc_filter.blockSignals(True)
+                self._outline_arc_filter.clear()
+                self._outline_arc_filter.addItem("全部篇章", "")
+                arcs = data.get("arcs", [])
+                for arc in arcs:
+                    arc_name = arc.get("name", "")
+                    self._outline_arc_filter.addItem(f"📖 {arc_name}", arc_name)
+                target_idx = 0
+                for i in range(self._outline_arc_filter.count()):
+                    if self._outline_arc_filter.itemData(i) == prev_arc:
+                        target_idx = i
+                        break
+                if selected_arc:
+                    for i in range(self._outline_arc_filter.count()):
+                        if self._outline_arc_filter.itemData(i) == selected_arc:
+                            target_idx = i
+                            break
+                self._outline_arc_filter.setCurrentIndex(target_idx)
+                self._outline_arc_filter.blockSignals(False)
 
             arcs = data.get("arcs", [])
             if arcs:
                 for arc in arcs:
                     arc_order = arc.get("order", "?")
                     arc_name = arc.get("name", f"篇{arc_order}")
+
+                    if selected_arc and arc_name != selected_arc:
+                        continue
+
                     arc_item = QTreeWidgetItem([
                         f"📖 {arc_name}",
                         "",
@@ -3092,6 +3156,43 @@ class NovelRightPanel(QWidget):
             cmd = f'novel_edit(book_id="{self._book_id}", edit_type="delete_arc", data={json.dumps({"arc_name": arc_name}, ensure_ascii=False)})'
             self._send_command(cmd)
             self._refresh_arcs()
+
+    def _generate_arc_outline(self):
+        row = self._arcs_table.currentRow()
+        if row < 0 or row >= len(self._arc_data_cache):
+            self._append_system_msg("⚠️ 请先选择一个篇章")
+            return
+        arc = self._arc_data_cache[row]
+        arc_name = arc.get("name", f"第{arc.get('order', '?')}篇")
+        arc_goal = arc.get("goal", "")
+        arc_summary = arc.get("summary", "")
+        cmd = f'novel_outline(book_id="{self._book_id}", arc_name="{arc_name}")'
+        self._append_system_msg(
+            f"📝 正在为篇章「{arc_name}」生成3幕结构大纲...\n"
+            f"目标：{arc_goal}\n"
+            f"概要：{arc_summary[:80]}{'…' if len(arc_summary) > 80 else ''}"
+        )
+        self._send_command(cmd)
+
+    def _expand_arc_chapter_outlines(self):
+        row = self._arcs_table.currentRow()
+        if row < 0 or row >= len(self._arc_data_cache):
+            self._append_system_msg("⚠️ 请先选择一个篇章")
+            return
+        arc = self._arc_data_cache[row]
+        arc_name = arc.get("name", f"第{arc.get('order', '?')}篇")
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "确认展开章纲",
+            f"确定要为篇章「{arc_name}」展开章节大纲吗？\n"
+            f"这会消耗较多 Token，请确认大纲内容已审核无误。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            cmd = f'novel_chapter_outlines(book_id="{self._book_id}", arc_name="{arc_name}")'
+            self._append_system_msg(f"📋 正在为篇章「{arc_name}」展开章节大纲...")
+            self._send_command(cmd)
 
     def _refresh_chapters(self):
         self._chapter_table.setRowCount(0)
@@ -5927,14 +6028,15 @@ class GanggeDesktop(QMainWindow):
                             f'\n\n小说已经创建好了。这是我的故事构思：\n{ideas}\n\n'
                             f'请根据以上构思，按顺序执行：\n'
                             f'1. 先用 novel_setup 配置角色和世界观\n'
-                            f'2. 再用 novel_outline 生成大纲\n'
-                            f'⚠️ 重要：到此为止！不要生成章节大纲，也不要写正文！\n'
-                            f'章节大纲非常消耗 Token，等用户确认大纲内容合理后再手动点击「展开章纲」按钮。'
+                            f'⚠️ 重要：到此为止！不要生成大纲，也不要写正文！\n'
+                            f'用户需要先在「篇章」Tab 中创建和管理篇章，\n'
+                            f'然后选择一个篇章，点击「生成大纲」为该篇章生成大纲。\n'
+                            f'确认大纲合理后，再点击「展开章纲」生成章节大纲。'
                         )
                         self._append_system_msg(
-                            f"📖 已收到你的创作构思，AI 将自动配置角色、世界观和大纲。\n"
-                            f"完成后停在大纲阶段，请确认大纲内容是否合理。\n"
-                            f"确认无误后，手动点击右侧「展开章纲」按钮。\n"
+                            f"📖 已收到你的创作构思，AI 将自动配置角色和世界观。\n"
+                            f"完成后请在「篇章」Tab 中创建篇章（如：东海篇、阿拉巴斯坦篇），\n"
+                            f"然后选择篇章 → 点击「生成大纲」→ 确认后 → 点击「展开章纲」。\n"
                             f"构思摘要：{ideas[:100]}{'…' if len(ideas) > 100 else ''}"
                         )
                     else:
