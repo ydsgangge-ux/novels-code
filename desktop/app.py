@@ -1415,6 +1415,11 @@ class NovelSidebarPanel(QWidget):
         self._btn_status.clicked.connect(lambda: self._emit_action("status"))
         lay.addWidget(self._btn_status)
 
+        self._btn_load = QPushButton("📂 载入小说")
+        self._btn_load.setToolTip("从其他文件夹加载已有小说")
+        self._btn_load.clicked.connect(lambda: self._emit_action("load"))
+        lay.addWidget(self._btn_load)
+
         lay.addStretch()
         self._workspace = ""
 
@@ -1459,7 +1464,7 @@ class NovelSidebarPanel(QWidget):
     def _on_book_selected(self, current, previous):
         if current:
             book_id = current.data(Qt.ItemDataRole.UserRole) or ""
-            self._emit_action("select")
+            self.novel_action.emit("select", {"book_id": book_id})
 
     def _emit_action(self, action: str):
         book_id = self.get_selected_book_id()
@@ -1554,6 +1559,10 @@ class NovelRightPanel(QWidget):
         btn = QPushButton("展开章纲")
         btn.clicked.connect(lambda: self._emit_action("generate_chapter_outlines"))
         row1.addWidget(btn)
+        btn_arc = QPushButton("📖 新篇章")
+        btn_arc.setToolTip("为当前事件追加一个新的篇章（独立3幕结构）")
+        btn_arc.clicked.connect(lambda: self._emit_action("new_arc"))
+        row1.addWidget(btn_arc)
         action_lay.addLayout(row1)
 
         row2 = QHBoxLayout()
@@ -1617,13 +1626,16 @@ class NovelRightPanel(QWidget):
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(6)
 
-        self._char_table = QTableWidget(0, 5)
-        self._char_table.setHorizontalHeaderLabels(["ID", "名称", "弧线", "外部目标", "内在渴望"])
+        self._char_table = QTableWidget(0, 7)
+        self._char_table.setHorizontalHeaderLabels(["ID", "名称", "弧线", "外部目标", "内在渴望", "势力", "主角团"])
         self._char_table.horizontalHeader().setStretchLastSection(True)
-        self._char_table.setColumnWidth(0, 70)
-        self._char_table.setColumnWidth(1, 80)
-        self._char_table.setColumnWidth(2, 60)
-        self._char_table.setColumnWidth(3, 120)
+        self._char_table.setColumnWidth(0, 60)
+        self._char_table.setColumnWidth(1, 70)
+        self._char_table.setColumnWidth(2, 50)
+        self._char_table.setColumnWidth(3, 100)
+        self._char_table.setColumnWidth(4, 100)
+        self._char_table.setColumnWidth(5, 70)
+        self._char_table.setColumnWidth(6, 55)
         self._char_table.setAlternatingRowColors(True)
         self._char_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._char_table.verticalHeader().setVisible(False)
@@ -1816,6 +1828,14 @@ class NovelRightPanel(QWidget):
         )
         btn_del.clicked.connect(self._delete_selected_world_item)
         btn_row.addWidget(btn_del)
+        btn_add_loc = QPushButton("+地点")
+        btn_add_loc.setToolTip("添加新地点")
+        btn_add_loc.clicked.connect(self._add_world_location)
+        btn_row.addWidget(btn_add_loc)
+        btn_add_fac = QPushButton("+势力")
+        btn_add_fac.setToolTip("添加新势力")
+        btn_add_fac.clicked.connect(self._add_world_faction)
+        btn_row.addWidget(btn_add_fac)
         btn_row.addStretch()
         lay.addLayout(btn_row)
         return tab
@@ -2485,6 +2505,9 @@ class NovelRightPanel(QWidget):
                 need = c.get("need", {})
                 self._char_table.setItem(row, 3, QTableWidgetItem(need.get("external", "") if isinstance(need, dict) else ""))
                 self._char_table.setItem(row, 4, QTableWidgetItem(need.get("internal", "") if isinstance(need, dict) else ""))
+                self._char_table.setItem(row, 5, QTableWidgetItem(c.get("faction", "")))
+                is_main = "✅" if c.get("is_main_cast", False) else ""
+                self._char_table.setItem(row, 6, QTableWidgetItem(is_main))
                 self._char_data_cache.append(c)
         except Exception:
             pass
@@ -2498,6 +2521,11 @@ class NovelRightPanel(QWidget):
             if isinstance(need, dict):
                 html += f"<p><b>外部目标:</b> {need.get('external', '')}</p>"
                 html += f"<p><b>内在渴望:</b> {need.get('internal', '')}</p>"
+            faction = c.get("faction", "")
+            if faction:
+                html += f"<p><b>势力:</b> {faction}</p>"
+            if c.get("is_main_cast", False):
+                html += "<p><b>主角团:</b> ✅ 是</p>"
             html += f"<p><b>简介:</b> {c.get('profile', '')}</p>"
             wv = c.get("worldview", {})
             if isinstance(wv, dict):
@@ -2525,17 +2553,21 @@ class NovelRightPanel(QWidget):
             if not char_id:
                 return
 
-            field_map = {1: "name", 2: "arc", 3: "need_external", 4: "need_internal"}
+            field_map = {1: "name", 2: "arc", 3: "need_external", 4: "need_internal", 5: "faction", 6: "is_main_cast"}
             field = field_map.get(col)
             if not field:
                 return
 
             new_value = self._char_table.item(row, col).text() if self._char_table.item(row, col) else ""
-            old_value = c.get(field, "")
             if field == "need_external":
                 old_value = c.get("need", {}).get("external", "") if isinstance(c.get("need"), dict) else ""
             elif field == "need_internal":
                 old_value = c.get("need", {}).get("internal", "") if isinstance(c.get("need"), dict) else ""
+            elif field == "is_main_cast":
+                old_value = c.get("is_main_cast", False)
+                new_value = new_value.strip() in ("✅", "true", "True", "是", "1", "yes", "Yes")
+            else:
+                old_value = c.get(field, "")
 
             if new_value == old_value:
                 return
@@ -2564,7 +2596,7 @@ class NovelRightPanel(QWidget):
         form = QFormLayout(dlg)
 
         fields = {}
-        for key, label in [("name", "名称"), ("arc", "弧线"), ("profile", "简介"), ("backstory", "背景")]:
+        for key, label in [("name", "名称"), ("arc", "弧线"), ("profile", "简介"), ("backstory", "背景"), ("faction", "所属势力")]:
             le = QLineEdit(c.get(key, ""))
             form.addRow(label, le)
             fields[key] = le
@@ -2578,6 +2610,12 @@ class NovelRightPanel(QWidget):
             form.addRow("内在渴望", le_int)
             fields["need_internal"] = le_int
 
+        from PyQt6.QtWidgets import QCheckBox
+        cb_main = QCheckBox("是主角团成员")
+        cb_main.setChecked(c.get("is_main_cast", False))
+        cb_main.setStyleSheet("QCheckBox{color:#c9d1d9;}")
+        form.addRow("主角团", cb_main)
+
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
@@ -2587,6 +2625,7 @@ class NovelRightPanel(QWidget):
             edit_data = {"character_id": char_id}
             for key, le in fields.items():
                 edit_data[key] = le.text()
+            edit_data["is_main_cast"] = cb_main.isChecked()
             cmd = f'novel_edit(book_id="{self._book_id}", edit_type="update_character", data={json.dumps(edit_data, ensure_ascii=False)})'
             self._send_command(cmd)
             self._refresh_characters()
@@ -2620,27 +2659,65 @@ class NovelRightPanel(QWidget):
             return
         try:
             data = json.loads(outline_path.read_text(encoding="utf-8"))
-            self._outline_info.setText(
-                f"<b>{data.get('title', '大纲')}</b> | Logline: {data.get('logline', '')}"
-            )
-            for seq in data.get("sequences", []):
-                act = str(seq.get("act", "?"))
-                seq_item = QTreeWidgetItem([
-                    f"序列{seq.get('number', '?')}",
-                    f"第{act}幕",
-                    seq.get("summary", ""),
-                    seq.get("dramatic_function", ""),
-                ])
-                seq_item.setForeground(0, QColor("#58a6ff"))
-                self._outline_tree.addTopLevelItem(seq_item)
+            total_goal = data.get("total_goal", "")
+            info_parts = [f"<b>{data.get('title', '大纲')}</b> | Logline: {data.get('logline', '')}"]
+            if total_goal:
+                info_parts.append(f" | 🎯 总目标: {total_goal}")
+            self._outline_info.setText("".join(info_parts))
 
-                end_hook = seq.get("end_hook", "")
-                if end_hook:
-                    hook_item = QTreeWidgetItem(seq_item, ["结尾钩子", "", end_hook, ""])
-                    hook_item.setForeground(0, QColor("#f78166"))
-                for evt in seq.get("key_events", []):
-                    evt_item = QTreeWidgetItem(seq_item, ["事件", "", evt, ""])
-                    evt_item.setForeground(0, QColor("#8b949e"))
+            arcs = data.get("arcs", [])
+            if arcs:
+                for arc in arcs:
+                    arc_order = arc.get("order", "?")
+                    arc_name = arc.get("name", f"篇{arc_order}")
+                    arc_item = QTreeWidgetItem([
+                        f"📖 {arc_name}",
+                        "",
+                        arc.get("summary", ""),
+                        f"第{arc_order}篇",
+                    ])
+                    arc_item.setForeground(0, QColor("#d2a8ff"))
+                    arc_item.setForeground(3, QColor("#f78166"))
+                    arc_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "arc", "data": arc})
+                    self._outline_tree.addTopLevelItem(arc_item)
+
+                    for seq in arc.get("sequences", []):
+                        act = str(seq.get("act", "?"))
+                        seq_item = QTreeWidgetItem([
+                            f"序列{seq.get('number', '?')}",
+                            f"第{act}幕",
+                            seq.get("summary", ""),
+                            seq.get("dramatic_function", ""),
+                        ])
+                        seq_item.setForeground(0, QColor("#58a6ff"))
+                        arc_item.addChild(seq_item)
+
+                        end_hook = seq.get("end_hook", "")
+                        if end_hook:
+                            hook_item = QTreeWidgetItem(seq_item, ["结尾钩子", "", end_hook, ""])
+                            hook_item.setForeground(0, QColor("#f78166"))
+                        for evt in seq.get("key_events", []):
+                            evt_item = QTreeWidgetItem(seq_item, ["事件", "", evt, ""])
+                            evt_item.setForeground(0, QColor("#8b949e"))
+            else:
+                for seq in data.get("sequences", []):
+                    act = str(seq.get("act", "?"))
+                    seq_item = QTreeWidgetItem([
+                        f"序列{seq.get('number', '?')}",
+                        f"第{act}幕",
+                        seq.get("summary", ""),
+                        seq.get("dramatic_function", ""),
+                    ])
+                    seq_item.setForeground(0, QColor("#58a6ff"))
+                    self._outline_tree.addTopLevelItem(seq_item)
+
+                    end_hook = seq.get("end_hook", "")
+                    if end_hook:
+                        hook_item = QTreeWidgetItem(seq_item, ["结尾钩子", "", end_hook, ""])
+                        hook_item.setForeground(0, QColor("#f78166"))
+                    for evt in seq.get("key_events", []):
+                        evt_item = QTreeWidgetItem(seq_item, ["事件", "", evt, ""])
+                        evt_item.setForeground(0, QColor("#8b949e"))
         except Exception:
             pass
 
@@ -3033,6 +3110,76 @@ class NovelRightPanel(QWidget):
             if ci:
                 html += f"<p><b>核心利益:</b> {ci}</p>"
             self._world_detail.setHtml(html)
+
+    def _add_world_location(self):
+        if not self._workspace or not self._book_id:
+            return
+        from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("添加新地点")
+        dlg.setMinimumWidth(400)
+        dlg.setStyleSheet("QDialog{background:#161b22;color:#c9d1d9;} QLabel{color:#c9d1d9;} "
+                          "QLineEdit,QTextEdit{background:#0d1117;border:1px solid #30363d;border-radius:4px;"
+                          "color:#c9d1d9;padding:4px;}")
+        form = QFormLayout(dlg)
+        le_id = QLineEdit(f"loc_{id(self) % 10000}")
+        form.addRow("ID", le_id)
+        le_name = QLineEdit("")
+        form.addRow("名称", le_name)
+        te_desc = QTextEdit()
+        te_desc.setMaximumHeight(80)
+        form.addRow("描述", te_desc)
+        le_dp = QLineEdit("")
+        form.addRow("戏剧潜力", le_dp)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            edit_data = {
+                "location_id": le_id.text(),
+                "name": le_name.text(),
+                "description": te_desc.toPlainText(),
+                "dramatic_potential": le_dp.text(),
+            }
+            cmd = f'novel_edit(book_id="{self._book_id}", edit_type="update_location", data={json.dumps(edit_data, ensure_ascii=False)})'
+            self._send_command(cmd)
+            self._refresh_world()
+
+    def _add_world_faction(self):
+        if not self._workspace or not self._book_id:
+            return
+        from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("添加新势力")
+        dlg.setMinimumWidth(400)
+        dlg.setStyleSheet("QDialog{background:#161b22;color:#c9d1d9;} QLabel{color:#c9d1d9;} "
+                          "QLineEdit,QTextEdit{background:#0d1117;border:1px solid #30363d;border-radius:4px;"
+                          "color:#c9d1d9;padding:4px;}")
+        form = QFormLayout(dlg)
+        le_id = QLineEdit(f"fac_{id(self) % 10000}")
+        form.addRow("ID", le_id)
+        le_name = QLineEdit("")
+        form.addRow("名称", le_name)
+        te_desc = QTextEdit()
+        te_desc.setMaximumHeight(80)
+        form.addRow("描述", te_desc)
+        le_ci = QLineEdit("")
+        form.addRow("核心利益", le_ci)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            edit_data = {
+                "faction_id": le_id.text(),
+                "name": le_name.text(),
+                "description": te_desc.toPlainText(),
+                "core_interest": le_ci.text(),
+            }
+            cmd = f'novel_edit(book_id="{self._book_id}", edit_type="update_faction", data={json.dumps(edit_data, ensure_ascii=False)})'
+            self._send_command(cmd)
+            self._refresh_world()
 
     def _edit_selected_world_item(self):
         item = self._world_tree.currentItem()
@@ -5520,6 +5667,26 @@ class GanggeDesktop(QMainWindow):
     def _novel_new_book(self):
         self._on_novel_action("new", {})
 
+    def _import_novel_folder(self, workspace: str, folder: str):
+        import shutil
+        src = Path(folder)
+        if not src.is_dir():
+            self._append_system_msg("选择的路径不是文件夹")
+            return
+        books_dir = Path(workspace) / "books"
+        books_dir.mkdir(parents=True, exist_ok=True)
+        dst = books_dir / src.name
+        if dst.exists():
+            self._append_system_msg(f"小说文件夹已存在: {dst}")
+            self._novel_sidebar.refresh_books()
+            return
+        try:
+            shutil.copytree(str(src), str(dst))
+            self._append_system_msg(f"✅ 已载入小说: {src.name}")
+            self._novel_sidebar.refresh_books()
+        except Exception as e:
+            self._append_system_msg(f"❌ 载入失败: {e}")
+
     def _select_sidebar_book(self, book_id: str):
         self._novel_sidebar.select_book(book_id)
 
@@ -5539,9 +5706,17 @@ class GanggeDesktop(QMainWindow):
                     cmd = f'novel_init(title="{d["title"]}", genre="{d["genre"]}", target_chapters={d["target_chapters"]}, words_per_chapter={d["words_per_chapter"]})'
                     ideas = d.get("ideas", "").strip()
                     if ideas:
-                        cmd += f'\n\n小说已经创建好了。这是我的故事构思：\n{ideas}\n\n请根据以上构思，先帮我配置角色和世界观，再生成大纲。'
+                        cmd += (
+                            f'\n\n小说已经创建好了。这是我的故事构思：\n{ideas}\n\n'
+                            f'请根据以上构思，按顺序执行：\n'
+                            f'1. 先用 novel_setup 配置角色和世界观\n'
+                            f'2. 再用 novel_outline 生成大纲\n'
+                            f'3. 最后用 novel_chapter_outlines 展开章节大纲\n'
+                            f'⚠️ 重要：到此为止，不要写正文！等用户确认大纲后再继续。'
+                        )
                         self._append_system_msg(
-                            f"📖 已收到你的创作构思，AI 将自动配置角色、世界观和大纲。\n"
+                            f"📖 已收到你的创作构思，AI 将自动配置角色、世界观、大纲和章节大纲。\n"
+                            f"完成后会停在章节大纲，等待你确认再继续。\n"
                             f"构思摘要：{ideas[:100]}{'…' if len(ideas) > 100 else ''}"
                         )
                     else:
@@ -5556,6 +5731,12 @@ class GanggeDesktop(QMainWindow):
         if action == "select":
             if book_id:
                 self._novel_right.set_workspace(ws, book_id)
+            return
+
+        if action == "load":
+            folder = QFileDialog.getExistingDirectory(self, "选择小说文件夹", ws)
+            if folder:
+                self._import_novel_folder(ws, folder)
             return
 
         if not book_id:
@@ -5599,6 +5780,12 @@ class GanggeDesktop(QMainWindow):
             cmd = f'novel_export(book_id="{book_id}")'
         elif action == "generate_chapter_outlines":
             cmd = f'novel_chapter_outlines(book_id="{book_id}")'
+        elif action == "new_arc":
+            self._append_system_msg("📖 请在聊天窗口描述新篇章的背景和任务目标，AI 将自动生成。\n"
+                                   "例如：「这是第2个篇章，主角团来到新大陆，要寻找传说中的宝藏」")
+            cmd = f'novel_new_arc(book_id="{book_id}")'
+            self._task_input.setPlainText(cmd)
+            return
         elif action == "audit_selected":
             sm_dir = Path(ws) / "books" / book_id / "state"
             ws_path = sm_dir / "world_state.json"

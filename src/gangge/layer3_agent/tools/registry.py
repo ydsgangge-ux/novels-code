@@ -130,6 +130,7 @@ def create_tool_registry(
             NovelSetupTool,
             NovelOutlineTool,
             NovelChapterOutlinesTool,
+            NovelNewArcTool,
             NovelWriteChapterTool,
             NovelAuditTool,
             NovelReviseTool,
@@ -151,6 +152,7 @@ def create_tool_registry(
             registry.register(NovelSetupTool(workspace=workspace))
             registry.register(NovelOutlineTool(workspace=workspace, llm=llm))
             registry.register(NovelChapterOutlinesTool(workspace=workspace, llm=llm))
+            registry.register(NovelNewArcTool(workspace=workspace, llm=llm))
             registry.register(NovelWriteChapterTool(workspace=workspace, llm=llm))
             registry.register(NovelAuditTool(workspace=workspace, llm=llm))
             registry.register(NovelReviseTool(workspace=workspace, llm=llm))
@@ -165,7 +167,7 @@ def create_tool_registry(
             registry.register(NovelImitateWriteTool(workspace=workspace, llm=llm))
             registry.register(NovelChatTool(workspace=workspace, llm=llm))
             registry.register(NovelNavigateTool(workspace=workspace))
-            logger.info("[Registry] Novel writing tools (Dramatica-Flow) activated — 16 tools")
+            logger.info("[Registry] Novel writing tools (Dramatica-Flow) activated — 17 tools")
         else:
             logger.debug("[Registry] Dramatica-Flow not available — novel tools skipped")
     except Exception as e:

@@ -89,6 +89,8 @@ def _ensure_setup(workspace: str, book_id: str, genre: str = "", title: str = ""
                     "backstory": "",
                     "current_goal": "",
                     "hidden_agenda": "",
+                    "faction": "",
+                    "is_main_cast": true,
                 }
             ]
         }
@@ -538,6 +540,141 @@ class NovelChapterOutlinesTool(BaseTool):
                 f"{ch_summary}\n\n"
                 f"下一步：使用 novel_write_chapter 逐章写作。"
             )
+        )
+
+
+class NovelNewArcTool(BaseTool):
+    name = "novel_new_arc"
+    description = (
+        "为长篇小说创建新的篇章（Arc）。每个篇章是一个独立的3幕结构，"
+        "服务于小说的总目标。总目标未完成时，可以不断追加新篇章。"
+        "类似海贼王的东海篇、阿拉巴斯坦篇、空岛篇等。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "book_id": {"type": "string", "description": "书籍 ID"},
+            "arc_name": {"type": "string", "description": "篇章名称，如「东海篇」"},
+            "arc_summary": {"type": "string", "description": "篇章概要，描述这个篇章要讲什么故事"},
+            "arc_goal": {"type": "string", "description": "这个篇章的小目标，服务于总目标"},
+        },
+        "required": ["book_id"],
+    }
+
+    def __init__(self, workspace: str = "", llm=None):
+        self.workspace = workspace
+        self._llm = llm
+
+    async def execute(self, **kwargs) -> ToolResult:
+        err = _check_dramatica()
+        if err:
+            return ToolResult(output=err, is_error=True)
+
+        book_id = kwargs.get("book_id", "")
+        arc_name = kwargs.get("arc_name", "")
+        arc_summary = kwargs.get("arc_summary", "")
+        arc_goal = kwargs.get("arc_goal", "")
+
+        if not book_id:
+            return ToolResult(output="请提供 book_id", is_error=True)
+
+        if not self._llm:
+            return ToolResult(output="LLM 未初始化", is_error=True)
+
+        sm = StateManager(self.workspace, book_id)
+        outline_path = sm.state_dir / "outline.json"
+        if not outline_path.exists():
+            return ToolResult(output="大纲不存在，请先使用 novel_outline 生成", is_error=True)
+
+        try:
+            from gangge.layer3_agent.tools.dramatica_adapter import DramaticaLLMAdapter
+            df_llm = DramaticaLLMAdapter(self._llm)
+            engine = NarrativeEngine(df_llm)
+        except Exception as e:
+            return ToolResult(output=f"引擎初始化失败: {e}", is_error=True)
+
+        outline_data = json.loads(outline_path.read_text(encoding="utf-8"))
+        arcs = outline_data.get("arcs", [])
+        total_goal = outline_data.get("total_goal", "")
+
+        if not arcs:
+            existing_sequences = outline_data.get("sequences", [])
+            if existing_sequences:
+                arcs = [{
+                    "id": "arc_1",
+                    "name": arc_name or "第一篇",
+                    "summary": arc_summary or "初始篇章",
+                    "goal": arc_goal or total_goal or "完成故事启程",
+                    "order": 1,
+                    "sequences": [{
+                        "number": s.get("number", ""),
+                        "act": s.get("act", ""),
+                        "summary": s.get("summary", ""),
+                        "dramatic_function": s.get("dramatic_function", ""),
+                        "end_hook": s.get("end_hook", ""),
+                        "key_events": s.get("key_events", []),
+                        "estimated_scenes": s.get("estimated_scenes", 3),
+                    } for s in existing_sequences],
+                }]
+                if not total_goal:
+                    outline_data["total_goal"] = arc_goal or arc_summary or "完成故事"
+
+        arc_order = len(arcs) + 1
+        arc_id = f"arc_{arc_order}"
+        new_arc_summary = arc_summary or f"第{arc_order}个篇章"
+        new_arc_goal = arc_goal or f"服务于总目标：{total_goal}"
+
+        try:
+            new_arc = engine.generate_arc(
+                arc_name=arc_name or f"第{arc_order}篇",
+                arc_summary=new_arc_summary,
+                arc_goal=new_arc_goal,
+                total_goal=total_goal,
+                previous_arcs=[a.get("summary", "") for a in arcs],
+                genre=outline_data.get("logline", ""),
+            )
+        except AttributeError:
+            new_arc = {
+                "id": arc_id,
+                "name": arc_name or f"第{arc_order}篇",
+                "summary": new_arc_summary,
+                "goal": new_arc_goal,
+                "order": arc_order,
+                "sequences": [],
+            }
+
+        if isinstance(new_arc, dict):
+            new_arc["id"] = arc_id
+            new_arc["order"] = arc_order
+        else:
+            new_arc = {
+                "id": arc_id,
+                "name": arc_name or f"第{arc_order}篇",
+                "summary": new_arc_summary,
+                "goal": new_arc_goal,
+                "order": arc_order,
+                "sequences": [],
+            }
+
+        arcs.append(new_arc)
+        outline_data["arcs"] = arcs
+        outline_data.pop("sequences", None)
+
+        outline_path.write_text(
+            json.dumps(outline_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        return ToolResult(
+            output=(
+                f"✅ 新篇章已创建！\n"
+                f"  篇章名称：{arc_name or f'第{arc_order}篇'}\n"
+                f"  篇章概要：{new_arc_summary}\n"
+                f"  篇章目标：{new_arc_goal}\n"
+                f"  总目标：{total_goal}\n\n"
+                f"下一步：使用 novel_outline 为这个新篇章生成三幕结构大纲。"
+            ),
+            metadata={"book_id": book_id, "arc_id": arc_id},
         )
 
 
@@ -2006,10 +2143,14 @@ class NovelEditTool(BaseTool):
 
         char = chars[char_id]
         updated_fields = []
-        for key in ("name", "arc", "profile", "backstory", "personality", "behavior_lock"):
+        for key in ("name", "arc", "profile", "backstory", "personality", "behavior_lock", "faction"):
             if key in data:
                 char[key] = data[key]
                 updated_fields.append(key)
+
+        if "is_main_cast" in data:
+            char["is_main_cast"] = bool(data["is_main_cast"])
+            updated_fields.append("is_main_cast")
 
         need = char.get("need", {})
         if not isinstance(need, dict):
