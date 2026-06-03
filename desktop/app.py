@@ -3280,57 +3280,116 @@ class NovelRightPanel(QWidget):
         chapter_dir = Path(self._workspace) / "books" / self._book_id / "chapters"
         if not chapter_dir.exists():
             return
-        for ch_path in sorted(chapter_dir.glob("ch*_final.md")):
+
+        # 兼容多种章节文件名格式：
+        # ch0001_final.md, ch0001_draft.md, chapter_001.md, 第01章_标题.md
+        import re
+        chapters_found: dict[int, dict] = {}
+
+        for ch_path in sorted(chapter_dir.glob("*.md")):
             name = ch_path.stem
-            content = ch_path.read_text(encoding="utf-8")
+            ch_num = None
+            status = "已完成"
+
+            if name.startswith("ch") and ("_final" in name or "_draft" in name):
+                num_str = name.replace("ch", "").replace("_final", "").replace("_draft", "")
+                try:
+                    ch_num = int(num_str)
+                except ValueError:
+                    pass
+                if "_draft" in name:
+                    status = "草稿"
+            elif name.startswith("chapter_"):
+                num_str = name.replace("chapter_", "")
+                try:
+                    ch_num = int(num_str)
+                except ValueError:
+                    pass
+            elif name.startswith("第"):
+                m = re.match(r"第(\d+)章", name)
+                if m:
+                    ch_num = int(m.group(1))
+
+            if ch_num is None:
+                continue
+
+            if ch_num in chapters_found:
+                existing = chapters_found[ch_num]
+                if existing["status"] == "已完成" and status == "草稿":
+                    continue
+                if existing["status"] == "草稿" and status == "已完成":
+                    pass
+                else:
+                    continue
+
+            try:
+                content = ch_path.read_text(encoding="utf-8")
+            except Exception:
+                continue
             word_count = len(content)
-            row = self._chapter_table.rowCount()
-            self._chapter_table.insertRow(row)
-            ch_num = name.replace("ch", "").replace("_final", "")
-            self._chapter_table.setItem(row, 0, QTableWidgetItem(ch_num))
             title = ""
-            for line in content.split("\n")[:3]:
+            for line in content.split("\n")[:5]:
                 if line.strip().startswith("#"):
                     title = line.strip().lstrip("#").strip()
                     break
-            self._chapter_table.setItem(row, 1, QTableWidgetItem(title or name))
-            self._chapter_table.setItem(row, 2, QTableWidgetItem(f"{word_count:,}"))
-            self._chapter_table.setItem(row, 3, QTableWidgetItem("已完成"))
 
-        draft_dir = Path(self._workspace) / "books" / self._book_id / "chapters"
-        if draft_dir.exists():
-            for ch_path in sorted(draft_dir.glob("ch*_draft.md")):
-                name = ch_path.stem
-                final_name = name.replace("_draft", "_final")
-                if (ch_path.parent / final_name).exists():
-                    continue
-                content = ch_path.read_text(encoding="utf-8")
-                word_count = len(content)
-                row = self._chapter_table.rowCount()
-                ch_num = name.replace("ch", "").replace("_draft", "")
-                self._chapter_table.insertRow(row)
-                self._chapter_table.setItem(row, 0, QTableWidgetItem(ch_num))
-                self._chapter_table.setItem(row, 1, QTableWidgetItem(name))
-                self._chapter_table.setItem(row, 2, QTableWidgetItem(f"{word_count:,}"))
-                self._chapter_table.setItem(row, 3, QTableWidgetItem("草稿"))
+            chapters_found[ch_num] = {
+                "path": ch_path,
+                "status": status,
+                "title": title or name,
+                "word_count": word_count,
+            }
+
+        for ch_num in sorted(chapters_found.keys()):
+            info = chapters_found[ch_num]
+            row = self._chapter_table.rowCount()
+            self._chapter_table.insertRow(row)
+            self._chapter_table.setItem(row, 0, QTableWidgetItem(str(ch_num)))
+            self._chapter_table.setItem(row, 1, QTableWidgetItem(info["title"]))
+            self._chapter_table.setItem(row, 2, QTableWidgetItem(f"{info['word_count']:,}"))
+            self._chapter_table.setItem(row, 3, QTableWidgetItem(info["status"]))
+
+    def _find_chapter_file(self, ch_num: int) -> Path | None:
+        """查找章节文件，兼容多种命名格式。优先级：final > draft > chapter_N > 第N章"""
+        if not self._workspace or not self._book_id:
+            return None
+        ch_dir = Path(self._workspace) / "books" / self._book_id / "chapters"
+        if not ch_dir.exists():
+            return None
+        # 按优先级查找
+        candidates = [
+            ch_dir / f"ch{ch_num:04d}_final.md",
+            ch_dir / f"ch{ch_num:04d}_draft.md",
+            ch_dir / f"chapter_{ch_num:03d}.md",
+            ch_dir / f"chapter_{ch_num}.md",
+        ]
+        for p in candidates:
+            if p.exists():
+                return p
+        # 模糊匹配：第N章_*.md
+        import re
+        for f in ch_dir.glob("*.md"):
+            m = re.match(r"第(\d+)章", f.stem)
+            if m and int(m.group(1)) == ch_num:
+                return f
+        return None
 
     def _on_chapter_selected(self, row, col, prev_row, prev_col):
         item = self._chapter_table.item(row, 0)
         if not item:
             return
-        ch_num = item.text()
-        if not self._workspace or not self._book_id:
+        try:
+            ch_num = int(item.text())
+        except ValueError:
             return
-        ch_dir = Path(self._workspace) / "books" / self._book_id / "chapters"
-        for suffix in ["_final.md", "_draft.md"]:
-            ch_path = ch_dir / f"ch{int(ch_num):04d}{suffix}"
-            if ch_path.exists():
-                content = ch_path.read_text(encoding="utf-8")
-                preview = content[:2000]
-                if len(content) > 2000:
-                    preview += "\n\n...(点击导出查看完整内容)"
-                self._chapter_preview.setPlainText(preview)
-                return
+        ch_path = self._find_chapter_file(ch_num)
+        if ch_path and ch_path.exists():
+            content = ch_path.read_text(encoding="utf-8")
+            preview = content[:2000]
+            if len(content) > 2000:
+                preview += "\n\n...(点击导出查看完整内容)"
+            self._chapter_preview.setPlainText(preview)
+            return
         self._chapter_preview.setPlainText("章节内容不存在")
 
     def _edit_selected_chapter(self):
@@ -3340,17 +3399,12 @@ class NovelRightPanel(QWidget):
         item = self._chapter_table.item(row, 0)
         if not item:
             return
-        ch_num = item.text()
-        if not self._workspace or not self._book_id:
+        try:
+            ch_num = int(item.text())
+        except ValueError:
             return
 
-        ch_dir = Path(self._workspace) / "books" / self._book_id / "chapters"
-        ch_path = None
-        for suffix in ["_final.md", "_draft.md"]:
-            p = ch_dir / f"ch{int(ch_num):04d}{suffix}"
-            if p.exists():
-                ch_path = p
-                break
+        ch_path = self._find_chapter_file(ch_num)
         if not ch_path:
             return
 

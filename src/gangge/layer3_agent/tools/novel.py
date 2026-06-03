@@ -54,6 +54,27 @@ def _check_dramatica() -> str | None:
     return None
 
 
+def _find_chapter_file(chapter_dir: Path, ch_num: int) -> Path | None:
+    """查找章节文件，兼容多种命名格式。优先级：final > draft > chapter_N > 第N章"""
+    if not chapter_dir.exists():
+        return None
+    candidates = [
+        chapter_dir / f"ch{ch_num:04d}_final.md",
+        chapter_dir / f"ch{ch_num:04d}_draft.md",
+        chapter_dir / f"chapter_{ch_num:03d}.md",
+        chapter_dir / f"chapter_{ch_num}.md",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    import re
+    for f in chapter_dir.glob("*.md"):
+        m = re.match(r"第(\d+)章", f.stem)
+        if m and int(m.group(1)) == ch_num:
+            return f
+    return None
+
+
 def _get_books_dir(workspace: str) -> Path:
     return Path(workspace) / "books"
 
@@ -1002,9 +1023,9 @@ class NovelAuditTool(BaseTool):
             return ToolResult(output="请提供 book_id 和 chapter_number", is_error=True)
 
         sm = StateManager(self.workspace, book_id)
-        final_path = sm.chapter_dir / f"ch{chapter_number:04d}_final.md"
-        if not final_path.exists():
-            return ToolResult(output=f"第 {chapter_number} 章的最终稿不存在", is_error=True)
+        final_path = _find_chapter_file(sm.chapter_dir, chapter_number)
+        if not final_path:
+            return ToolResult(output=f"第 {chapter_number} 章不存在", is_error=True)
 
         content = final_path.read_text(encoding="utf-8")
 
@@ -1067,8 +1088,8 @@ class NovelReviseTool(BaseTool):
             return ToolResult(output="LLM 未初始化", is_error=True)
 
         sm = StateManager(self.workspace, book_id)
-        final_path = sm.chapter_dir / f"ch{chapter_number:04d}_final.md"
-        if not final_path.exists():
+        final_path = _find_chapter_file(sm.chapter_dir, chapter_number)
+        if not final_path:
             return ToolResult(output=f"第 {chapter_number} 章不存在", is_error=True)
 
         content = final_path.read_text(encoding="utf-8")
@@ -1836,10 +1857,9 @@ class NovelNavigateTool(BaseTool):
 
         if ch_match:
             ch_num = int(ch_match.group(1))
-            ch_path = Path(self.workspace) / "books" / book_id / "chapters" / f"chapter_{ch_num:03d}.md"
-            if not ch_path.exists():
-                ch_path = Path(self.workspace) / "books" / book_id / "chapters" / f"chapter_{ch_num}.md"
-            if not ch_path.exists():
+            ch_dir = Path(self.workspace) / "books" / book_id / "chapters"
+            ch_path = _find_chapter_file(ch_dir, ch_num)
+            if not ch_path:
                 return ToolResult(output=f"第 {ch_num} 章文件不存在", is_error=True)
             try:
                 content = ch_path.read_text(encoding="utf-8")
@@ -1898,7 +1918,7 @@ class NovelNavigateTool(BaseTool):
             ch_dir = Path(self.workspace) / "books" / book_id / "chapters"
             if not ch_dir.exists():
                 return ToolResult(output="暂无章节文件")
-            chapters = sorted(ch_dir.glob("chapter_*.md"))
+            chapters = sorted(ch_dir.glob("*.md"))
             if not chapters:
                 return ToolResult(output="暂无章节文件")
             lines = []
@@ -2981,8 +3001,37 @@ class NovelExportTool(BaseTool):
         if not chapter_dir.exists():
             return ToolResult(output="还没有写任何章节", is_error=True)
 
-        chapters = sorted(chapter_dir.glob("ch*_final.md"))
+        chapters = sorted(chapter_dir.glob("*.md"))
+        # 去重：同一章节号只取优先级最高的文件
+        seen_nums = set()
+        deduped = []
         for ch_path in chapters:
+            ch_num = None
+            name = ch_path.stem
+            if name.startswith("ch") and ("_final" in name or "_draft" in name):
+                num_str = name.replace("ch", "").replace("_final", "").replace("_draft", "")
+                try:
+                    ch_num = int(num_str)
+                except ValueError:
+                    pass
+            elif name.startswith("chapter_"):
+                try:
+                    ch_num = int(name.replace("chapter_", ""))
+                except ValueError:
+                    pass
+            elif name.startswith("第"):
+                import re
+                m = re.match(r"第(\d+)章", name)
+                if m:
+                    ch_num = int(m.group(1))
+            if ch_num is not None:
+                if ch_num not in seen_nums:
+                    seen_nums.add(ch_num)
+                    deduped.append((ch_num, ch_path))
+            else:
+                deduped.append((9999, ch_path))
+        deduped.sort(key=lambda x: x[0])
+        for ch_num, ch_path in deduped:
             content = ch_path.read_text(encoding="utf-8")
             parts.append(content + "\n\n---\n\n")
 
