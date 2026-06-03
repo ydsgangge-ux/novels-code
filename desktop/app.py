@@ -990,7 +990,9 @@ class GanggeWorker(QThread):
             asyncio.run(self._run_async())
         except Exception as e:
             import traceback
-            self.text_block.emit(_t("execution_error", error=f"{e}\n{traceback.format_exc()}"), "error")
+            tb = traceback.format_exc()
+            logging.getLogger("gangge.worker").critical("Worker 线程异常: %s\n%s", e, tb)
+            self.text_block.emit(_t("execution_error", error=f"{e}\n{tb}"), "error")
             self.finished.emit({"error": str(e)})
 
     async def _run_async(self):
@@ -6909,6 +6911,7 @@ class GanggeDesktop(QMainWindow):
             )
 
         # ── Auto-refresh novel panels after novel tool calls ──
+        # 必须在主线程执行GUI操作，用 QTimer 延迟确保线程安全
         if tool_name in self._NOVEL_TOOL_NAMES and not is_error:
             refresh_map = {
                 "novel_init": [self._refresh_dashboard],
@@ -6928,11 +6931,16 @@ class GanggeDesktop(QMainWindow):
                 "novel_consistency_check": [],
                 "novel_graph_rebuild": [self._refresh_graph],
             }
-            for fn in refresh_map.get(tool_name, []):
-                try:
-                    fn()
-                except Exception:
-                    pass
+            fns = refresh_map.get(tool_name, [])
+            if fns:
+                from PyQt6.QtCore import QTimer
+                def _safe_refresh():
+                    for fn in fns:
+                        try:
+                            fn()
+                        except Exception as e:
+                            logging.getLogger("gangge").warning("面板刷新失败: %s - %s", fn.__name__, e)
+                QTimer.singleShot(0, _safe_refresh)
 
     def _append_output(self, text: str, role: str = ""):
         """Render message as a styled bubble card."""
@@ -7127,6 +7135,45 @@ class GanggeDesktop(QMainWindow):
 #  Entry Point
 # ═════════════════════════════════════════════════════════════════
 def main():
+    # ── 全局日志：崩溃时写入文件 ──
+    log_dir = Path.home() / ".gangge" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"crash_{datetime.now().strftime('%Y%m%d')}.log"
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(str(log_file), encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+    logger = logging.getLogger("gangge")
+
+    def global_exception_handler(exc_type, exc_value, exc_tb):
+        logger.critical("未捕获异常，应用即将崩溃", exc_info=(exc_type, exc_value, exc_tb))
+        import traceback
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            from PyQt6.QtWidgets import QMessageBox
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("Gangge Code 崩溃")
+            msg.setText(f"程序发生未捕获异常：\n{exc_value}")
+            msg.setDetailedText(f"日志文件：{log_file}\n\n{tb_text}")
+            msg.exec()
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = global_exception_handler
+
+    # ── 捕获线程异常 ──
+    threading.excepthook = lambda args: logger.critical(
+        "线程异常: %s", args.exc_value, exc_info=(args.exc_type, args.exc_value, args.exc_traceback)
+    )
+
+    logger.info("Gangge Code 启动，日志文件: %s", log_file)
+
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName("Gangge Code")
@@ -7136,9 +7183,13 @@ def main():
     font = QFont("Segoe UI", 10)
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(font)
+
     w = GanggeDesktop()
     w.show()
-    sys.exit(app.exec())
+    logger.info("主窗口已显示")
+    exit_code = app.exec()
+    logger.info("应用退出，退出码: %s", exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
