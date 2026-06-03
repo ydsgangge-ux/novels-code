@@ -901,7 +901,8 @@ class GanggeWorker(QThread):
                  provider: str = "",
                  model_name: str = "",
                  previous_messages: list | None = None,
-                 attachments: list | None = None):
+                 attachments: list | None = None,
+                 auto_inject: bool = False):
         super().__init__()
         self.llm = llm
         self.task = task
@@ -922,6 +923,7 @@ class GanggeWorker(QThread):
         self._provider = provider
         self._model = model_name or getattr(llm, "model", "")
         self._attachments = attachments or []
+        self._auto_inject = auto_inject
         self._cancel = False
         self._approved_plan = ""
         self._ask_user_answer = ""
@@ -996,6 +998,45 @@ class GanggeWorker(QThread):
             self.finished.emit({"error": str(e)})
 
     async def _run_async(self):
+        # ── Build project context in worker thread (not blocking UI) ──
+        if self._auto_inject:
+            self.text_block.emit("⏳ 正在加载项目上下文...\n", "system")
+            project_context = scan_project_context(self.workspace)
+            if project_context:
+                self.text_block.emit("📁 已自动注入项目上下文\n", "system")
+            self.project_context = project_context
+
+            project_map = build_project_map(self.workspace)
+            if project_map:
+                self.text_block.emit("🗺️ 已生成项目文件索引\n", "system")
+            self.project_map = project_map
+
+            file_registry = build_initial_file_registry(self.workspace)
+            if file_registry:
+                self.text_block.emit(f"📋 已注册 {len(file_registry)} 个现有文件\n", "system")
+            self.file_registry = file_registry
+
+            rules_path = Path(self.workspace) / ".ganggerules"
+            if rules_path.exists():
+                try:
+                    self.ganggerules = rules_path.read_text(encoding="utf-8", errors="replace")[:3000]
+                    self.text_block.emit("📜 已加载 .ganggerules 项目规则\n", "system")
+                except Exception:
+                    pass
+
+            memory_bank_progress, memory_bank_changelog = read_memory_bank(self.workspace)
+            if memory_bank_progress or memory_bank_changelog:
+                self.text_block.emit("📚 已加载 Memory Bank (进度+变更日志)\n", "system")
+            self.memory_bank_progress = memory_bank_progress
+            self.memory_bank_changelog = memory_bank_changelog
+
+            git_state = detect_git_state(self.workspace)
+            if git_state:
+                self.project_context += "\n\n## Git 状态\n" + git_state
+                self.text_block.emit("🔀 已注入 Git 状态\n", "system")
+
+            self.text_block.emit("✅ 项目上下文加载完成\n", "system")
+
         async def ask_callback(req: PermissionRequest) -> PermissionDecision:
             if self.auto_allow and req.risk.level.value in ("safe", "low"):
                 return PermissionDecision.ALLOW
@@ -6671,47 +6712,8 @@ class GanggeDesktop(QMainWindow):
             extra_prompt = (extra_prompt + "\n\n" + novel_context).strip()
             self._append_output("📖 已注入小说创作上下文\n", "system")
 
-        # ── Auto-inject project context ──
-        project_context = ""
-        project_map = ""
-        file_registry: dict = {}
-        ganggerules = ""
-        memory_bank_progress = ""
-        memory_bank_changelog = ""
-        if self._auto_inject_cb.isChecked():
-            project_context = scan_project_context(workspace)
-            if project_context:
-                self._append_output("📁 已自动注入项目上下文\n", "system")
-
-            # ── Build project map ──
-            project_map = build_project_map(workspace)
-            if project_map:
-                self._append_output("🗺️ 已生成项目文件索引\n", "system")
-
-            # ── Build initial file registry ──
-            file_registry = build_initial_file_registry(workspace)
-            if file_registry:
-                self._append_output(f"📋 已注册 {len(file_registry)} 个现有文件\n", "system")
-
-            # ── Read .ganggerules ──
-            rules_path = Path(workspace) / ".ganggerules"
-            if rules_path.exists():
-                try:
-                    ganggerules = rules_path.read_text(encoding="utf-8", errors="replace")[:3000]
-                    self._append_output("📜 已加载 .ganggerules 项目规则\n", "system")
-                except Exception:
-                    pass
-
-            # ── Read Memory Bank ──
-            memory_bank_progress, memory_bank_changelog = read_memory_bank(workspace)
-            if memory_bank_progress or memory_bank_changelog:
-                self._append_output("📚 已加载 Memory Bank (进度+变更日志)\n", "system")
-
-            # ── Git state injection ──
-            git_state = detect_git_state(workspace)
-            if git_state:
-                project_context += "\n\n## Git 状态\n" + git_state
-                self._append_output("🔀 已注入 Git 状态\n", "system")
+        # ── Project context will be built in Worker thread to avoid blocking UI ──
+        auto_inject = self._auto_inject_cb.isChecked()
 
         # Create session if none
         if not self._current_session_id:
@@ -6743,17 +6745,18 @@ class GanggeDesktop(QMainWindow):
         self._worker = GanggeWorker(
             llm=llm, task=task, workspace=workspace,
             max_rounds=self._max_rounds_spin.value(),
-            plan_mode=plan_mode, project_context=project_context,
+            plan_mode=plan_mode, project_context="",  # built in worker thread
             system_prompt_extra=extra_prompt, auto_allow=auto_allow,
             batch_index=batch_index, batch_total=batch_total,
-            project_map=project_map,
-            file_registry=file_registry,
-            ganggerules=ganggerules,
-            memory_bank_progress=memory_bank_progress,
-            memory_bank_changelog=memory_bank_changelog,
+            project_map="",
+            file_registry={},
+            ganggerules="",
+            memory_bank_progress="",
+            memory_bank_changelog="",
             provider=self._provider_combo.currentData(),
             model_name=self._model_combo.currentText(),
             attachments=list(self._attachments),
+            auto_inject=auto_inject,
         )
         self._worker.text_block.connect(self._append_output)
         self._worker.tool_call_sig.connect(self._on_tool_call)
