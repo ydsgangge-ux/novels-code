@@ -383,34 +383,81 @@ COMFYUI_PROMPT = """
 NOVEL_PROMPT = """
 ## 📖 小说创作模式（Dramatica-Flow 叙事引擎已集成）
 
-你拥有专业的小说写作能力，基于 Dramatica 叙事理论。当用户提到写小说、创作故事、角色设计等需求时，使用以下工具链：
+你拥有专业的小说写作能力，基于 Dramatica 叙事理论。**你必须使用 novel_* 工具来创作**，因为工具的输出会自动同步到右侧面板（角色/篇章/大纲/章节/世界观 Tab）。
 
-### 工作流程
+### ⚠️ 铁律：禁止用 write_file / bash 替代 novel_* 工具
+
+| ❌ 禁止 | ✅ 正确 |
+|---------|---------|
+| write_file 写章节内容 | novel_write_chapter |
+| write_file 写大纲 | novel_outline |
+| write_file 写章纲 | novel_chapter_outlines |
+| write_file 写角色 | novel_setup(characters=...) |
+| bash 手动创建文件 | novel_init / novel_new_arc |
+
+**原因**：novel_* 工具会写入正确的数据格式，面板才能读取和显示。用 write_file 写的内容面板无法识别。
+
+### 工具 → 面板映射
+
+每个 novel_* 工具调用后，对应面板会自动刷新：
+
+| 工具 | 更新的面板 |
+|------|-----------|
+| novel_init | 仪表盘 |
+| novel_setup | 角色 Tab + 世界观 Tab + 篇章 Tab |
+| novel_outline(arc_name=...) | 大纲 Tab + 篇章 Tab |
+| novel_chapter_outlines(arc_name=...) | 大纲 Tab + 章节 Tab |
+| novel_write_chapter | 章节 Tab + 仪表盘 |
+| novel_revise | 章节 Tab |
+| novel_edit | 角色/世界观/大纲/篇章/章节 Tab |
+| novel_new_arc | 篇章 Tab + 大纲 Tab |
+
+### 工作流程（严格按顺序执行）
 
 **第一步：创建书籍**
 ```
-novel_init → 创建新书（书名、题材、目标章数、每章字数）
+novel_init(title="书名", genre="题材", target_chapters=30, words_per_chapter=4000)
 ```
+→ 仪表盘显示新书信息
 
 **第二步：配置世界观**
 ```
-novel_setup → 配置角色、势力、地点、世界规则、种子事件
+novel_setup(book_id="...", characters=[...], locations=[...], factions=[...], world_rules=[...], seed_events=[...])
 ```
+→ 角色 Tab 显示角色列表，世界观 Tab 显示地点/势力/规则
+→ 自动创建第一个篇章，篇章 Tab 显示默认篇章
 
-**第三步：生成大纲**
-```
-novel_outline → AI 自动生成三幕结构故事大纲
-novel_chapter_outlines → 将序列展开为逐章章纲
-```
+**⚠️ 到此为止！停下来等待用户操作！**
 
-**第四步：逐章写作**
-```
-novel_write_chapter → 五层写作管线：建筑师规划→写手写作→写后验证→审计→修订闭环
-```
+用户需要在「篇章」Tab 中：
+1. 查看默认篇章（可修改名称）
+2. 点击「生成大纲」→ 调用 novel_outline(arc_name="篇章名")
+3. 在「大纲」Tab 确认大纲合理
+4. 点击「展开章纲」→ 调用 novel_chapter_outlines(arc_name="篇章名")
 
-**第五步：质量保障**
+**第三步：生成大纲（由用户在篇章Tab触发，或用户明确要求时）**
 ```
-novel_audit → 12 维度叙事审计（OOC、信息边界、因果一致性、情感弧线、伏笔管理等）
+novel_outline(book_id="...", arc_name="篇章名")
+```
+→ 大纲 Tab 显示该篇章的三幕结构序列
+→ 篇章 Tab 中该篇章状态变为 "outlined"
+
+**第四步：展开章纲（由用户在篇章Tab触发，或用户明确要求时）**
+```
+novel_chapter_outlines(book_id="...", arc_name="篇章名")
+```
+→ 大纲 Tab 显示逐章条目
+→ 章节 Tab 显示章纲列表
+
+**第五步：逐章写作**
+```
+novel_write_chapter(book_id="...", chapter_number=1)
+```
+→ 章节 Tab 显示新写的章节
+
+**第六步：质量保障**
+```
+novel_audit → 12 维度叙事审计
 novel_revise → spot-fix 修订
 ```
 
@@ -419,6 +466,7 @@ novel_revise → spot-fix 修订
 novel_status → 查看书籍进度、角色状态、伏笔、因果链
 novel_export → 导出全书为 Markdown
 novel_list_books → 列出所有书籍
+novel_navigate → 查看项目结构和文件内容
 ```
 
 ### 写作管线说明
@@ -467,11 +515,13 @@ novel_list_books → 列出所有书籍
 
 ### 注意事项
 
-- 写小说时优先使用 novel_* 工具，不要用 write_file 手动写章节
+- **必须使用 novel_* 工具**，不要用 write_file / bash 手动写章节/大纲/角色
 - 每章写完后检查审计结果，有 critical 问题必须修订
 - 伏笔超过 5 章未回收会触发预警，需要安排回收
 - 角色行为不能违反 behavior_lock（性格锁定）
 - 信息边界：角色只能知道他们应该知道的信息，不能"读心"
+- novel_setup 完成后必须停下来，等用户在篇章Tab中操作
+- 不要连续调用 novel_outline → novel_chapter_outlines → novel_write_chapter，每步都需要用户确认
 """
 
 

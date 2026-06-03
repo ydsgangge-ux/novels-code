@@ -193,7 +193,9 @@ def _read_truth_bundle(workspace: str, book_id: str, keys: list) -> str:
 class NovelInitTool(BaseTool):
     name = "novel_init"
     description = (
-        "创建一本新小说。自动初始化模板角色、世界和事件，无需额外 setup 即可直接生成大纲。"
+        "创建一本新小说，初始化书籍骨架。"
+        "输出：仪表盘 Tab 显示新书信息。"
+        "下一步：调用 novel_setup 配置角色和世界观。"
     )
     input_schema = {
         "type": "object",
@@ -259,9 +261,10 @@ class NovelInitTool(BaseTool):
 class NovelSetupTool(BaseTool):
     name = "novel_setup"
     description = (
-        "配置小说的世界观：角色、势力、地点、世界规则。"
-        "可以一次性传入完整 JSON 配置，也可以分步配置。"
-        "配置完成后会自动生成故事圣经和初始化世界状态。"
+        "配置小说的世界观：角色、势力、地点、世界规则、种子事件。"
+        "输出：角色 Tab + 世界观 Tab + 篇章 Tab（自动创建第一个篇章）。"
+        "⚠️ 配置完成后必须停下来，等用户在篇章Tab中操作（生成大纲/展开章纲）。"
+        "不要继续调用 novel_outline 或 novel_chapter_outlines。"
     )
     input_schema = {
         "type": "object",
@@ -386,9 +389,9 @@ class NovelOutlineTool(BaseTool):
     name = "novel_outline"
     description = (
         "AI 基于 Dramatica 叙事理论自动生成三幕结构故事大纲。"
-        "如果尚未配置世界观，会自动用模板初始化。"
-        "生成的大纲包含多个序列，每个序列有叙事目标、戏剧功能、关键事件和结尾钩子。"
-        "如果提供 arc_name，则为指定篇章生成大纲并写入该篇章的 sequences 中。"
+        "输出：大纲 Tab + 篇章 Tab（状态变为 outlined）。"
+        "如果提供 arc_name，则为指定篇章生成大纲；否则为第一个 pending 篇章生成。"
+        "⚠️ 生成大纲后停下来，等用户确认后再调用 novel_chapter_outlines。"
     )
     input_schema = {
         "type": "object",
@@ -555,8 +558,9 @@ class NovelChapterOutlinesTool(BaseTool):
     name = "novel_chapter_outlines"
     description = (
         "将故事大纲的序列展开为逐章章纲。"
-        "每个章纲包含：章节号、标题、摘要、节拍序列、情感弧线、必完任务。"
-        "如果提供 arc_name，则只展开指定篇章的序列。"
+        "输出：大纲 Tab（显示章节条目）+ 章节 Tab（显示章纲列表）。"
+        "如果提供 arc_name，则只展开指定篇章的序列；否则展开第一个 outlined 篇章。"
+        "⚠️ 展开章纲后停下来，等用户确认后再调用 novel_write_chapter。"
     )
     input_schema = {
         "type": "object",
@@ -852,6 +856,7 @@ class NovelWriteChapterTool(BaseTool):
     name = "novel_write_chapter"
     description = (
         "使用五层写作管线写一章小说：建筑师规划→写手写作→写后验证→审计→修订闭环。"
+        "输出：章节 Tab（显示新章节）+ 仪表盘（更新进度和字数）。"
         "写完后自动提取因果链、生成摘要、更新世界状态。"
     )
     input_schema = {

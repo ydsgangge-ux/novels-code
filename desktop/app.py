@@ -6908,6 +6908,32 @@ class GanggeDesktop(QMainWindow):
                 diff=diff,
             )
 
+        # ── Auto-refresh novel panels after novel tool calls ──
+        if tool_name in self._NOVEL_TOOL_NAMES and not is_error:
+            refresh_map = {
+                "novel_init": [self._refresh_dashboard],
+                "novel_setup": [self._refresh_characters, self._refresh_world, self._refresh_arcs],
+                "novel_outline": [self._refresh_outline, self._refresh_arcs],
+                "novel_chapter_outlines": [self._refresh_outline, self._refresh_chapters],
+                "novel_write_chapter": [self._refresh_chapters, self._refresh_dashboard],
+                "novel_audit": [],
+                "novel_revise": [self._refresh_chapters],
+                "novel_edit": [self._refresh_characters, self._refresh_world, self._refresh_outline, self._refresh_arcs, self._refresh_chapters],
+                "novel_new_arc": [self._refresh_arcs, self._refresh_outline],
+                "novel_export": [],
+                "novel_status": [],
+                "novel_list_books": [],
+                "novel_navigate": [],
+                "novel_graph_query": [self._refresh_graph],
+                "novel_consistency_check": [],
+                "novel_graph_rebuild": [self._refresh_graph],
+            }
+            for fn in refresh_map.get(tool_name, []):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
     def _append_output(self, text: str, role: str = ""):
         """Render message as a styled bubble card."""
         cursor = self._output.textCursor()
