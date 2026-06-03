@@ -2768,6 +2768,24 @@ class NovelRightPanel(QWidget):
             return
         try:
             data = json.loads(outline_path.read_text(encoding="utf-8"))
+
+            # 自动迁移旧格式：将顶层 sequences 包装为第一个篇章
+            if not data.get("arcs") and data.get("sequences"):
+                title = data.get("title", "我的小说")
+                default_arc = {
+                    "name": f"{title}·第一篇",
+                    "order": 1,
+                    "goal": data.get("total_goal", ""),
+                    "summary": data.get("logline", ""),
+                    "sequences": data["sequences"],
+                    "status": "outlined",
+                }
+                data["arcs"] = [default_arc]
+                outline_path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
             total_goal = data.get("total_goal", "")
             info_parts = [f"<b>{data.get('title', '大纲')}</b> | Logline: {data.get('logline', '')}"]
             if total_goal:
@@ -3019,7 +3037,7 @@ class NovelRightPanel(QWidget):
         if not self._workspace or not self._book_id:
             return
 
-        outline_path = Path(self._workspace) / "books" / self._book_id / "state" / "outline_state.json"
+        outline_path = Path(self._workspace) / "books" / self._book_id / "state" / "outline.json"
         if not outline_path.exists():
             self._arcs_info.setText("尚未生成大纲，请先生成大纲")
             return
@@ -3029,6 +3047,24 @@ class NovelRightPanel(QWidget):
             arcs = data.get("arcs", [])
             total_goal = data.get("total_goal", "")
 
+            # 自动迁移旧格式：将顶层 sequences 包装为第一个篇章
+            if not arcs and data.get("sequences"):
+                title = data.get("title", "我的小说")
+                default_arc = {
+                    "name": f"{title}·第一篇",
+                    "order": 1,
+                    "goal": total_goal or "",
+                    "summary": data.get("logline", ""),
+                    "sequences": data["sequences"],
+                    "status": "outlined",
+                }
+                arcs = [default_arc]
+                data["arcs"] = arcs
+                outline_path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
             info_parts = []
             if total_goal:
                 info_parts.append(f"总目标：{total_goal}")
@@ -3036,7 +3072,7 @@ class NovelRightPanel(QWidget):
             self._arcs_info.setText(" | ".join(info_parts))
 
             if not arcs:
-                self._arcs_info.setText(self._arcs_info.text() + "\n⚠️ 当前大纲为旧格式（无篇章结构），请先通过「新篇章」按钮或对话创建第一个篇章。")
+                self._arcs_info.setText("尚无篇章，请点击「添加篇章」创建第一个篇章。")
                 return
 
             for arc in arcs:
