@@ -2,12 +2,17 @@
 
 Supports OpenAI, DeepSeek, Ollama — any provider that implements
 the OpenAI Chat Completions API.
+
+Includes automatic retry with exponential backoff for rate limits (429)
+and transient server errors (5xx).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
@@ -23,6 +28,11 @@ from gangge.layer5_llm.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Retry configuration ──
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2.0  # seconds
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class OpenAICompatLLM(BaseLLM):
@@ -212,8 +222,44 @@ class OpenAICompatLLM(BaseLLM):
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
 
-        raw = await self.client.chat.completions.create(**kwargs)
-        return self._parse_response(raw)
+        # ── Retry with exponential backoff for 429/5xx ──
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                raw = await self.client.chat.completions.create(**kwargs)
+                return self._parse_response(raw)
+            except Exception as e:
+                last_error = e
+
+                # Check if this is a retryable error
+                status_code = getattr(e, "status_code", None)
+                if status_code is None and hasattr(e, "response"):
+                    status_code = getattr(e.response, "status_code", None)
+
+                is_retryable = status_code in RETRYABLE_STATUS_CODES
+
+                if not is_retryable or attempt == MAX_RETRIES:
+                    # Non-retryable error or max retries exhausted
+                    if is_retryable:
+                        logger.error(
+                            f"[LLM] Rate limit/server error after {MAX_RETRIES} retries: {status_code}"
+                        )
+                    raise
+
+                # Exponential backoff with jitter
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                # Add jitter: random 0-1s
+                jitter = (hash(str(time.time())) % 1000) / 1000.0
+                total_delay = delay + jitter
+
+                logger.warning(
+                    f"[LLM] Retryable error (status={status_code}), "
+                    f"retry {attempt + 1}/{MAX_RETRIES} in {total_delay:.1f}s"
+                )
+                await asyncio.sleep(total_delay)
+
+        # Should not reach here, but just in case
+        raise last_error
 
     async def stream(
         self,

@@ -169,6 +169,9 @@ class LLMResponse:
 class BaseLLM(ABC):
     """Abstract base class for all LLM providers."""
 
+    # Default context window — subclasses should override
+    CONTEXT_WINDOW_TOKENS: int = 128_000
+
     def __init__(
         self,
         model: str,
@@ -180,6 +183,11 @@ class BaseLLM(ABC):
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.kwargs = kwargs
+
+    @property
+    def max_context_tokens(self) -> int:
+        """Maximum context window size in tokens."""
+        return self.CONTEXT_WINDOW_TOKENS
 
     @abstractmethod
     async def chat(

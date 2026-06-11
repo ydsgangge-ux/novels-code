@@ -107,7 +107,10 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
         "label": "DeepSeek",
         "api_key_env": "DEEPSEEK_API_KEY",
         "model_default": "deepseek-chat",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "models": [
+            "deepseek-chat", "deepseek-reasoner",
+            "deepseek-chat-v4", "deepseek-reasoner-v4",
+        ],
         "base_url_editable": True,
         "base_url_default": "https://api.deepseek.com/v1",
     },
@@ -4990,6 +4993,30 @@ class GanggeDesktop(QMainWindow):
         self._plan_mode_cb = QCheckBox(_t("cb_plan_mode"), self)
         self._plan_mode_cb.hide()
 
+        self._thinking_mode_cb = QCheckBox("思考模式", self)
+        self._thinking_mode_cb.hide()
+
+        self._mm_enable_cb = QCheckBox("启用多模态模型", self)
+        self._mm_enable_cb.hide()
+
+        self._mm_provider_combo = QComboBox(self)
+        for k, cfg in PROVIDER_CONFIGS.items():
+            self._mm_provider_combo.addItem(cfg["label"], k)
+        self._mm_provider_combo.hide()
+
+        self._mm_api_key_input = QLineEdit(self)
+        self._mm_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._mm_api_key_input.setPlaceholderText("Multimodal API Key")
+        self._mm_api_key_input.hide()
+
+        self._mm_model_combo = QComboBox(self)
+        self._mm_model_combo.setEditable(True)
+        self._mm_model_combo.hide()
+
+        self._mm_base_url_input = QLineEdit(self)
+        self._mm_base_url_input.setPlaceholderText("Multimodal Base URL")
+        self._mm_base_url_input.hide()
+
         self._extra_prompt = QPlainTextEdit(self)
         self._extra_prompt.setPlaceholderText(_t("extra_prompt_placeholder"))
         self._extra_prompt.setMaximumHeight(100)
@@ -4999,6 +5026,10 @@ class GanggeDesktop(QMainWindow):
     def _setup_ui(self):
         # ── Init config widgets (needed before _load_settings) ──
         self._init_config_widgets()
+        # Connect multimodal provider change to update model presets
+        self._mm_provider_combo.currentIndexChanged.connect(self._update_mm_model_combo)
+        # Initialize multimodal model combo with presets
+        self._update_mm_model_combo()
 
         c = QWidget()
         self.setCentralWidget(c)
@@ -5368,7 +5399,15 @@ class GanggeDesktop(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle(_t("settings_title"))
         dlg.setMinimumSize(520, 520)
-        dlg.setStyleSheet("QDialog{background:#0d1117;}")
+        dlg.setStyleSheet("""
+            QDialog{background:#0d1117;}
+            QComboBox{background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 8px;}
+            QComboBox::drop-down{border:none;width:24px;}
+            QComboBox::down-arrow{image:none;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid #8b949e;}
+            QComboBox QAbstractItemView{background:#161b22;color:#c9d1d9;border:1px solid #30363d;outline:none;padding:2px;}
+            QComboBox QAbstractItemView::item{padding:4px 8px;}
+            QComboBox QAbstractItemView::item:selected{background:#1f6feb;color:#fff;}
+        """)
 
         layout = QVBoxLayout(dlg)
         layout.setSpacing(12)
@@ -5422,7 +5461,70 @@ class GanggeDesktop(QMainWindow):
             )
         )
         lf.addRow("", _show_key)
+
+        _thinking_mode = QCheckBox("🧠 思考模式 (Reasoning)")
+        _thinking_mode.setChecked(self._thinking_mode_cb.isChecked())
+        _thinking_mode.setToolTip("启用后使用推理模型（如 DeepSeek-R1 / OpenAI o1），响应更慢但推理更强")
+        lf.addRow("", _thinking_mode)
+
         form.addWidget(llm_g)
+
+        # ── Multimodal LLM ──
+        mm_g = QGroupBox("多模态模型 (图片识别)")
+        mm_g.setStyleSheet(llm_g.styleSheet())
+        mm_lay = QFormLayout(mm_g)
+        mm_lay.setSpacing(8)
+        mm_lay.addRow(QLabel("主模型不支持图片时自动切换到此模型"))
+
+        _mm_enable = QCheckBox("启用独立多模态模型")
+        _mm_enable.setChecked(self._mm_enable_cb.isChecked())
+        mm_lay.addRow("", _mm_enable)
+
+        _mm_provider = QComboBox()
+        for k, cfg in PROVIDER_CONFIGS.items():
+            _mm_provider.addItem(cfg["label"], k)
+        idx = _mm_provider.findData(self._mm_provider_combo.currentData())
+        if idx >= 0:
+            _mm_provider.setCurrentIndex(idx)
+        mm_lay.addRow("Provider", _mm_provider)
+
+        _mm_api_key = QLineEdit()
+        _mm_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        _mm_api_key.setPlaceholderText("API Key (留空则复用主模型 Key)")
+        _mm_api_key.setText(self._mm_api_key_input.text())
+        mm_lay.addRow("API Key", _mm_api_key)
+
+        _mm_model = QComboBox()
+        _mm_model.setEditable(True)
+        mm_provider_key = _mm_provider.currentData()
+        for m in self._MM_MODEL_PRESETS.get(mm_provider_key, []):
+            _mm_model.addItem(m)
+        _mm_model.setCurrentText(self._mm_model_combo.currentText())
+        mm_lay.addRow("模型", _mm_model)
+        # Auto-update model list when provider changes
+        def _update_mm_combo(prov, model_combo):
+            model_combo.clear()
+            pk = prov.currentData()
+            for m in self._MM_MODEL_PRESETS.get(pk, []):
+                model_combo.addItem(m)
+        _mm_provider.currentIndexChanged.connect(
+            lambda: _update_mm_combo(_mm_provider, _mm_model)
+        )
+
+        _mm_base_url = QLineEdit()
+        _mm_base_url.setPlaceholderText("Base URL（可选，默认使用 Provider 地址）")
+        _mm_base_url.setText(self._mm_base_url_input.text())
+        mm_lay.addRow("Base URL", _mm_base_url)
+
+        _mm_show_key = QCheckBox(_t("settings_show_key"))
+        _mm_show_key.toggled.connect(
+            lambda chk: _mm_api_key.setEchoMode(
+                QLineEdit.EchoMode.Normal if chk else QLineEdit.EchoMode.Password
+            )
+        )
+        mm_lay.addRow("", _mm_show_key)
+
+        form.addWidget(mm_g)
 
         # ── Advanced ──
         ad_g = QGroupBox(_t("settings_advanced"))
@@ -5549,6 +5651,12 @@ class GanggeDesktop(QMainWindow):
                 self._model_combo.addItem(_model.itemText(i), _model.itemData(i))
             self._model_combo.setCurrentText(_model.currentText())
             self._base_url_input.setText(_base_url.text())
+            self._thinking_mode_cb.setChecked(_thinking_mode.isChecked())
+            self._mm_enable_cb.setChecked(_mm_enable.isChecked())
+            self._mm_provider_combo.setCurrentIndex(_mm_provider.currentIndex())
+            self._mm_api_key_input.setText(_mm_api_key.text())
+            self._mm_model_combo.setCurrentText(_mm_model.currentText())
+            self._mm_base_url_input.setText(_mm_base_url.text())
             self._max_rounds_spin.setValue(_rounds.value())
             self._auto_allow_cb.setChecked(_auto_allow.isChecked())
             self._auto_inject_cb.setChecked(_auto_inject.isChecked())
@@ -5561,6 +5669,12 @@ class GanggeDesktop(QMainWindow):
             self._settings.setValue("github_token", _gh_token.text())
             self._settings.setValue("github_username", _gh_username.text())
             self._settings.setValue("github_email", _gh_email.text())
+            # Save multimodal settings
+            self._settings.setValue("mm_enable", _mm_enable.isChecked())
+            self._settings.setValue("mm_provider", _mm_provider.currentData())
+            self._settings.setValue("mm_api_key", _mm_api_key.text())
+            self._settings.setValue("mm_model", _mm_model.text())
+            self._settings.setValue("mm_base_url", _mm_base_url.text())
             self._update_provider_fields()
             self._sync_env_file()
             # Apply language change
@@ -5603,6 +5717,25 @@ class GanggeDesktop(QMainWindow):
         }
         if provider in base_url_map and self._base_url_input.text().strip():
             updates[base_url_map[provider]] = self._base_url_input.text().strip()
+
+        # ── Multimodal LLM settings ──
+        if self._mm_enable_cb.isChecked():
+            mm_provider = self._mm_provider_combo.currentData()
+            mm_model = self._mm_model_combo.currentText().strip()
+            mm_key = self._mm_api_key_input.text().strip()
+            mm_url = self._mm_base_url_input.text().strip()
+            if mm_model:
+                updates["MM_ENABLED"] = "true"
+                updates["MM_PROVIDER"] = mm_provider
+                updates["MM_MODEL"] = mm_model
+                if mm_key:
+                    updates["MM_API_KEY"] = mm_key
+                if mm_url:
+                    updates["MM_BASE_URL"] = mm_url
+
+        # ── Thinking mode ──
+        if self._thinking_mode_cb.isChecked():
+            updates["THINKING_MODE"] = "true"
 
         try:
             # Read existing .env
@@ -6541,11 +6674,67 @@ class GanggeDesktop(QMainWindow):
             self._base_url_input.setText("")
             self._base_url_input.setPlaceholderText("(默认地址)")
 
+    _MM_MODEL_PRESETS = {
+        "qwen": ["qwen-vl-max", "qwen-vl-plus", "qwen2-vl-72b-instruct"],
+        "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
+        "anthropic": ["claude-3-5-sonnet-20241022", "claude-3-opus-20240229"],
+        "deepseek": ["deepseek-vl2", "deepseek-vl2-small"],
+        "siliconflow": ["Qwen/Qwen2-VL-72B-Instruct", "Qwen/Qwen-VL-Plus", "OpenGVLab/InternVL2-8B"],
+        "ollama": ["llava", "llava:13b", "bakllava"],
+        "custom": [],
+    }
+
+    def _update_mm_model_combo(self):
+        """Update multimodal model combo when provider changes."""
+        self._mm_model_combo.clear()
+        provider_key = self._mm_provider_combo.currentData()
+        presets = self._MM_MODEL_PRESETS.get(provider_key, [])
+        if presets:
+            self._mm_model_combo.addItems(presets)
+            self._mm_model_combo.setCurrentText(presets[0])
+        else:
+            self._mm_model_combo.setPlaceholderText("输入模型名称...")
+
+    def _get_thinking_model(self, provider_key: str, model: str) -> str:
+        """Map to thinking/reasoning model variant when thinking mode is on."""
+        thinking_map = {
+            "deepseek": {
+                "deepseek-chat": "deepseek-reasoner",
+                "deepseek-chat-v4": "deepseek-reasoner-v4",
+                "deepseek-reasoner": "deepseek-reasoner",
+                "deepseek-reasoner-v4": "deepseek-reasoner-v4",
+            },
+            "openai": {
+                "gpt-4o": "o1",
+                "gpt-4o-mini": "o3-mini",
+                "gpt-4-turbo": "o1",
+                "gpt-3.5-turbo": "o3-mini",
+            },
+            "siliconflow": {
+                "deepseek-ai/DeepSeek-V3": "deepseek-ai/DeepSeek-R1",
+                "Qwen/Qwen2.5-72B-Instruct": "Qwen/QwQ-32B-Preview",
+            },
+        }
+        provider_map = thinking_map.get(provider_key, {})
+        return provider_map.get(model, model)
+
     def _build_llm(self) -> BaseLLM | None:
         provider_key = self._provider_combo.currentData()
         api_key = self._api_key_input.text().strip()
         model = self._model_combo.currentText().strip()
         cfg = PROVIDER_CONFIGS.get(provider_key, {})
+
+        # Apply thinking mode model mapping
+        if self._thinking_mode_cb.isChecked():
+            mapped = self._get_thinking_model(provider_key, model)
+            if mapped != model:
+                logger.info(f"思考模式: 模型 {model} → {mapped}")
+            model = mapped
+
+        temperature = 0.0
+        # Reasoning models don't use temperature
+        if self._thinking_mode_cb.isChecked() and provider_key in ("openai", "deepseek"):
+            temperature = 1.0  # reasoning models require temp=1
 
         if provider_key == "anthropic":
             if not api_key:
@@ -6554,11 +6743,11 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 请输入 Anthropic API Key")
                 return None
             from gangge.layer5_llm.anthropic import AnthropicLLM
-            return AnthropicLLM(api_key=api_key, model=model, max_tokens=8192, temperature=0.0)
+            return AnthropicLLM(api_key=api_key, model=model, max_tokens=8192, temperature=temperature)
         elif provider_key == "ollama":
             url = self._base_url_input.text().strip() or "http://localhost:11434/v1"
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=url, api_key="ollama", model=model, max_tokens=8192, temperature=0.0)
+            return OpenAICompatLLM(base_url=url, api_key="ollama", model=model, max_tokens=8192, temperature=temperature)
         elif provider_key == "custom":
             base_url = self._base_url_input.text().strip()
             if not base_url:
@@ -6568,7 +6757,7 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 自定义模式需要填写模型名称")
                 return None
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=8192, temperature=0.0)
+            return OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=8192, temperature=temperature)
         else:
             api_key_env = cfg.get("api_key_env", "")
             if not api_key and api_key_env:
@@ -6582,7 +6771,33 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 请填写 Base URL")
                 return None
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=base_url, api_key=api_key, model=model, max_tokens=8192, temperature=0.0)
+            return OpenAICompatLLM(base_url=base_url, api_key=api_key, model=model, max_tokens=8192, temperature=temperature)
+
+    def _build_multimodal_llm(self) -> BaseLLM | None:
+        """Build a separate multimodal LLM for image recognition tasks."""
+        if not self._mm_enable_cb.isChecked():
+            return None
+        provider_key = self._mm_provider_combo.currentData()
+        api_key = self._mm_api_key_input.text().strip()
+        model = self._mm_model_combo.currentText().strip()
+        if not model:
+            return None
+        cfg = PROVIDER_CONFIGS.get(provider_key, {})
+        base_url = self._mm_base_url_input.text().strip() or cfg.get("base_url_default", "")
+        if not base_url:
+            return None
+        if not api_key:
+            # Fall back to main model's API key for the same provider
+            if provider_key == self._provider_combo.currentData():
+                api_key = self._api_key_input.text().strip()
+            if not api_key:
+                api_key_env = cfg.get("api_key_env", "")
+                if api_key_env:
+                    api_key = os.environ.get(api_key_env, "")
+        if not api_key and provider_key not in ("ollama",):
+            return None
+        from gangge.layer5_llm.openai_compat import OpenAICompatLLM
+        return OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=4096, temperature=0.0)
 
     # ── Run / Batch / Cancel ──────────────────────────────────
     _NOVEL_TOOL_NAMES = frozenset([
@@ -6796,8 +7011,17 @@ class GanggeDesktop(QMainWindow):
         batch_text = f" [{batch_index + 1}/{batch_total}]" if batch_total > 1 else ""
         self._status_label.setText(f"🚀 执行{batch_text}...")
 
+        # ── Use multimodal LLM if attachments contain images ──
+        effective_llm = llm
+        if self._attachments and self._mm_enable_cb.isChecked():
+            mm_llm = self._build_multimodal_llm()
+            if mm_llm:
+                effective_llm = mm_llm
+                logger.info("使用多模态模型处理图片附件")
+                self._append_output("🖼️ 检测到图片附件，自动切换到多模态模型\n", "system")
+
         self._worker = GanggeWorker(
-            llm=llm, task=task, workspace=workspace,
+            llm=effective_llm, task=task, workspace=workspace,
             max_rounds=self._max_rounds_spin.value(),
             plan_mode=plan_mode, project_context="",  # built in worker thread
             system_prompt_extra=extra_prompt, auto_allow=auto_allow,
@@ -7128,6 +7352,7 @@ class GanggeDesktop(QMainWindow):
         self._settings.setValue("workspace", self._ws_input.text())
         self._settings.setValue("max_rounds", self._max_rounds_spin.value())
         self._settings.setValue("plan_mode", self._plan_mode_cb.isChecked())
+        self._settings.setValue("thinking_mode", self._thinking_mode_cb.isChecked())
         self._settings.setValue("auto_allow", self._auto_allow_cb.isChecked())
         self._settings.setValue("auto_inject", self._auto_inject_cb.isChecked())
         self._settings.setValue("test_verify", self._test_verify_cb.isChecked())
@@ -7167,10 +7392,26 @@ class GanggeDesktop(QMainWindow):
             self._file_browser.set_root(str(auto_ws))
         self._max_rounds_spin.setValue(int(self._settings.value("max_rounds", 30)))
         self._plan_mode_cb.setChecked(self._settings.value("plan_mode", "false") == "true")
+        self._thinking_mode_cb.setChecked(self._settings.value("thinking_mode", "false") == "true")
         self._auto_allow_cb.setChecked(self._settings.value("auto_allow", "true") == "true")
         self._auto_inject_cb.setChecked(self._settings.value("auto_inject", "true") != "false")
         self._test_verify_cb.setChecked(self._settings.value("test_verify", "true") != "false")
         self._git_commit_cb.setChecked(self._settings.value("git_commit", "true") != "false")
+        # Restore multimodal settings
+        self._mm_enable_cb.setChecked(self._settings.value("mm_enable", "false") == "true")
+        mm_p = self._settings.value("mm_provider", "qwen")
+        mm_idx = self._mm_provider_combo.findData(mm_p)
+        if mm_idx >= 0:
+            self._mm_provider_combo.setCurrentIndex(mm_idx)
+        mm_key = self._settings.value("mm_api_key", "")
+        if mm_key:
+            self._mm_api_key_input.setText(mm_key)
+        mm_model = self._settings.value("mm_model", "")
+        if mm_model:
+            self._mm_model_combo.setCurrentText(mm_model)
+        mm_url = self._settings.value("mm_base_url", "")
+        if mm_url:
+            self._mm_base_url_input.setText(mm_url)
         ep = self._settings.value("extra_prompt", "")
         if ep:
             self._extra_prompt.setPlainText(ep)

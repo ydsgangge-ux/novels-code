@@ -92,6 +92,7 @@ class LoopConfig:
     """Configuration for the agentic loop."""
 
     max_tool_rounds: int = 30        # Max tool-call iterations (可在 .env 中通过 MAX_ROUNDS 覆盖)
+    llm_timeout: float = 300.0       # LLM response timeout in seconds (本地模型可能较慢)
     max_tokens: int = 8192
     system_prompt: str = ""
     workspace_dir: str = "."
@@ -367,96 +368,66 @@ class AgenticLoop:
         except Exception as e:
             logger.warning(f"[Memory Bank] 自动保存 changelog.md 失败: {e}")
 
-    def _get_all_tool_defs(self) -> list:
-        """获取内置工具 + MCP 工具的完整 definitions 列表。"""
-        defs = list(self.tools.get_definitions())
+    async def _git_checkpoint(self, label: str) -> str | None:
+        """Run Shadow Git checkpoint in a thread to avoid blocking the event loop."""
+        if not self.config.workspace_dir:
+            return None
+        try:
+            from gangge.layer4_tools.shadow_git import ShadowGit
+            sg = ShadowGit(self.config.workspace_dir)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: sg.checkpoint(label) if (sg.is_available() or sg.ensure_init()) else None,
+            )
+            if result:
+                logger.info(f"Shadow Git checkpoint: {result}")
+            return result
+        except Exception as e:
+            logger.warning(f"Shadow Git checkpoint failed: {e}")
+            return None
+
+    def _get_all_tool_defs(self, phase: int | None = None) -> list:
+        """获取工具 definitions 列表，按阶段过滤。
+
+        Args:
+            phase: 如果提供，只返回该阶段及以下的工具。
+                   如果 None，返回全部工具。
+        """
+        defs = list(self.tools.get_definitions(phase=phase))
         if self.mcp_manager:
             mcp_defs = self.mcp_manager.build_tool_definitions()
             defs.extend(mcp_defs)
         return defs
 
     def _build_system_prompt(self, reads_cache: dict[str, int] | None = None, round_num: int = 0, consecutive_timeouts: int = 0) -> str:
+        """Build system prompt — minimal rules + auto-injected todo state."""
         prompt = build_system_prompt(
             workspace_dir=self.config.workspace_dir,
-            project_context=self.config.project_context,
+            project_context=self.config.project_context[:500] if self.config.project_context else "",
             plan_mode=self.config.plan_mode,
-            memory_bank_progress=self.config.memory_bank_progress,
-            memory_bank_changelog=self.config.memory_bank_changelog,
-            memory_bank_decisions=self.config.memory_bank_decisions,
+            memory_bank_progress=self.config.memory_bank_progress[:200] if self.config.memory_bank_progress else "",
+            memory_bank_changelog=self.config.memory_bank_changelog[:200] if self.config.memory_bank_changelog else "",
+            memory_bank_decisions=self.config.memory_bank_decisions[:300] if self.config.memory_bank_decisions else "",
         )
 
-        # ── Inject .ganggerules ──
+        # ── Inject .ganggerules (project-specific rules) ──
         if self.config.ganggerules:
-            prompt += f"\n\n## 项目规则 (.ganggerules)\n{self.config.ganggerules}"
+            prompt += f"\n\n## 项目规则 (.ganggerules)\n{self.config.ganggerules[:500]}"
 
-        # ── Inject project map (lazy loading) ──
-        if self.config.project_map:
-            if self.config.enable_lazy_project_map and round_num > 0:
-                file_count = self.config.project_map.count("\n") + 1
-                prompt += f"\n\n## 项目文件索引\n[项目索引已在第1轮加载，包含约 {file_count} 个条目，如需查看请用 list_dir 工具]"
-            else:
-                prompt += f"\n\n## 项目文件索引 (请利用这些信息定位文件，不要反复 read_file)\n{self.config.project_map}"
-
-        # ── Inject symbol table ──
-        if self.config.symbol_table and round_num == 0:
-            prompt += f"\n\n{self.config.symbol_table}"
-
-        # ── Inject dependency graph summary ──
-        if self.config.dep_graph_summary and round_num == 0:
-            prompt += f"\n\n{self.config.dep_graph_summary}"
-
-        # ── Inject file registry ──
-        if self.config.file_registry:
-            lines = ["", "## 已修改的文件记录 (实时更新)"]
-            for path, info in sorted(self.config.file_registry.items()):
-                action = info.get("last_action", "?")
-                rnd = info.get("round", "?")
-                detail = ""
-                if info.get("classes"):
-                    detail += f" classes:{','.join(info['classes'][:5])}"
-                if info.get("functions"):
-                    detail += f" funcs:{','.join(info['functions'][:8])}"
-                lines.append(f"- `{path}` [{action}, 第{rnd}轮]{detail}")
-            prompt += "\n".join(lines)
-
-        # ── Inject reads cache (context de-duplication) ──
-        if reads_cache:
-            prompt += "\n\n## 已读取的文件 (避免重复读取)\n"
-            for path, rnd in reads_cache.items():
-                prompt += f"- `{path}` (第 {rnd} 轮已读取)\n"
-            prompt += "\n如需再次查看，请优先用 grep 搜索特定内容，而非重新 read_file。"
-
-        # ── Memory Bank update instruction ──
-        prompt += (
-            "\n\n## 任务结束时\n"
-            "在最终回复中，请附带以下更新信息（包含在 ```memory-bank 标记中）：\n"
-            "1. **progress.md** 更新：新增/完成的模块、当前进度百分比、下一步要做什么\n"
-            "2. **changelog.md** 更新：本次变更摘要、涉及文件列表、风险事项\n"
-            "3. **重要**：progress.md 中必须包含'下一步'字段，写明还需要做什么，这样下次'继续'时不需要重新读文件\n"
-        )
-
-        # ── Consecutive timeout warning ──
-        if consecutive_timeouts >= 2:
-            prompt += (
-                f"\n\n## ⚠️ 超时警告 (连续 {consecutive_timeouts} 次)\n"
-                "最近多次命令执行超时！请立即采取以下措施之一：\n"
-                "1. 缩小扫描/遍历范围（如只扫描特定子目录而非整个C盘）\n"
-                "2. 降低超时阈值（使用更短的 timeout 参数）\n"
-                "3. 跳过耗时操作，先完成其他任务\n"
-                "4. 使用更快的替代方案（如用 grep 搜索而非全量扫描）\n"
-                "绝对不要用同样的方式重试超时的命令！\n"
-            )
+        # ── Inject TodoWrite state (most important: model always knows where it is) ──
+        from gangge.layer3_agent.tools.todo import get_todo_state
+        todo_state = get_todo_state()
+        todo_injection = todo_state.format_for_injection()
+        if todo_injection:
+            prompt += f"\n\n{todo_injection}"
 
         # ── Approaching max rounds warning ──
         remaining = self.config.max_tool_rounds - round_num
         if remaining <= 3:
             prompt += (
                 f"\n\n## ⚠️ 轮数即将耗尽 (剩余 {remaining} 轮)\n"
-                "即将达到最大工具调用轮数限制！请立即：\n"
-                "1. 停止调用新工具，输出最终总结\n"
-                "2. 如果有未完成的任务，在总结中说明当前进度和剩余工作\n"
-                "3. 附带 memory-bank 更新\n"
-                "不要再启动新的耗时操作！\n"
+                "停止调用新工具，输出当前进度和剩余工作。\n"
             )
 
         return prompt
@@ -680,7 +651,14 @@ class AgenticLoop:
             return ""
 
     async def run(self, messages: list[Message]) -> LoopResult:
-        """Run the agentic loop until LLM returns end_turn.
+        """Run the agentic loop — simple while loop + TodoWrite + tool layering.
+
+        Core design (inspired by Claude Code):
+        - Software manages state (todo, context, permissions)
+        - Model only decides "what to do next"
+        - Tool layering: start with explore tools, open more as needed
+        - TodoWrite: model maintains task list via tool, system injects every round
+        - Token-based compression: auto-compress at 92% context usage
 
         Args:
             messages: Conversation history (will be modified in place).
@@ -688,7 +666,42 @@ class AgenticLoop:
         Returns:
             LoopResult with final response and execution records.
         """
-        # ── PATCH: include MCP tool definitions ──
+        # ── Reset tool phase for new task ──
+        self.tools.reset_phase()
+
+        # ── Detect agent profile from user message ──
+        # This determines which tools the model can see.
+        # Coding → 12 tools, Novel → 22 tools, Research → 9 tools
+        user_message = ""
+        for msg in reversed(messages):
+            if msg.role == Role.USER:
+                text = msg.get_text().strip()
+                if text and not text.startswith("[系统提示]"):
+                    user_message = text
+                    break
+
+        from gangge.layer3_agent.tools.registry import detect_agent_profile
+        profile = detect_agent_profile(user_message)
+        self.tools.set_profile(profile)
+        profile_desc = {
+            "coding": "编程", "novel": "小说创作", "research": "研究搜索"
+        }.get(profile, profile)
+        logger.info(f"[Loop] Agent profile: {profile} ({profile_desc})")
+
+        # ── Clear stale todo state ──
+        from gangge.layer3_agent.tools.todo import get_todo_state
+        todo_state = get_todo_state()
+        # Clear previous task's todos unless user explicitly says "继续"
+        _should_keep_todos = False
+        for msg in messages:
+            if msg.role == Role.USER:
+                text = msg.get_text().strip()
+                if text and ("继续" in text or "continue" in text.lower()):
+                    _should_keep_todos = True
+                    break
+        if not _should_keep_todos:
+            todo_state.clear()
+
         # ── Load Memory Bank from .gangge/ files ──
         self._ensure_memory_bank()
 
@@ -702,23 +715,18 @@ class AgenticLoop:
                     break
 
         # ── Shadow Git: auto-checkpoint before AI starts ──
-        shadow_checkpoint = None
-        if self.config.workspace_dir:
-            from gangge.layer4_tools.shadow_git import ShadowGit
-            sg = ShadowGit(self.config.workspace_dir)
-            if sg.is_available() or sg.ensure_init():
-                before_label = f"checkpoint: before task — {user_task_desc}" if user_task_desc else "checkpoint: before AI task"
-                shadow_checkpoint = sg.checkpoint(before_label)
-                if shadow_checkpoint:
-                    logger.info(f"Shadow Git checkpoint: {shadow_checkpoint}")
+        shadow_checkpoint = await self._git_checkpoint(
+            f"checkpoint: before task — {user_task_desc}" if user_task_desc else "checkpoint: before AI task"
+        )
 
-        tool_defs = self._get_all_tool_defs()
+        tool_defs = self._get_all_tool_defs(phase=self.tools.get_current_phase())
         is_empty_dir = detect_empty_workspace(self.config.workspace_dir)
         executions: list[ToolExecution] = []
         total_tokens: dict[str, int] = {"input": 0, "output": 0}
         has_modified_files = False
         any_tool_succeeded = False
         consecutive_timeouts = 0
+        consecutive_readonly_rounds = 0  # Track rounds with only read tools
         file_registry = dict(self.config.file_registry)  # mutable copy
         reads_cache: dict[str, int] = {}  # path -> round_number for de-dup
         memory_bank_update = ""  # extracted from LLM's final response
@@ -790,27 +798,41 @@ class AgenticLoop:
                     text=f"⚠️ 即将达到最大轮数限制（剩余 {remaining} 轮），请尽快总结当前进度并输出最终回复！\n",
                 ))
 
-            # ── Rebuild system prompt with fresh project context ──
+            # ── Rebuild system prompt with fresh project context + todo state ──
             self.config.file_registry = file_registry
             system = self._build_system_prompt(reads_cache=reads_cache, round_num=round_num, consecutive_timeouts=consecutive_timeouts)
             self.emitter.emit(EventType.THINKING, f"正在思考...")
 
-            # ── Sliding window: trim old messages ──
-            if self.config.enable_sliding_window and round_num > 0:
-                messages = self._trim_history(messages)
+            # ── Refresh tool definitions based on current phase ──
+            current_phase = self.tools.get_current_phase()
+            tool_defs = self._get_all_tool_defs(phase=current_phase)
 
-            # ── Summary compression every N rounds (fallback, disabled when sliding window is on) ──
-            if (
-                not self.config.enable_sliding_window
-                and self.config.enable_summary_compression
-                and round_num > 0
-                and round_num % self.config.summary_compression_interval == 0
-            ):
-                messages = await self._compress_history(messages, round_num)
-                await self._emit(ContentBlock(
-                    type=ContentType.TEXT,
-                    text=f"\n📦 历史压缩: 第 {round_num} 轮，压缩旧对话以节省上下文\n",
-                ))
+            # ── Token-based auto compression (Claude Code style: 92% threshold) ──
+            # Check token usage and compress if approaching context limit
+            if round_num > 0:
+                total_input = total_tokens.get("input", 0)
+                # Estimate context usage: if input tokens exceed 92% of max, compress
+                context_limit = self.config.max_tokens * 12  # rough char-to-token ratio
+                if total_input > 0 and self.llm.max_context_tokens > 0:
+                    usage_ratio = total_input / self.llm.max_context_tokens
+                    if usage_ratio > 0.92:
+                        messages = await self._compress_history(messages, round_num)
+                        await self._emit(ContentBlock(
+                            type=ContentType.TEXT,
+                            text=f"\n📦 上下文压缩: 使用率 {usage_ratio:.0%}，已自动压缩旧对话\n",
+                        ))
+                elif self.config.enable_sliding_window:
+                    # Fallback: sliding window
+                    messages = self._trim_history(messages)
+                elif (
+                    self.config.enable_summary_compression
+                    and round_num % self.config.summary_compression_interval == 0
+                ):
+                    messages = await self._compress_history(messages, round_num)
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text=f"\n📦 历史压缩: 第 {round_num} 轮\n",
+                    ))
 
             # ── Deduplicate repeated file reads to save tokens ──
             if round_num > 0 and reads_cache:
@@ -828,10 +850,10 @@ class AgenticLoop:
                         tools=tool_defs,
                         system=system,
                     ),
-                    timeout=120.0,
+                    timeout=self.config.llm_timeout,
                 )
             except asyncio.TimeoutError:
-                error_text = "LLM 调用超时（120s），请检查网络或 API 状态"
+                error_text = f"LLM 调用超时（{self.config.llm_timeout:.0f}s），请检查网络或 API 状态"
                 logger.error(error_text)
                 self.emitter.emit(EventType.ERROR, error_text)
                 return LoopResult(
@@ -869,105 +891,53 @@ class AgenticLoop:
                 if block.type in (ContentType.TEXT, ContentType.THINKING):
                     await self._emit(block)
 
-            # 4. If no tool calls → force retry (rounds 0-2) or exit
+            # 4. If no tool calls → check if done, then exit
+            # Core principle: the model decides when to stop by not calling tools.
+            # We only force retry in the first 2 rounds to get things started.
+            # After that, no tool call = task is done (or model is stuck, either way we exit).
             has_tool_call = response.stop_reason == "tool_use" and response.tool_calls
             if not has_tool_call:
                 text = response.text or ""
 
-                intent_keywords = [
-                    "开始执行", "接下来执行", "开始写", "接下来写", "现在写",
-                    "创建", "写入", "写一个", "编写", "生成",
-                    "开始构建", "开始创建", "开始实现", "开始开发",
-                    "write_file", "edit_file", "bash",
-                    "第 1 步", "第1步", "步骤 1", "step 1",
-                    "接下来", "下一步", "然后", "之后",
-                ]
-                has_intent = any(kw in text for kw in intent_keywords)
-                completion_keywords = ["任务完成", "🎉", "全部完成", "已完成所有", "所有文件已创建"]
-                has_completion = any(kw in text for kw in completion_keywords)
-
-                wait_user_keywords = [
-                    "等待用户", "等你操作", "等你确认", "请先", "请手动",
-                    "请在", "需要你操作", "需要你确认", "等你", "请点击",
-                    "请前往", "请到", "请选择", "用户确认后", "确认后再",
-                    "不要生成大纲", "不要写正文", "到此为止",
-                ]
-                has_wait_user = any(kw in text for kw in wait_user_keywords)
-
-                # ── Allow long planning text without forcing retry ──
-                # When the LLM outputs a lengthy planning response (e.g., for a large file),
-                # one round of "thinking" is acceptable. Don't penalize it.
-                is_long_planning = (
-                    len(text) > 400
-                    and any(kw in text for kw in ["📋", "模块", "规划", "✅", "任务清单", "🗂️", "📁"])
-                    and not has_completion
-                    and not has_intent
-                )
-
-                should_force_retry = False
-                force_reason = ""
-
-                if has_wait_user:
-                    pass
-                elif is_long_planning:
-                    pass
-                elif round_num <= 2 and not has_modified_files and not any_tool_succeeded:
-                    should_force_retry = True
-                    force_reason = "early_round_no_tool"
-                elif has_intent and not has_completion:
-                    should_force_retry = True
-                    force_reason = "intent_without_action"
-                elif not has_completion and any_tool_succeeded and round_num < self.config.max_tool_rounds - 3:
-                    should_force_retry = True
-                    force_reason = "no_tool_no_completion"
-
-                if should_force_retry:
-                    self.emitter.emit(EventType.WARNING,
-                                      f"第 {round_num+1} 轮未调用工具（{force_reason}），正在强制重试")
+                # ── Check Todo state: if all tasks completed, exit immediately ──
+                todo_pending = todo_state.get_pending()
+                if not todo_pending and todo_state.get_all():
+                    # All todos completed — exit regardless of what model says
                     await self._emit(ContentBlock(
                         type=ContentType.TEXT,
-                        text="⚠️ AI 未使用工具，正在强制重试...\n",
+                        text="📋 所有任务已完成，自动退出\n",
                     ))
-                    if force_reason == "early_round_no_tool" and is_empty_dir:
+
+                # ── Only force retry in the first 2 rounds to get things started ──
+                elif round_num <= 1 and not any_tool_succeeded and not has_modified_files:
+                    # Early rounds with no tool use — give a nudge
+                    self.emitter.emit(EventType.WARNING,
+                                      f"第 {round_num+1} 轮未调用工具，正在引导")
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text="⚠️ AI 未使用工具，正在引导...\n",
+                    ))
+                    if is_empty_dir:
                         force_msg = (
-                            "你刚才只输出了文字，没有调用任何工具。\n\n"
-                            "当前工作目录是空的，不需要探索，直接开始构建。\n\n"
-                            "请立刻：\n"
-                            "1. 输出规划（技术栈 + 模块 + 任务清单）\n"
-                            "2. 调用 write_file 或 bash 开始创建第一个文件\n\n"
-                            "现在开始，不要再回复纯文字。"
-                        )
-                    elif force_reason == "no_tool_no_completion":
-                        force_msg = (
-                            "你刚才只输出了文字，没有调用任何工具，且任务尚未完成。\n\n"
-                            "请立刻调用工具继续执行任务（write_file / edit_file / bash）。\n"
-                            "如果任务确实已完成，请输出'🎉 任务完成'。\n"
-                            "不要只输出文字规划或说明，必须同时调用工具。"
+                            "当前工作目录是空的，不需要探索，直接开始构建。\n"
+                            "请立刻调用 write_file 或 bash 开始创建第一个文件。"
                         )
                     else:
                         force_msg = (
-                            "你刚才只输出了文字，没有调用任何工具。\n\n"
-                            "你说要做某事但没有实际调用 write_file 或 bash。\n\n"
-                            "Gangge Code 要求：说要做就立刻做，不要只说不做。\n\n"
-                            "请立刻重新回复，这次必须同时调用工具（write_file / edit_file / bash）。\n"
-                            "不要再输出纯文字规划，直接行动。"
+                            "请立刻调用工具开始执行任务（write_file / edit_file / bash / read_file）。\n"
+                            "不要只输出文字规划，直接行动。"
                         )
                     messages.append(Message(
                         role=Role.USER,
                         content=[ContentBlock(type=ContentType.TEXT, text=force_msg)],
                     ))
                     continue
-                # ── Test verification ──
-                if has_modified_files:
-                    messages.append(Message(
-                        role=Role.USER,
-                        content=[ContentBlock(
-                            type=ContentType.TEXT,
-                            text="[系统提示] 检测到文件已被修改。请运行相关测试或检查来验证修改是否正确。如果没有测试，至少运行 lint 或编译检查。",
-                        )],
-                    ))
-                    has_modified_files = False
-                    continue
+
+                # ── All other cases: model stopped calling tools → exit ──
+                # This is the Claude Code way: no tool call = done.
+                # We don't force retry for "no_tool_no_completion" or
+                # inject "please run tests" — that creates infinite loops.
+
                 # ── Extract Memory Bank update from final response ──
                 final_text = response.text
                 mb_extracted = ""
@@ -982,11 +952,10 @@ class AgenticLoop:
 
                 # ── Shadow Git: post-task checkpoint ──
                 after_checkpoint = None
-                if self.config.workspace_dir and has_modified_files:
-                    from gangge.layer4_tools.shadow_git import ShadowGit
-                    sg = ShadowGit(self.config.workspace_dir)
-                    after_label = f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
-                    after_checkpoint = sg.checkpoint(after_label)
+                if has_modified_files:
+                    after_checkpoint = await self._git_checkpoint(
+                        f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
+                    )
 
                 self.emitter.emit_done(total_steps=round_num + 1)
                 return LoopResult(
@@ -1011,6 +980,18 @@ class AgenticLoop:
             for tool_call in response.tool_calls:
                 tool_name = tool_call.name
                 tool_input = tool_call.input
+
+                # ── Auto-advance phase if model uses a higher-phase tool ──
+                # This is intentional: the model "knows" what it needs to do,
+                # and we open the gate automatically rather than rejecting.
+                from gangge.layer3_agent.tools.registry import TOOL_PHASES, DEFAULT_PHASE
+                tool_phase = TOOL_PHASES.get(tool_name, DEFAULT_PHASE)
+                current_phase = self.tools.get_current_phase()
+                if tool_phase > current_phase:
+                    self.tools.set_phase(tool_phase)
+                    phase_names = {1: "探索", 2: "编写", 3: "运行", 4: "特殊"}
+                    logger.info(f"[Loop] Auto-advancing phase {current_phase}→{tool_phase} for {tool_name}")
+
                 action = self._get_permission_action(tool_name, tool_input)
                 self.emitter.emit_tool_start(tool_name, tool_input)
 
@@ -1093,6 +1074,19 @@ class AgenticLoop:
                 if not result.is_error:
                     any_tool_succeeded = True
                     consecutive_timeouts = 0
+
+                    # ── Runtime auto-advance Todo state ──
+                    # The system manages todo progress, not the model.
+                    # When a productive tool succeeds, auto-complete current todo
+                    # and auto-start the next one.
+                    todo_state = get_todo_state()
+                    if todo_state.auto_advance(tool_name, tool_input, success=True):
+                        current = todo_state.get_current()
+                        if current:
+                            await self._emit(ContentBlock(
+                                type=ContentType.TEXT,
+                                text=f"  📋 自动推进: ▶️ {current['content']}\n",
+                            ))
                 else:
                     is_timeout = isinstance(result.output, str) and result.output.startswith("[超时]")
                     if is_timeout:
@@ -1162,6 +1156,78 @@ class AgenticLoop:
                 ))
 
             messages.append(tool_results_msg)
+
+            # ── Track consecutive read-only rounds ──
+            # If the model only called read tools (read_file, grep, glob, list_dir)
+            # for several rounds after already modifying files, it's likely done
+            # and just reviewing — exit early.
+            write_tools = {"write_file", "edit_file", "bash", "novel_write_chapter",
+                           "novel_init", "novel_setup", "novel_outline", "create_tool"}
+            round_had_write = any(tc.name in write_tools for tc in response.tool_calls)
+            if round_had_write:
+                consecutive_readonly_rounds = 0
+            elif any_tool_succeeded and has_modified_files:
+                consecutive_readonly_rounds += 1
+
+            if consecutive_readonly_rounds >= 3:
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="📋 连续3轮仅使用只读工具，任务已完成，自动退出\n",
+                ))
+                final_text = ""
+                mb_extracted = ""
+                after_checkpoint = None
+                if has_modified_files:
+                    after_checkpoint = await self._git_checkpoint(
+                        f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
+                    )
+                self.emitter.emit_done(total_steps=round_num + 1)
+                return LoopResult(
+                    final_response=final_text,
+                    tool_executions=executions,
+                    total_rounds=round_num + 1,
+                    total_tokens=total_tokens,
+                    extra={
+                        "memory_bank_update": mb_extracted,
+                        "shadow_checkpoint_before": shadow_checkpoint or "",
+                        "shadow_checkpoint_after": after_checkpoint or "",
+                    },
+                )
+
+            # ── Check if all todos are completed → exit early ──
+            # This is the key fix: even if the model keeps calling tools
+            # (read_file, bash, etc.), if all planned tasks are done, we exit.
+            todo_state = get_todo_state()
+            todo_pending = todo_state.get_pending()
+            todo_all = todo_state.get_all()
+            if todo_all and not todo_pending:
+                # All todos completed — no need to keep looping
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="📋 所有任务已完成，自动退出\n",
+                ))
+                final_text = ""
+                mb_extracted = ""
+
+                # Shadow Git checkpoint
+                after_checkpoint = None
+                if has_modified_files:
+                    after_checkpoint = await self._git_checkpoint(
+                        f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
+                    )
+
+                self.emitter.emit_done(total_steps=round_num + 1)
+                return LoopResult(
+                    final_response=final_text,
+                    tool_executions=executions,
+                    total_rounds=round_num + 1,
+                    total_tokens=total_tokens,
+                    extra={
+                        "memory_bank_update": mb_extracted,
+                        "shadow_checkpoint_before": shadow_checkpoint or "",
+                        "shadow_checkpoint_after": after_checkpoint or "",
+                    },
+                )
 
         self.emitter.emit(EventType.WARNING, "达到最大工具调用轮数限制")
 
