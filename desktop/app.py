@@ -1040,6 +1040,9 @@ class GanggeWorker(QThread):
 
             self.text_block.emit("✅ 项目上下文加载完成\n", "system")
 
+        # ── TIMING: 开始计时设置阶段 ──
+        _t0 = time.monotonic()
+
         async def ask_callback(req: PermissionRequest) -> PermissionDecision:
             if self.auto_allow and req.risk.level.value in ("safe", "low"):
                 return PermissionDecision.ALLOW
@@ -1064,6 +1067,11 @@ class GanggeWorker(QThread):
             ask_user_callback=_ask_user_callback,
             llm=self.llm,
         )
+        _t1 = time.monotonic()
+        _cost = _t1 - _t0
+        logger.info("[Timing] create_tool_registry 耗时: %.1fs", _cost)
+        if _cost > 2:
+            self.text_block.emit(f"⏱ 工具注册耗时: {_cost:.1f}s\n", "system")
 
         extra = self.system_prompt_extra
         system_text = build_system_prompt(
@@ -1097,7 +1105,13 @@ class GanggeWorker(QThread):
                     get_or_build_index, build_dependency_graph,
                     format_symbol_table,
                 )
+                _t2 = time.monotonic()
                 index = get_or_build_index(self.workspace)
+                _t3 = time.monotonic()
+                _cost = _t3 - _t2
+                logger.info("[Timing] get_or_build_index 耗时: %.1fs", _cost)
+                if _cost > 1:
+                    self.text_block.emit(f"⏱ 代码索引耗时: {_cost:.1f}s (文件数: {len(index.get('files',{}))})\n", "system")
                 config.symbol_table = format_symbol_table(index)
                 dep_graph = build_dependency_graph(index, self.workspace)
                 if dep_graph:
@@ -1118,7 +1132,7 @@ class GanggeWorker(QThread):
             if block.type == ContentType.TEXT:
                 self.text_block.emit(block.text, "assistant")
             elif block.type == ContentType.THINKING:
-                self.text_block.emit(f"🤔 {block.text}", "system")
+                self.text_block.emit(block.text, "thinking")
             elif block.type == ContentType.TOOL_USE:
                 inp = json.dumps(block.tool_input, ensure_ascii=False)[:200]
                 self.text_block.emit(_t("execution_tool_call", name=block.tool_name, input=inp), "tool")
@@ -1145,6 +1159,12 @@ class GanggeWorker(QThread):
         else:
             messages.append(Message(role=Role.USER, content=full_task))
             self.text_block.emit(f"\n📋 任务: {full_task}\n", "user")
+        # ── TIMING: 总设置耗时 ──
+        _t4 = time.monotonic()
+        _cost = _t4 - _t0
+        if _cost > 1:
+            self.text_block.emit(f"⏱ 设置阶段总耗时: {_cost:.1f}s\n", "system")
+            logger.info("[Timing] 设置阶段总耗时: %.1fs", _cost)
         if self.batch_total > 1:
             self.text_block.emit(f"📌 批处理进度: {self.batch_index + 1}/{self.batch_total}\n", "system")
         self.text_block.emit(_t("execution_workspace", path=self.workspace), "system")
@@ -5197,11 +5217,13 @@ class GanggeDesktop(QMainWindow):
         # ── Chat output ──
         self._output = QTextBrowser()
         self._output.setReadOnly(True)
-        self._output.setOpenExternalLinks(True)
+        self._output.setOpenLinks(False)
         self._output.setStyleSheet(
             "QTextBrowser{background:#0d1117;border:none;"
             "padding:16px 20px;color:#c9d1d9;font-size:13px;}"
         )
+        self._output.anchorClicked.connect(self._on_thinking_link)
+        self._thinking_bubbles: dict[str, str] = {}  # id → full text
         self._highlighter = OutputHighlighter(self._output.document())
         center_lay.addWidget(self._output, 1)
 
@@ -7223,10 +7245,72 @@ class GanggeDesktop(QMainWindow):
                             logging.getLogger("gangge").warning("面板刷新失败: %s - %s", fn.__name__, e)
                 QTimer.singleShot(0, _safe_refresh)
 
+    def _on_thinking_link(self, url):
+        """Handle click on a thinking bubble's 'expand' link."""
+        bubble_id = url.toString()
+        full_text = self._thinking_bubbles.get(bubble_id, "")
+        if not full_text:
+            return
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QPushButton, QTextBrowser
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🧠 完整思考过程")
+        dlg.resize(680, 540)
+        dlg.setStyleSheet("QDialog{background:#0d1117;}")
+        lay = QVBoxLayout(dlg)
+        tb = QTextBrowser()
+        tb.setPlainText(full_text)
+        tb.setStyleSheet(
+            "QTextBrowser{background:#161b22;color:#c9d1d9;border:1px solid #30363d;"
+            "border-radius:6px;padding:12px;font-family:Consolas,monospace;font-size:12px;}"
+        )
+        lay.addWidget(tb)
+        btn = QPushButton("关闭")
+        btn.setStyleSheet(
+            "QPushButton{background:#21262d;color:#c9d1d9;border:1px solid #30363d;"
+            "border-radius:6px;padding:8px 20px;}"
+            "QPushButton:hover{background:#30363d;}"
+        )
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
+        dlg.exec()
+
     def _append_output(self, text: str, role: str = ""):
         """Render message as a styled bubble card."""
         cursor = self._output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        # ── Thinking content: render as collapsible block ──
+        if role == "thinking":
+            import hashlib
+            bubble_id = hashlib.md5(text.encode()).hexdigest()[:12]
+            self._thinking_bubbles[bubble_id] = text
+            escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            # Truncate preview to ~300 chars
+            preview = escaped[:300]
+            truncated = len(escaped) > 300
+            if truncated:
+                preview = preview[:297] + "..."
+            expand_link = ""
+            if truncated:
+                expand_link = (
+                    f'<br><a href="{bubble_id}" style="color:#58a6ff;text-decoration:none;'
+                    f'font-size:12px;">📖 查看完整思考过程 ({len(text)} 字符)</a>'
+                )
+            bubble_html = (
+                f'<div style="margin:6px 40px 6px 8px;padding:10px 14px;'
+                f'background:#0d1117;border:1px solid #30363d;border-left:3px solid #58a6ff;'
+                f'border-radius:8px;">'
+                f'<div style="font-size:11px;color:#8b949e;margin-bottom:4px;">'
+                f'🧠 <strong style="color:#58a6ff;">思考过程</strong>'
+                f'<span style="float:right;color:#484f58;">{datetime.now().strftime("%H:%M")}</span>'
+                f'</div>'
+                f'<div style="color:#8b949e;font-size:12px;line-height:1.6;font-style:italic;">'
+                f'{preview}{expand_link}</div></div>'
+            )
+            cursor.insertHtml(bubble_html)
+            self._output.setTextCursor(cursor)
+            self._output.ensureCursorVisible()
+            return
 
         # ── Bubble styling by role ──
         bubble_cfg = {

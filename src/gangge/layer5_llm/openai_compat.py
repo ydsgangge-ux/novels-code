@@ -166,6 +166,11 @@ class OpenAICompatLLM(BaseLLM):
         blocks = []
         message = choice.message
 
+        # ── Reasoning/thinking content (DeepSeek-R1, OpenAI o1, etc.) ──
+        reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+        if reasoning:
+            blocks.append(ContentBlock(type=ContentType.THINKING, text=reasoning))
+
         if message.content:
             blocks.append(ContentBlock(type=ContentType.TEXT, text=message.content))
 
@@ -293,6 +298,11 @@ class OpenAICompatLLM(BaseLLM):
 
             if delta.content:
                 yield ContentBlock(type=ContentType.TEXT, text=delta.content)
+
+            # ── Reasoning/thinking content (DeepSeek-R1, etc.) ──
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if reasoning:
+                yield ContentBlock(type=ContentType.THINKING, text=reasoning)
 
             if hasattr(delta, "tool_calls") and delta.tool_calls:
                 for tc in delta.tool_calls:
