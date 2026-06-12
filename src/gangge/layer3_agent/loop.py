@@ -441,6 +441,12 @@ class AgenticLoop:
                 "2. 如果没有测试文件，创建基本测试文件并运行\n"
                 "3. 测试失败则修复后再结束\n"
             )
+            prompt += (
+                "\n## 环境与依赖\n"
+                "需要安装依赖时，直接使用 bash 运行 pip/npm/curl 等命令。\n"
+                "可以从网络下载资源文件，使用 curl 或 Invoke-WebRequest。\n"
+                "解压文件使用 unzip 或 Expand-Archive。\n"
+            )
 
         return prompt
 
