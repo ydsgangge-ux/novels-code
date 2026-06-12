@@ -22,7 +22,9 @@ class PermissionRule:
     description: str = ""
     scope: str = "bash"  # "bash" | "file_read" | "file_write" | "network"
 
-    def matches(self, target: str) -> bool:
+    def matches(self, target: str | None) -> bool:
+        if target is None:
+            return False
         try:
             return bool(re.search(self.pattern, target, re.IGNORECASE))
         except re.error:

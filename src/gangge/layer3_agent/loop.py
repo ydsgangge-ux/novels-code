@@ -188,6 +188,8 @@ class AgenticLoop:
         # ── PATCH: MCP Client Manager ──
         self.mcp_manager: MCPClientManager | None = None
         self._init_mcp()
+        self._profile: str = ""  # set by run()
+        self._llm_failures: int = 0  # consecutive LLM call failures
 
     def set_stream_callback(self, callback: StreamCallback) -> None:
         """Set callback for streaming content blocks."""
@@ -430,6 +432,16 @@ class AgenticLoop:
                 "停止调用新工具，输出当前进度和剩余工作。\n"
             )
 
+        # ── Coding profile: inject test verification instruction on first round ──
+        if round_num == 0 and getattr(self, "_profile", "") == "coding":
+            prompt += (
+                "\n\n## 测试验证\n"
+                "代码实现完成后，必须运行 pytest 验证代码正确性：\n"
+                "1. 如果项目有测试文件，运行 `pytest -v` 确认现有测试通过\n"
+                "2. 如果没有测试文件，创建基本测试文件并运行\n"
+                "3. 测试失败则修复后再结束\n"
+            )
+
         return prompt
 
     def _deduplicate_reads(
@@ -633,10 +645,10 @@ class AgenticLoop:
     def _get_permission_action(self, tool_name: str, tool_input: dict) -> str:
         """Extract the action string for permission checking."""
         if tool_name == "bash":
-            return tool_input.get("command", "")
+            return tool_input.get("command", "") or ""
         elif tool_name in ("read_file", "write_file", "edit_file"):
-            return tool_input.get("path", "")
-        return tool_name
+            return tool_input.get("path", "") or ""
+        return tool_name or ""
 
     async def _auto_lint_check(self, file_path: str) -> str:
         """Run a quick lint check on a modified file. Returns summary or empty string."""
@@ -682,6 +694,7 @@ class AgenticLoop:
 
         from gangge.layer3_agent.tools.registry import detect_agent_profile
         profile = detect_agent_profile(user_message)
+        self._profile = profile  # store for _build_system_prompt
         self.tools.set_profile(profile)
         profile_desc = {
             "coding": "编程", "novel": "小说创作", "research": "研究搜索"
@@ -863,7 +876,28 @@ class AgenticLoop:
                     total_tokens=total_tokens,
                 )
             except Exception as e:
-                error_text = f"LLM 调用失败: {e}"
+                error_str = str(e)
+                # ── Retryable errors (rate limit / server overload) ──
+                # 429 = too many requests, 503 = service unavailable, 5xx = server error
+                is_retryable = any(code in error_str for code in ("429", "503", "502", "500"))
+                if is_retryable:
+                    # Count consecutive failures to cap retries
+                    consecutive_failures = getattr(self, "_llm_failures", 0) + 1
+                    self._llm_failures = consecutive_failures
+                    max_retries = 3
+                    if consecutive_failures <= max_retries:
+                        backoff = [5, 15, 30][consecutive_failures - 1]
+                        await self._emit(ContentBlock(
+                            type=ContentType.TEXT,
+                            text=f"⏳ API 限流，{backoff} 秒后自动重试（第 {consecutive_failures}/{max_retries} 次）...\n",
+                        ))
+                        await asyncio.sleep(backoff)
+                        continue  # retry this round
+                    else:
+                        error_text = f"LLM 调用失败（已重试 {max_retries} 次仍限流）: {e}"
+                else:
+                    error_text = f"LLM 调用失败: {e}"
+
                 logger.error(error_text)
                 self.emitter.emit(EventType.ERROR, error_text)
 
@@ -881,6 +915,9 @@ class AgenticLoop:
             # Track token usage
             total_tokens["input"] += response.usage.get("input_tokens", 0)
             total_tokens["output"] += response.usage.get("output_tokens", 0)
+
+            # Reset consecutive failure counter on success
+            self._llm_failures = 0
 
             # 2. Add assistant message to history
             assistant_msg = Message(role=Role.ASSISTANT, content=response.content)
@@ -933,10 +970,27 @@ class AgenticLoop:
                     ))
                     continue
 
-                # ── All other cases: model stopped calling tools → exit ──
+                # ── All other cases: model stopped calling tools ──
+                # If there are still pending todos → nudge, don't exit
+                todo_pending = todo_state.get_pending()
+                if todo_pending:
+                    next_todo = todo_state.get_current()
+                    todo_hint = f" 当前待办: {next_todo['content']}" if next_todo else ""
+                    self.emitter.emit(EventType.WARNING,
+                                      f"第 {round_num+1} 轮未调用工具，仍有待办任务{todo_hint}")
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text=f"⚠️ AI 未使用工具，仍有待办任务{todo_hint}\n",
+                    ))
+                    force_msg = "请立即调用工具执行当前待办任务，不要只输出文字。"
+                    messages.append(Message(
+                        role=Role.USER,
+                        content=[ContentBlock(type=ContentType.TEXT, text=force_msg)],
+                    ))
+                    continue
+
+                # No pending todos, model chose to stop → exit normally
                 # This is the Claude Code way: no tool call = done.
-                # We don't force retry for "no_tool_no_completion" or
-                # inject "please run tests" — that creates infinite loops.
 
                 # ── Extract Memory Bank update from final response ──
                 final_text = response.text
@@ -1170,29 +1224,39 @@ class AgenticLoop:
                 consecutive_readonly_rounds += 1
 
             if consecutive_readonly_rounds >= 3:
-                await self._emit(ContentBlock(
-                    type=ContentType.TEXT,
-                    text="📋 连续3轮仅使用只读工具，任务已完成，自动退出\n",
-                ))
-                final_text = ""
-                mb_extracted = ""
-                after_checkpoint = None
-                if has_modified_files:
-                    after_checkpoint = await self._git_checkpoint(
-                        f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
+                # ── Don't exit if there are still pending todos ──
+                todo_state = get_todo_state()
+                if todo_state.get_pending():
+                    # Still have work to do — reset counter and nudge
+                    consecutive_readonly_rounds = 0
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text="⚠️ 还有待办任务未完成，请继续执行\n",
+                    ))
+                else:
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text="📋 连续3轮仅使用只读工具，任务已完成，自动退出\n",
+                    ))
+                    final_text = ""
+                    mb_extracted = ""
+                    after_checkpoint = None
+                    if has_modified_files:
+                        after_checkpoint = await self._git_checkpoint(
+                            f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
+                        )
+                    self.emitter.emit_done(total_steps=round_num + 1)
+                    return LoopResult(
+                        final_response=final_text,
+                        tool_executions=executions,
+                        total_rounds=round_num + 1,
+                        total_tokens=total_tokens,
+                        extra={
+                            "memory_bank_update": mb_extracted,
+                            "shadow_checkpoint_before": shadow_checkpoint or "",
+                            "shadow_checkpoint_after": after_checkpoint or "",
+                        },
                     )
-                self.emitter.emit_done(total_steps=round_num + 1)
-                return LoopResult(
-                    final_response=final_text,
-                    tool_executions=executions,
-                    total_rounds=round_num + 1,
-                    total_tokens=total_tokens,
-                    extra={
-                        "memory_bank_update": mb_extracted,
-                        "shadow_checkpoint_before": shadow_checkpoint or "",
-                        "shadow_checkpoint_after": after_checkpoint or "",
-                    },
-                )
 
             # ── Check if all todos are completed → exit early ──
             # This is the key fix: even if the model keeps calling tools

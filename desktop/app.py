@@ -905,9 +905,11 @@ class GanggeWorker(QThread):
                  model_name: str = "",
                  previous_messages: list | None = None,
                  attachments: list | None = None,
-                 auto_inject: bool = False):
+                 auto_inject: bool = False,
+                 multimodal_llm: Any | None = None):
         super().__init__()
         self.llm = llm
+        self.multimodal_llm = multimodal_llm
         self.task = task
         self.workspace = workspace
         self.previous_messages = previous_messages or []
@@ -1042,6 +1044,7 @@ class GanggeWorker(QThread):
 
         # ── TIMING: 开始计时设置阶段 ──
         _t0 = time.monotonic()
+        self.text_block.emit("⏱ 正在初始化 (工具注册/代码索引/系统提示)...\n", "system")
 
         async def ask_callback(req: PermissionRequest) -> PermissionDecision:
             if self.auto_allow and req.risk.level.value in ("safe", "low"):
@@ -1062,16 +1065,18 @@ class GanggeWorker(QThread):
             await loop.run_in_executor(None, self._ask_user_event.wait)
             return self._ask_user_answer
 
+        self.text_block.emit("⏱ 正在注册工具 (导入模块)...\n", "system")
         registry = create_tool_registry(
             workspace=self.workspace,
             ask_user_callback=_ask_user_callback,
             llm=self.llm,
+            multimodal_llm=self.multimodal_llm,
+            attachments=self._attachments,
         )
         _t1 = time.monotonic()
         _cost = _t1 - _t0
-        logger.info("[Timing] create_tool_registry 耗时: %.1fs", _cost)
-        if _cost > 2:
-            self.text_block.emit(f"⏱ 工具注册耗时: {_cost:.1f}s\n", "system")
+        logging.getLogger("gangge").info("[Timing] create_tool_registry 耗时: %.1fs", _cost)
+        self.text_block.emit(f"⏱ 工具注册完成: {_cost:.1f}s\n", "system")
 
         extra = self.system_prompt_extra
         system_text = build_system_prompt(
@@ -1100,6 +1105,7 @@ class GanggeWorker(QThread):
         )
 
         if self.workspace:
+            self.text_block.emit("⏱ 正在构建代码索引...\n", "system")
             try:
                 from gangge.layer4_tools.repo_index import (
                     get_or_build_index, build_dependency_graph,
@@ -1109,9 +1115,8 @@ class GanggeWorker(QThread):
                 index = get_or_build_index(self.workspace)
                 _t3 = time.monotonic()
                 _cost = _t3 - _t2
-                logger.info("[Timing] get_or_build_index 耗时: %.1fs", _cost)
-                if _cost > 1:
-                    self.text_block.emit(f"⏱ 代码索引耗时: {_cost:.1f}s (文件数: {len(index.get('files',{}))})\n", "system")
+                logging.getLogger("gangge").info("[Timing] get_or_build_index 耗时: %.1fs", _cost)
+                self.text_block.emit(f"⏱ 代码索引完成: {_cost:.1f}s (文件数: {len(index.get('files',{}))})\n", "system")
                 config.symbol_table = format_symbol_table(index)
                 dep_graph = build_dependency_graph(index, self.workspace)
                 if dep_graph:
@@ -1146,15 +1151,11 @@ class GanggeWorker(QThread):
         messages = list(self.previous_messages)
 
         if self._attachments:
-            user_msg = Message(role=Role.USER, content=full_task)
-            for att in self._attachments:
-                user_msg.content.append(ContentBlock(
-                    type=ContentType.IMAGE,
-                    media_type=att["media_type"],
-                    media_data=att["data"],
-                ))
-            messages.append(user_msg)
             att_names = ", ".join(a["name"] for a in self._attachments)
+            # Don't send image content to main LLM (it may not support images).
+            # Mention the attachment name and let the LLM call vision tool.
+            enhanced_task = f"{full_task}\n\n[附件: {att_names}] 如需识别图片内容，请使用 vision 工具。"
+            messages.append(Message(role=Role.USER, content=enhanced_task))
             self.text_block.emit(f"\n📋 任务: {full_task}\n📎 附件: {att_names}\n", "user")
         else:
             messages.append(Message(role=Role.USER, content=full_task))
@@ -1162,9 +1163,8 @@ class GanggeWorker(QThread):
         # ── TIMING: 总设置耗时 ──
         _t4 = time.monotonic()
         _cost = _t4 - _t0
-        if _cost > 1:
-            self.text_block.emit(f"⏱ 设置阶段总耗时: {_cost:.1f}s\n", "system")
-            logger.info("[Timing] 设置阶段总耗时: %.1fs", _cost)
+        self.text_block.emit(f"⏱ 初始化总耗时: {_cost:.1f}s\n", "system")
+        logging.getLogger("gangge").info("[Timing] 初始化总耗时: %.1fs", _cost)
         if self.batch_total > 1:
             self.text_block.emit(f"📌 批处理进度: {self.batch_index + 1}/{self.batch_total}\n", "system")
         self.text_block.emit(_t("execution_workspace", path=self.workspace), "system")
@@ -1175,6 +1175,9 @@ class GanggeWorker(QThread):
 
         # ── 5. Run loop ──
         result = await loop.run(messages)
+
+        # Store raw Message objects for multi-turn context
+        self._conversation_messages = messages
 
         # ── CHANGE: 方案C — 聚合消息并发射到主线程 ──────────
         # messages 现在的格式：USER, ASSISTANT(含tool_use+text), TOOL 交替
@@ -5245,6 +5248,7 @@ class GanggeDesktop(QMainWindow):
         input_outer_lay.addWidget(self._attachment_bar)
 
         self._attachments: list[dict[str, str]] = []
+        self._conversation_history: list = []  # accumulated messages across tasks
 
         input_lay = QHBoxLayout()
         input_lay.setSpacing(8)
@@ -5413,6 +5417,9 @@ class GanggeDesktop(QMainWindow):
         )
         self._ws_input.textChanged.connect(
             lambda: self._novel_sidebar.set_workspace(self._ws_input.text())
+        )
+        self._ws_input.textChanged.connect(
+            lambda: self._on_workspace_changed()
         )
 
     # ── Settings Dialog ───────────────────────────────────────
@@ -5695,7 +5702,7 @@ class GanggeDesktop(QMainWindow):
             self._settings.setValue("mm_enable", _mm_enable.isChecked())
             self._settings.setValue("mm_provider", _mm_provider.currentData())
             self._settings.setValue("mm_api_key", _mm_api_key.text())
-            self._settings.setValue("mm_model", _mm_model.text())
+            self._settings.setValue("mm_model", _mm_model.currentText())
             self._settings.setValue("mm_base_url", _mm_base_url.text())
             self._update_provider_fields()
             self._sync_env_file()
@@ -6668,6 +6675,14 @@ class GanggeDesktop(QMainWindow):
     def _update_provider_fields(self):
         key = self._provider_combo.currentData()
         cfg = PROVIDER_CONFIGS.get(key, PROVIDER_CONFIGS["deepseek"])
+
+        # ── Reload API key for the new provider ──
+        saved_key = self._settings.value(f"api_key_{key}", "")
+        if saved_key:
+            self._api_key_input.setText(saved_key)
+        else:
+            self._api_key_input.clear()
+
         self._model_combo.clear()
         if key == "ollama":
             base_url = self._base_url_input.text().strip() or cfg["base_url_default"]
@@ -6982,6 +6997,10 @@ class GanggeDesktop(QMainWindow):
 
         self._execute_single(llm, task, batch_index=total - remaining, batch_total=total)
 
+    def _on_workspace_changed(self):
+        """Clear conversation history when the workspace changes."""
+        self._conversation_history = []
+
     def _execute_single(self, llm: BaseLLM, task: str, batch_index: int = 0, batch_total: int = 1):
         workspace = self._ws_input.text().strip()
         if not workspace:
@@ -7033,17 +7052,41 @@ class GanggeDesktop(QMainWindow):
         batch_text = f" [{batch_index + 1}/{batch_total}]" if batch_total > 1 else ""
         self._status_label.setText(f"🚀 执行{batch_text}...")
 
-        # ── Use multimodal LLM if attachments contain images ──
-        effective_llm = llm
-        if self._attachments and self._mm_enable_cb.isChecked():
+        # ── Auto-detect file:/// URLs in task text as attachments ──
+        if task:
+            import re
+            file_urls = re.findall(r'file:///([^\s\n]+)', task)
+            for fpath in file_urls:
+                fpath = fpath.strip().rstrip(".,;:!?")
+                p = Path(fpath)
+                if p.exists() and p.suffix.lower() in ('.png','.jpg','.jpeg','.gif','.bmp','.webp'):
+                    import base64
+                    try:
+                        b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+                        ext = p.suffix.lower()
+                        mt = f"image/{ext.lstrip('.')}"
+                        if ext == ".jpg": mt = "image/jpeg"
+                        att = {"path": str(p), "name": p.name, "media_type": mt, "data": b64, "icon": "🖼️"}
+                        self._attachments.append(att)
+                        self._append_output(f"🖼️ 自动加载图片附件: {p.name}\n", "system")
+                    except Exception as e:
+                        self._append_output(f"⚠️ 无法加载图片 {p.name}: {e}\n", "system")
+            # Strip file:/// URLs from task text for clean LLM input
+            if file_urls:
+                task = re.sub(r'file:///[^\s\n]+', '', task).strip()
+
+        # ── Build multimodal LLM for VisionTool (if configured) ──
+        multimodal_llm = None
+        if self._mm_enable_cb.isChecked():
             mm_llm = self._build_multimodal_llm()
             if mm_llm:
-                effective_llm = mm_llm
-                logger.info("使用多模态模型处理图片附件")
-                self._append_output("🖼️ 检测到图片附件，自动切换到多模态模型\n", "system")
+                multimodal_llm = mm_llm
+                logging.getLogger("gangge").info("多模态模型已就绪，通过 vision 工具调用")
 
         self._worker = GanggeWorker(
-            llm=effective_llm, task=task, workspace=workspace,
+            llm=llm, task=task, workspace=workspace,
+            multimodal_llm=multimodal_llm,
+            previous_messages=self._conversation_history,
             max_rounds=self._max_rounds_spin.value(),
             plan_mode=plan_mode, project_context="",  # built in worker thread
             system_prompt_extra=extra_prompt, auto_allow=auto_allow,
@@ -7062,7 +7105,10 @@ class GanggeDesktop(QMainWindow):
         self._worker.tool_call_sig.connect(self._on_tool_call)
         self._worker.finished.connect(lambda s: self._on_finished(s, llm))
         self._worker.ask_user_sig.connect(self._on_ask_user)
-        # ── CHANGE: 方案C — turn_complete → save_turn ──────────
+        # ── Store turn messages for conversation continuity ──
+        self._worker.turn_complete.connect(
+            lambda msgs: self._on_turn_complete(msgs)
+        )
         if self._current_session_id:
             sid = self._current_session_id
             db = self._db
@@ -7081,6 +7127,14 @@ class GanggeDesktop(QMainWindow):
             self._append_output("\n⏹ 任务已取消\n", "system")
             self._batch_queue.clear()
             self._on_finished({}, None)
+
+    def _on_turn_complete(self, msgs: list):
+        """Store raw conversation history for multi-turn context."""
+        # Get raw Message objects from the Worker (not aggregated dicts)
+        if hasattr(self, "_worker") and self._worker is not None:
+            raw = getattr(self._worker, "_conversation_messages", [])
+            if raw:
+                self._conversation_history = raw
 
     def _update_elapsed(self):
         if hasattr(self, "_start_time"):

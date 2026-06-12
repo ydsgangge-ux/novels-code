@@ -55,6 +55,7 @@ TOOL_PHASES: dict[str, int] = {
     "web_fetch":      PHASE_SPECIAL,
     "generate_image": PHASE_SPECIAL,
     "browser":        PHASE_SPECIAL,
+    "vision":         PHASE_EXPLORE,  # always visible — LLM needs it for image tasks
     # Novel tools — all phase 4
     "novel_init":              PHASE_SPECIAL,
     "novel_setup":             PHASE_SPECIAL,
@@ -105,6 +106,7 @@ AGENT_PROFILES = {
             "bash", "lint_check",
             # Always available
             "ask_user",
+            "vision",
         },
     },
     "novel": {
@@ -149,6 +151,34 @@ AGENT_PROFILES = {
             "TodoWrite", "ask_user",
             # Can write findings
             "write_file", "edit_file",
+            # Image recognition
+            "vision",
+        },
+    },
+    "novel": {
+        "description": "小说创作任务",
+        "detect_keywords": [
+            "小说", "写作", "章节", "角色", "大纲", "剧情",
+            "novel", "story", "chapter", "character", "outline",
+            "写小说", "创作", "novel_init", "novel_setup",
+            "伏笔", "人设", "世界观",
+        ],
+        "tools": {
+            # Core novel tools
+            "novel_init", "novel_setup", "novel_outline",
+            "novel_chapter_outlines", "novel_new_arc",
+            "novel_write_chapter", "novel_audit", "novel_revise",
+            "novel_status", "novel_edit", "novel_export",
+            "novel_list_books", "novel_graph_query",
+            "novel_consistency_check", "novel_graph_rebuild",
+            "novel_import", "novel_imitate_write",
+            "novel_chat", "novel_navigate",
+            # Basic file tools (for reading reference)
+            "read_file", "list_dir", "grep", "glob",
+            # Planning + interaction
+            "TodoWrite", "ask_user",
+            # Image recognition
+            "vision",
         },
     },
 }
@@ -294,6 +324,8 @@ def create_tool_registry(
     ask_user_callback: Callable[[str], Awaitable[str]] | None = None,
     load_plugins: bool = True,
     llm: Any | None = None,
+    multimodal_llm: Any | None = None,  # separate multimodal LLM for vision tool
+    attachments: list[dict] | None = None,  # pre-loaded attachment data for vision tool
 ) -> ToolRegistry:
     """Create a ToolRegistry with all built-in tools registered.
 
@@ -342,6 +374,18 @@ def create_tool_registry(
         logger.debug("[Registry] Browser tool skipped: %s", e)
 
     registry.register(AskUserTool(ask_callback=ask_user_callback))
+
+    # ── Vision Tool (multimodal image recognition) ──
+    if multimodal_llm is not None:
+        try:
+            from gangge.layer3_agent.tools.vision import VisionTool
+            vt = VisionTool(multimodal_llm=multimodal_llm)
+            if attachments:
+                vt.set_attachments(attachments)
+            registry.register(vt)
+            logger.info("[Registry] Vision tool activated — multimodal LLM available")
+        except Exception as e:
+            logger.debug("[Registry] Vision tool skipped: %s", e)
 
     create_tool = CreateToolTool(workspace=workspace, registry=registry)
     registry.register(create_tool)
