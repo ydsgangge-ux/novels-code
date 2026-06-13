@@ -176,11 +176,13 @@ class AgenticLoop:
         tools: ToolRegistry,
         permission_guard: PermissionGuard,
         config: LoopConfig | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ):
         self.llm = llm
         self.tools = tools
         self.guard = permission_guard
         self.config = config or LoopConfig()
+        self._cancel_check = cancel_check
         self._stream_callback: StreamCallback | None = None
         # ── Progress Emitter ──
         self.emitter = ProgressEmitter()
@@ -808,6 +810,14 @@ class AgenticLoop:
                 type=ContentType.TEXT,
                 text=f"\n[dim]── 第 {round_num + 1} 轮 ──[/dim]\n",
             ))
+
+            # ── Cancel check: allow external stop button to interrupt ──
+            if self._cancel_check and self._cancel_check():
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="\n⏹ 任务已取消\n",
+                ))
+                break
 
             # ── Approaching max rounds: inject urgency hint ──
             remaining = self.config.max_tool_rounds - round_num

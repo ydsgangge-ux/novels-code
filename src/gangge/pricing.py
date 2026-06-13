@@ -22,12 +22,22 @@ PRICING_TABLE = {
         "deepseek-v4-pro":   {"input_cny": 0.003, "output_cny": 0.006},   # = $0.435/$0.87 per 1M (75% discount)
     },
     "openai": {
+        "gpt-5.5": {"input_usd": 0.0025, "output_usd": 0.01},
+        "gpt-5.5-pro": {"input_usd": 0.005, "output_usd": 0.02},
+        "gpt-5.5-instant": {"input_usd": 0.001, "output_usd": 0.004},
+        "gpt-5.4": {"input_usd": 0.0025, "output_usd": 0.01},
         "gpt-4o": {"input_usd": 0.0025, "output_usd": 0.01},
         "gpt-4o-mini": {"input_usd": 0.00015, "output_usd": 0.0006},
         "gpt-4-turbo": {"input_usd": 0.01, "output_usd": 0.03},
         "gpt-3.5-turbo": {"input_usd": 0.0005, "output_usd": 0.0015},
+        "o4-mini": {"input_usd": 0.0011, "output_usd": 0.0044},
+        "o3-mini": {"input_usd": 0.0011, "output_usd": 0.0044},
     },
     "anthropic": {
+        "claude-opus-4-7-20260601": {"input_usd": 0.015, "output_usd": 0.075},
+        "claude-opus-4-6-20260515": {"input_usd": 0.015, "output_usd": 0.075},
+        "claude-sonnet-4-6-20260501": {"input_usd": 0.003, "output_usd": 0.015},
+        "claude-haiku-4-5-20260301": {"input_usd": 0.0008, "output_usd": 0.004},
         "claude-sonnet-4-20250514": {"input_usd": 0.003, "output_usd": 0.015},
         "claude-3-5-sonnet-20241022": {"input_usd": 0.003, "output_usd": 0.015},
         "claude-3-5-haiku-20241022": {"input_usd": 0.0008, "output_usd": 0.004},

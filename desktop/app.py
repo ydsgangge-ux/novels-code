@@ -20,6 +20,7 @@ import logging
 import os
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -34,6 +35,7 @@ from PyQt6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QImage,
     QKeySequence,
     QPixmap,
     QSyntaxHighlighter,
@@ -106,8 +108,9 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
     "deepseek": {
         "label": "DeepSeek",
         "api_key_env": "DEEPSEEK_API_KEY",
-        "model_default": "deepseek-chat",
+        "model_default": "deepseek-v4-flash",
         "models": [
+            "deepseek-v4-pro", "deepseek-v4-flash",
             "deepseek-chat", "deepseek-reasoner",
             "deepseek-chat-v4", "deepseek-reasoner-v4",
         ],
@@ -117,8 +120,13 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
     "qwen": {
         "label": _t("qwen_label"),
         "api_key_env": "QWEN_API_KEY",
-        "model_default": "qwen-max",
+        "model_default": "qwen3.6-plus",
         "models": [
+            "qwen3.6-plus", "qwen3.6-35b-a3b", "qwen3.6-27b",
+            "qwen3.5-plus",
+            "qwen3-max", "qwen3-max-thinking",
+            "qwen3-plus", "qwen3-turbo",
+            "qwen3-coder-plus", "qwen3-coder-turbo",
             "qwen-max", "qwen-max-latest",
             "qwen-plus", "qwen-plus-latest",
             "qwen-turbo", "qwen-turbo-latest",
@@ -136,8 +144,11 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
     "zhipu": {
         "label": _t("zhipu_label"),
         "api_key_env": "ZHIPU_API_KEY",
-        "model_default": "glm-4-plus",
+        "model_default": "glm-5-1",
         "models": [
+            "glm-5-1", "glm-5", "glm-5-turbo",
+            "glm-4-7", "glm-4-7-flash",
+            "glm-4-6", "glm-4-6v",
             "glm-4-plus", "glm-4-0520", "glm-4", "glm-4-air", "glm-4-airx",
             "glm-4-long", "glm-4-flash", "glm-4-flashx",
             "glm-4v", "glm-4v-plus",
@@ -206,14 +217,18 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
     "siliconflow": {
         "label": _t("siliconflow_label"),
         "api_key_env": "SILICONFLOW_API_KEY",
-        "model_default": "deepseek-ai/DeepSeek-V3",
+        "model_default": "deepseek-ai/DeepSeek-V4-Pro",
         "models": [
+            "deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Flash",
             "deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1",
+            "Qwen/Qwen3.5-Plus", "Qwen/Qwen3.5-397B-A17B",
             "Qwen/Qwen2.5-72B-Instruct", "Qwen/Qwen2.5-Coder-32B-Instruct",
             "Qwen/Qwen2.5-7B-Instruct",
-            "THUDM/glm-4-9b-chat",
+            "THUDM/glm-5-9b", "THUDM/glm-4-9b-chat",
             "meta-llama/Meta-Llama-3.1-405B-Instruct",
             "meta-llama/Meta-Llama-3.1-70B-Instruct",
+            "Pro/Nex-N2-Pro",
+            "Pro/AI-MiniMax/M2.5",
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
         ],
         "base_url_editable": True,
@@ -222,16 +237,29 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
     "openai": {
         "label": "OpenAI",
         "api_key_env": "OPENAI_API_KEY",
-        "model_default": "gpt-4o",
-        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+        "model_default": "gpt-5.5",
+        "models": [
+            "gpt-5.5", "gpt-5.5-pro", "gpt-5.5-instant",
+            "gpt-5.4", "gpt-5.4-thinking",
+            "o4-mini", "o3-mini",
+            "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo",
+        ],
         "base_url_editable": False,
         "base_url_default": "https://api.openai.com/v1",
     },
     "anthropic": {
         "label": "Anthropic Claude",
         "api_key_env": "ANTHROPIC_API_KEY",
-        "model_default": "claude-sonnet-4-20250514",
+        "model_default": "claude-opus-4-7-20260601",
         "models": [
+            "claude-opus-4-7-20260601",
+            "claude-opus-4-7-20260601:thinking",
+            "claude-opus-4-6-20260515",
+            "claude-opus-4-6-20260515:thinking",
+            "claude-sonnet-4-6-20260501",
+            "claude-sonnet-4-6-20260501:thinking",
+            "claude-haiku-4-5-20260301",
+            "claude-haiku-4-5-20260301:thinking",
             "claude-sonnet-4-20250514",
             "claude-sonnet-4-20250514:thinking",
             "claude-4-20250514",
@@ -1128,7 +1156,7 @@ class GanggeWorker(QThread):
                 pass
 
         # ── 3. Create loop ──
-        loop = AgenticLoop(llm=self.llm, tools=registry, permission_guard=guard, config=config)
+        loop = AgenticLoop(llm=self.llm, tools=registry, permission_guard=guard, config=config, cancel_check=lambda: self._cancel)
 
         # Streaming callback
         async def stream_cb(block: ContentBlock):
@@ -5265,6 +5293,7 @@ class GanggeDesktop(QMainWindow):
         input_lay.addWidget(self._attach_btn)
 
         self._task_input = QPlainTextEdit()
+        self._task_input.setAcceptDrops(True)
         self._task_input.setPlaceholderText(
             _t("input_placeholder")
         )
@@ -5720,32 +5749,29 @@ class GanggeDesktop(QMainWindow):
         env_path = Path(__file__).resolve().parent.parent / ".env"
         provider = self._provider_combo.currentData()
 
-        # Map provider to env keys
-        api_key_map = {
-            "deepseek": "DEEPSEEK_API_KEY",
-            "openai": "OPENAI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-            "ollama": "OLLAMA_API_KEY",
-        }
-        model_map = {
-            "deepseek": "DEEPSEEK_MODEL",
-            "openai": "OPENAI_MODEL",
-            "anthropic": "ANTHROPIC_MODEL",
-            "ollama": "OLLAMA_MODEL",
-        }
-        base_url_map = {
-            "deepseek": "DEEPSEEK_BASE_URL",
-            "ollama": "OLLAMA_BASE_URL",
-        }
+        # Dynamic env key naming: {PROVIDER}_API_KEY, {PROVIDER}_MODEL, etc.
+        provider_upper = provider.upper()
+        api_key_env = f"{provider_upper}_API_KEY"
+        model_env = f"{provider_upper}_MODEL"
+        base_url_env = f"{provider_upper}_BASE_URL"
 
-        updates = {
+        updates: dict[str, str] = {
             "LLM_PROVIDER": provider,
             "GANGGE_LANG": self._lang_combo.currentData(),
-            api_key_map.get(provider, ""): self._api_key_input.text(),
-            model_map.get(provider, ""): self._model_combo.currentText(),
         }
-        if provider in base_url_map and self._base_url_input.text().strip():
-            updates[base_url_map[provider]] = self._base_url_input.text().strip()
+
+        # Only write model/key/base_url if they have values
+        api_key_val = self._api_key_input.text().strip()
+        if api_key_val:
+            updates[api_key_env] = api_key_val
+
+        model_val = self._model_combo.currentText().strip()
+        if model_val:
+            updates[model_env] = model_val
+
+        base_url_val = self._base_url_input.text().strip()
+        if base_url_val:
+            updates[base_url_env] = base_url_val
 
         # ── Multimodal LLM settings ──
         if self._mm_enable_cb.isChecked():
@@ -5938,8 +5964,14 @@ class GanggeDesktop(QMainWindow):
 
     # ── Attachment handling ──────────────────────────────────
     def _pick_attachment(self):
+        # Remember last used directory
+        settings = QSettings("Gangge", "GanggeCode")
+        last_dir = settings.value("attach_last_dir", "")
         file_filter = "Media Files (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.mp4 *.avi *.mov *.mkv *.webm *.mp3 *.wav *.ogg *.flac *.aac *.m4a);;Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;Video (*.mp4 *.avi *.mov *.mkv *.webm);;Audio (*.mp3 *.wav *.ogg *.flac *.aac *.m4a);;All Files (*)"
-        paths, _ = QFileDialog.getOpenFileNames(self, _t("attach_select"), "", file_filter)
+        paths, _ = QFileDialog.getOpenFileNames(self, _t("attach_select"), last_dir, file_filter)
+        if paths:
+            # Save last directory
+            settings.setValue("attach_last_dir", str(Path(paths[0]).parent))
         for path in paths:
             self._add_attachment(path)
 
@@ -6014,6 +6046,35 @@ class GanggeDesktop(QMainWindow):
             self._attachment_lay.addWidget(chip)
         self._attachment_lay.addStretch()
 
+    # ── Paste image from clipboard ──────────────────────────
+    def _paste_image_from_clipboard(self) -> bool:
+        """Check clipboard for image data. If found, save to temp file and add as attachment."""
+        clipboard = QApplication.clipboard()
+        mime_data = clipboard.mimeData()
+        if not mime_data.hasImage():
+            return False
+        image = clipboard.image()
+        if image.isNull():
+            return False
+        # Save clipboard image to a temp PNG file
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            image.save(tmp_path, "PNG")
+            self._add_attachment(tmp_path)
+            self._append_output("🖼️ 已从剪贴板粘贴图片\n", "system")
+            return True
+        except Exception as e:
+            logging.getLogger("gangge").warning(f"保存剪贴板图片失败: {e}")
+            return False
+        finally:
+            # Clean up temp file — base64 data is already in memory
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
     # ── Input auto-resize & Enter handling ──────────────────
     def _auto_resize_input(self):
         doc = self._task_input.document()
@@ -6022,10 +6083,47 @@ class GanggeDesktop(QMainWindow):
         self._task_input.setFixedHeight(h)
 
     def eventFilter(self, obj, event):
-        if obj == self._task_input and event.type() == event.Type.KeyPress:
-            from PyQt6.QtCore import QEvent
+        from PyQt6.QtCore import QEvent
+
+        # ── Drag & Drop: image files from file manager ──
+        if obj == self._task_input and event.type() in (
+            QEvent.Type.DragEnter, QEvent.Type.DragMove
+        ):
+            if event.mimeData().hasUrls():
+                image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+                for url in event.mimeData().urls():
+                    if url.isLocalFile():
+                        ext = Path(url.toLocalFile()).suffix.lower()
+                        if ext in image_exts:
+                            event.acceptProposedAction()
+                            return True
+            return False
+
+        if obj == self._task_input and event.type() == QEvent.Type.Drop:
+            if event.mimeData().hasUrls():
+                image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+                added = 0
+                for url in event.mimeData().urls():
+                    if url.isLocalFile():
+                        fpath = url.toLocalFile()
+                        ext = Path(fpath).suffix.lower()
+                        if ext in image_exts:
+                            self._add_attachment(fpath)
+                            added += 1
+                if added:
+                    event.acceptProposedAction()
+                    self._append_output(f"📎 已拖入 {added} 张图片\n", "system")
+                    return True
+            return False
+
+        # ── Paste (Ctrl+V): detect clipboard image ──
+        if obj == self._task_input and event.type() == QEvent.Type.KeyPress:
             from PyQt6.QtGui import QKeyEvent
             ke = event
+            # Ctrl+V — check clipboard for image first
+            if ke.key() == Qt.Key.Key_V and ke.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                if self._paste_image_from_clipboard():
+                    return True  # image pasted, skip text paste
             # Shift+Enter = insert newline
             if ke.key() == Qt.Key.Key_Return and ke.modifiers() == Qt.KeyboardModifier.ShiftModifier:
                 cursor = self._task_input.textCursor()
@@ -6712,11 +6810,11 @@ class GanggeDesktop(QMainWindow):
             self._base_url_input.setPlaceholderText("(默认地址)")
 
     _MM_MODEL_PRESETS = {
-        "qwen": ["qwen-vl-max", "qwen-vl-plus", "qwen2-vl-72b-instruct"],
-        "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
-        "anthropic": ["claude-3-5-sonnet-20241022", "claude-3-opus-20240229"],
-        "deepseek": ["deepseek-vl2", "deepseek-vl2-small"],
-        "siliconflow": ["Qwen/Qwen2-VL-72B-Instruct", "Qwen/Qwen-VL-Plus", "OpenGVLab/InternVL2-8B"],
+        "qwen": ["qwen3-vl-plus", "qwen-vl-max", "qwen-vl-plus", "qwen2-vl-72b-instruct"],
+        "openai": ["gpt-5.5", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
+        "anthropic": ["claude-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229"],
+        "deepseek": ["deepseek-v4-pro", "deepseek-chat", "deepseek-vl2", "deepseek-vl2-small"],
+        "siliconflow": ["deepseek-ai/DeepSeek-V4-Pro", "Qwen/Qwen2-VL-72B-Instruct", "Qwen/Qwen-VL-Plus", "OpenGVLab/InternVL2-8B"],
         "ollama": ["llava", "llava:13b", "bakllava"],
         "custom": [],
     }
@@ -6736,16 +6834,28 @@ class GanggeDesktop(QMainWindow):
         """Map to thinking/reasoning model variant when thinking mode is on."""
         thinking_map = {
             "deepseek": {
+                "deepseek-v4-pro": "deepseek-v4-pro",
+                "deepseek-v4-flash": "deepseek-v4-flash",
                 "deepseek-chat": "deepseek-reasoner",
                 "deepseek-chat-v4": "deepseek-reasoner-v4",
                 "deepseek-reasoner": "deepseek-reasoner",
                 "deepseek-reasoner-v4": "deepseek-reasoner-v4",
             },
             "openai": {
+                "gpt-5.5": "o4-mini",
+                "gpt-5.5-pro": "gpt-5.4-thinking",
                 "gpt-4o": "o1",
                 "gpt-4o-mini": "o3-mini",
                 "gpt-4-turbo": "o1",
                 "gpt-3.5-turbo": "o3-mini",
+            },
+            "anthropic": {
+                "claude-sonnet-4-20250514": "claude-sonnet-4-20250514:thinking",
+                "claude-4-20250514": "claude-4-20250514:thinking",
+                "claude-opus-4-6-20260515": "claude-opus-4-6-20260515:thinking",
+                "claude-opus-4-7-20260601": "claude-opus-4-7-20260601:thinking",
+                "claude-sonnet-4-6-20260501": "claude-sonnet-4-6-20260501:thinking",
+                "claude-haiku-4-5-20260301": "claude-haiku-4-5-20260301:thinking",
             },
             "siliconflow": {
                 "deepseek-ai/DeepSeek-V3": "deepseek-ai/DeepSeek-R1",
