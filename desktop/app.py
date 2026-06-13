@@ -5281,12 +5281,12 @@ class GanggeDesktop(QMainWindow):
         input_lay = QHBoxLayout()
         input_lay.setSpacing(8)
 
-        self._attach_btn = QPushButton("📎")
+        self._attach_btn = QPushButton("📎 附件")
         self._attach_btn.setToolTip(_t("tip_attach"))
-        self._attach_btn.setFixedSize(36, 36)
+        self._attach_btn.setFixedSize(80, 36)
         self._attach_btn.setStyleSheet(
             "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:6px;"
-            "color:#8b949e;font-size:16px;}"
+            "color:#8b949e;font-size:12px;padding:0 8px;}"
             "QPushButton:hover{background:#30363d;color:#c9d1d9;}"
         )
         self._attach_btn.clicked.connect(self._pick_attachment)
@@ -5297,11 +5297,11 @@ class GanggeDesktop(QMainWindow):
         self._task_input.setPlaceholderText(
             _t("input_placeholder")
         )
-        self._task_input.setMaximumHeight(100)
-        self._task_input.setMinimumHeight(36)
+        self._task_input.setMaximumHeight(150)
+        self._task_input.setMinimumHeight(80)
         self._task_input.setStyleSheet(
             "QPlainTextEdit{background:#0d1117;border:1px solid #30363d;"
-            "border-radius:6px;padding:6px 10px;color:#c9d1d9;font-size:13px;}"
+            "border-radius:6px;padding:8px 10px;color:#c9d1d9;font-size:13px;}"
             "QPlainTextEdit:focus{border:1px solid #58a6ff;outline:none;}"
         )
         self._task_input.textChanged.connect(self._auto_resize_input)
@@ -6079,7 +6079,7 @@ class GanggeDesktop(QMainWindow):
     def _auto_resize_input(self):
         doc = self._task_input.document()
         h = int(doc.size().height()) + 16
-        h = max(36, min(h, 100))
+        h = max(80, min(h, 150))
         self._task_input.setFixedHeight(h)
 
     def eventFilter(self, obj, event):
