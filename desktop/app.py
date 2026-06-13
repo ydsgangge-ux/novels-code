@@ -7380,23 +7380,24 @@ class GanggeDesktop(QMainWindow):
         # ── Auto-refresh novel panels after novel tool calls ──
         # 必须在主线程执行GUI操作，用 QTimer 延迟确保线程安全
         if tool_name in self._NOVEL_TOOL_NAMES and not is_error:
+            rp = self._novel_right
             refresh_map = {
-                "novel_init": [self._refresh_dashboard],
-                "novel_setup": [self._refresh_characters, self._refresh_world, self._refresh_arcs],
-                "novel_outline": [self._refresh_outline, self._refresh_arcs],
-                "novel_chapter_outlines": [self._refresh_outline, self._refresh_chapters],
-                "novel_write_chapter": [self._refresh_chapters, self._refresh_dashboard],
+                "novel_init": [rp._refresh_dashboard],
+                "novel_setup": [rp._refresh_characters, rp._refresh_world, rp._refresh_arcs],
+                "novel_outline": [rp._refresh_outline, rp._refresh_arcs],
+                "novel_chapter_outlines": [rp._refresh_outline, rp._refresh_chapters],
+                "novel_write_chapter": [rp._refresh_chapters, rp._refresh_dashboard],
                 "novel_audit": [],
-                "novel_revise": [self._refresh_chapters],
-                "novel_edit": [self._refresh_characters, self._refresh_world, self._refresh_outline, self._refresh_arcs, self._refresh_chapters],
-                "novel_new_arc": [self._refresh_arcs, self._refresh_outline],
+                "novel_revise": [rp._refresh_chapters],
+                "novel_edit": [rp._refresh_characters, rp._refresh_world, rp._refresh_outline, rp._refresh_arcs, rp._refresh_chapters],
+                "novel_new_arc": [rp._refresh_arcs, rp._refresh_outline],
                 "novel_export": [],
                 "novel_status": [],
                 "novel_list_books": [],
                 "novel_navigate": [],
-                "novel_graph_query": [self._refresh_graph],
+                "novel_graph_query": [rp._refresh_graph],
                 "novel_consistency_check": [],
-                "novel_graph_rebuild": [self._refresh_graph],
+                "novel_graph_rebuild": [rp._refresh_graph],
             }
             fns = refresh_map.get(tool_name, [])
             if fns:
