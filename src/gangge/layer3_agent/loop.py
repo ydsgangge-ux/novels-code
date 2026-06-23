@@ -450,6 +450,11 @@ class AgenticLoop:
                 "解压文件使用 unzip 或 Expand-Archive。\n"
             )
 
+        # ── Novel profile: inject novel writing prompt ──
+        if getattr(self, "_profile", "") == "novel":
+            from gangge.layer3_agent.prompts.system import NOVEL_PROMPT
+            prompt += "\n\n" + NOVEL_PROMPT
+
         return prompt
 
     def _deduplicate_reads(

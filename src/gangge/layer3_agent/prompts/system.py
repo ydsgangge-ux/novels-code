@@ -191,12 +191,4 @@ def build_system_prompt(
     if os.environ.get("GANGGE_COMFYUI_ACTIVE") == "1":
         parts.append(COMFYUI_PROMPT)
 
-    # Novel writing mode (only when Dramatica is available)
-    try:
-        from gangge.layer3_agent.tools.novel import _DRAMATICA_AVAILABLE
-        if _DRAMATICA_AVAILABLE:
-            parts.append(NOVEL_PROMPT)
-    except ImportError:
-        pass
-
     return "\n".join(parts)
