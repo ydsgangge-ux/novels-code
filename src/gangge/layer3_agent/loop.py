@@ -17,7 +17,7 @@ from typing import Any, AsyncIterator, Callable, Awaitable
 
 from gangge.layer3_agent.tools.registry import ToolRegistry
 from gangge.layer3_agent.tools.base import ToolResult
-from gangge.layer3_agent.prompts.system import build_system_prompt, detect_empty_workspace
+from gangge.layer3_agent.prompts.system import build_system_prompt, build_dynamic_state_text, detect_empty_workspace
 from gangge.layer3_agent.progress_emitter import ProgressEmitter, EventType
 from gangge.i18n import t
 from gangge.layer4_tools.mcp_client import MCPClientManager
@@ -404,38 +404,25 @@ class AgenticLoop:
             defs.extend(mcp_defs)
         return defs
 
-    def _build_system_prompt(self, reads_cache: dict[str, int] | None = None, round_num: int = 0, consecutive_timeouts: int = 0) -> str:
-        """Build system prompt — minimal rules + auto-injected todo state."""
+    def _build_static_system_prompt(self) -> str:
+        """Build static system prompt — called once, byte-identical across rounds.
+
+        This enables LLM API prompt caching: only content that never changes
+        during the session goes here. Dynamic state (progress, changelog,
+        decisions, todo, round warnings) is injected separately as a user message.
+        """
         prompt = build_system_prompt(
             workspace_dir=self.config.workspace_dir,
             project_context=self.config.project_context[:500] if self.config.project_context else "",
             plan_mode=self.config.plan_mode,
-            memory_bank_progress=self.config.memory_bank_progress[:200] if self.config.memory_bank_progress else "",
-            memory_bank_changelog=self.config.memory_bank_changelog[:200] if self.config.memory_bank_changelog else "",
-            memory_bank_decisions=self.config.memory_bank_decisions[:300] if self.config.memory_bank_decisions else "",
         )
 
-        # ── Inject .ganggerules (project-specific rules) ──
+        # ── Inject .ganggerules (stable per session) ──
         if self.config.ganggerules:
             prompt += f"\n\n## 项目规则 (.ganggerules)\n{self.config.ganggerules[:500]}"
 
-        # ── Inject TodoWrite state (most important: model always knows where it is) ──
-        from gangge.layer3_agent.tools.todo import get_todo_state
-        todo_state = get_todo_state()
-        todo_injection = todo_state.format_for_injection()
-        if todo_injection:
-            prompt += f"\n\n{todo_injection}"
-
-        # ── Approaching max rounds warning ──
-        remaining = self.config.max_tool_rounds - round_num
-        if remaining <= 3:
-            prompt += (
-                f"\n\n## ⚠️ 轮数即将耗尽 (剩余 {remaining} 轮)\n"
-                "停止调用新工具，输出当前进度和剩余工作。\n"
-            )
-
-        # ── Coding profile: inject test verification instruction on first round ──
-        if round_num == 0 and getattr(self, "_profile", "") == "coding":
+        # ── Coding profile: inject test verification instruction ──
+        if getattr(self, "_profile", "") == "coding":
             prompt += (
                 "\n\n## 测试验证\n"
                 "代码实现完成后，必须运行 pytest 验证代码正确性：\n"
@@ -456,6 +443,34 @@ class AgenticLoop:
             prompt += "\n\n" + NOVEL_PROMPT
 
         return prompt
+
+    def _build_dynamic_state_text(self, round_num: int = 0) -> str:
+        """Build dynamic state text that changes between rounds.
+
+        Returns a string to be injected as a user message, NOT into system prompt.
+        Keeps the static system prompt byte-identical for API caching.
+        """
+        # ── TodoWrite state ──
+        from gangge.layer3_agent.tools.todo import get_todo_state
+        todo_state = get_todo_state()
+        todo_injection = todo_state.format_for_injection()
+
+        # ── Approaching max rounds warning ──
+        round_warning = ""
+        remaining = self.config.max_tool_rounds - round_num
+        if remaining <= 3:
+            round_warning = (
+                f"⚠️ 轮数即将耗尽 (剩余 {remaining} 轮)\n"
+                "停止调用新工具，输出当前进度和剩余工作。\n"
+            )
+
+        return build_dynamic_state_text(
+            memory_bank_progress=self.config.memory_bank_progress[:200] if self.config.memory_bank_progress else "",
+            memory_bank_changelog=self.config.memory_bank_changelog[:200] if self.config.memory_bank_changelog else "",
+            memory_bank_decisions=self.config.memory_bank_decisions[:300] if self.config.memory_bank_decisions else "",
+            todo_injection=todo_injection,
+            round_warning=round_warning,
+        )
 
     def _deduplicate_reads(
         self, messages: list[Message], reads_cache: dict[str, int], current_round: int
@@ -714,6 +729,10 @@ class AgenticLoop:
         }.get(profile, profile)
         logger.info(f"[Loop] Agent profile: {profile} ({profile_desc})")
 
+        # ── Build static system prompt (once, byte-identical for caching) ──
+        # All dynamic state is injected as user messages per round
+        static_system = self._build_static_system_prompt()
+
         # ── Clear stale todo state ──
         from gangge.layer3_agent.tools.todo import get_todo_state
         todo_state = get_todo_state()
@@ -767,18 +786,8 @@ class AgenticLoop:
                 break
 
         if is_continue:
-            progress_summary = ""
-            if self.config.memory_bank_progress and self.config.memory_bank_progress.strip():
-                progress_summary = (
-                    f"\n\n### 上次进度（直接来自 Memory Bank，不需要再读取）\n"
-                    f"{self.config.memory_bank_progress[:800]}\n"
-                )
-            changelog_summary = ""
-            if self.config.memory_bank_changelog and self.config.memory_bank_changelog.strip():
-                changelog_summary = (
-                    f"\n\n### 上次变更日志（直接来自 Memory Bank，不需要再读取）\n"
-                    f"{self.config.memory_bank_changelog[:500]}\n"
-                )
+            # Build dynamic state for continue context
+            continue_state = self._build_dynamic_state_text(round_num=0)
             file_list_summary = ""
             if file_registry:
                 modified = sorted(
@@ -796,8 +805,7 @@ class AgenticLoop:
                 "请直接从上次中断的地方继续执行。"
                 "绝对不要从头 read_file 所有源文件来'了解项目'！"
                 "绝对不要读取 .gangge/changelog.md 或 .gangge/progress.md——进度信息已经直接提供在下面了！"
-                f"{progress_summary}"
-                f"{changelog_summary}"
+                f"\n\n{continue_state}"
                 f"{file_list_summary}"
                 "\n\n请立刻继续执行下一步，不要再读取任何已完成的文件。"
             )
@@ -832,9 +840,11 @@ class AgenticLoop:
                     text=f"⚠️ 即将达到最大轮数限制（剩余 {remaining} 轮），请尽快总结当前进度并输出最终回复！\n",
                 ))
 
-            # ── Rebuild system prompt with fresh project context + todo state ──
+            # ── Use cached static system prompt (byte-identical across rounds) ──
+            # Dynamic state (progress, changelog, decisions, todo) is injected
+            # as a user message below to preserve system prompt caching.
             self.config.file_registry = file_registry
-            system = self._build_system_prompt(reads_cache=reads_cache, round_num=round_num, consecutive_timeouts=consecutive_timeouts)
+            system = static_system
             self.emitter.emit(EventType.THINKING, f"正在思考...")
 
             # ── Refresh tool definitions based on current phase ──
@@ -872,6 +882,20 @@ class AgenticLoop:
             if round_num > 0 and reads_cache:
                 messages = self._deduplicate_reads(messages, reads_cache, round_num + 1)
 
+            # ── Inject dynamic state as a user message (NOT into system prompt) ──
+            # This keeps the static system prompt byte-identical for API caching.
+            # Construct call_messages = persistent history + ephemeral state update
+            state_text = self._build_dynamic_state_text(round_num=round_num)
+            if state_text:
+                call_messages = list(messages) + [
+                    Message(
+                        role=Role.USER,
+                        content=[ContentBlock(type=ContentType.TEXT, text=state_text)],
+                    )
+                ]
+            else:
+                call_messages = messages
+
             # 1. Call LLM (with 120s timeout to prevent hanging)
             await self._emit(ContentBlock(
                 type=ContentType.TEXT,
@@ -880,7 +904,7 @@ class AgenticLoop:
             try:
                 response = await asyncio.wait_for(
                     self.llm.chat(
-                        messages=messages,
+                        messages=call_messages,
                         tools=tool_defs,
                         system=system,
                     ),

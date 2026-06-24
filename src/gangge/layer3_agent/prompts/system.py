@@ -148,11 +148,13 @@ def build_system_prompt(
     workspace_dir: str = "",
     project_context: str = "",
     plan_mode: bool = False,
-    memory_bank_progress: str = "",
-    memory_bank_changelog: str = "",
-    memory_bank_decisions: str = "",
 ) -> str:
-    """Build the system prompt — kept minimal, context is managed by the pipeline."""
+    """Build the system prompt — contains only static content that won't change between rounds.
+
+    Dynamic state (progress, changelog, decisions) is injected separately via
+    build_dynamic_state_text() so the system prompt remains byte-identical
+    across rounds and can be cached by the LLM API.
+    """
     # Detect project status
     is_empty = detect_empty_workspace(workspace_dir)
     if is_empty or not workspace_dir:
@@ -165,22 +167,13 @@ def build_system_prompt(
     prompt = SYSTEM_PROMPT.replace("{workspace_path}", workspace_dir or ".")
     prompt = prompt.replace("{project_status}", project_status)
 
-    # Memory Bank (kept short)
-    memory_bank_summary = ""
-    if memory_bank_progress:
-        memory_bank_summary = f"### 进度\n{memory_bank_progress[:200]}"
-    if memory_bank_changelog:
-        memory_bank_summary += f"\n### 变更日志\n{memory_bank_changelog[:200]}"
-    prompt = prompt.replace("{memory_bank_summary}", memory_bank_summary.strip() or "暂无历史记录")
-
-    decisions_summary = ""
-    if memory_bank_decisions:
-        decisions_summary = f"### 历史决策\n{memory_bank_decisions[:300]}"
-    prompt = prompt.replace("{memory_bank_decisions}", decisions_summary)
+    # Remove memory bank placeholders — they're now injected dynamically
+    prompt = prompt.replace("{memory_bank_summary}", "暂无历史记录")
+    prompt = prompt.replace("{memory_bank_decisions}", "")
 
     parts = [prompt]
 
-    # Add project context (if any)
+    # Add project context (if any) — stable per session
     if project_context:
         parts.append(f"\n## 项目信息\n\n{project_context[:500]}")
 
@@ -193,3 +186,38 @@ def build_system_prompt(
         parts.append(COMFYUI_PROMPT)
 
     return "\n".join(parts)
+
+
+def build_dynamic_state_text(
+    memory_bank_progress: str = "",
+    memory_bank_changelog: str = "",
+    memory_bank_decisions: str = "",
+    todo_injection: str = "",
+    round_warning: str = "",
+) -> str:
+    """Build dynamic state text that changes between rounds.
+
+    This text is injected as a user message (NOT into system prompt)
+    so the static system prompt remains byte-identical across rounds
+    and can be cached by the LLM API (prompt caching).
+
+    Returns empty string if all inputs are empty.
+    """
+    parts = []
+
+    if memory_bank_progress:
+        parts.append(f"### 当前进度\n{memory_bank_progress[:200]}")
+    if memory_bank_changelog:
+        parts.append(f"### 变更日志\n{memory_bank_changelog[:200]}")
+    if memory_bank_decisions:
+        parts.append(f"### 历史决策\n{memory_bank_decisions[:300]}")
+    if todo_injection:
+        parts.append(todo_injection)
+    if round_warning:
+        parts.append(round_warning)
+
+    if not parts:
+        return ""
+
+    header = "## 📋 当前状态更新"
+    return header + "\n\n" + "\n\n".join(parts)
