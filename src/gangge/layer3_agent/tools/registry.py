@@ -39,6 +39,7 @@ TOOL_PHASES: dict[str, int] = {
     "read_file":      PHASE_EXPLORE,
     "grep":           PHASE_EXPLORE,
     "glob":           PHASE_EXPLORE,
+    "everything_search": PHASE_EXPLORE,
     "find_symbol":    PHASE_EXPLORE,
     "find_references": PHASE_EXPLORE,
     "TodoWrite":      PHASE_EXPLORE,
@@ -99,6 +100,7 @@ AGENT_PROFILES = {
         "tools": {
             # Phase 1: Explore
             "list_dir", "read_file", "grep", "glob",
+            "everything_search",
             "find_symbol", "find_references", "TodoWrite",
             # Phase 2: Write
             "write_file", "edit_file", "create_tool",
@@ -146,6 +148,7 @@ AGENT_PROFILES = {
         "tools": {
             # Search + web
             "web_search", "web_fetch", "grep", "glob",
+            "everything_search",
             "read_file", "list_dir",
             # Planning + interaction
             "TodoWrite", "ask_user",
@@ -175,6 +178,7 @@ AGENT_PROFILES = {
             "novel_chat", "novel_navigate",
             # Basic file tools (for reading reference)
             "read_file", "list_dir", "grep", "glob",
+            "everything_search",
             # Planning + interaction
             "TodoWrite", "ask_user",
             # Image recognition
@@ -334,7 +338,7 @@ def create_tool_registry(
     """
     from gangge.layer3_agent.tools.bash import BashTool
     from gangge.layer3_agent.tools.file_ops import ReadFileTool, WriteFileTool, EditFileTool
-    from gangge.layer3_agent.tools.search import GrepTool, GlobTool, ListDirTool
+    from gangge.layer3_agent.tools.search import GrepTool, GlobTool, ListDirTool, EverythingSearchTool
     from gangge.layer3_agent.tools.web import UsageController, WebFetchTool, WebSearchTool
     from gangge.layer3_agent.tools.ask_user import AskUserTool
     from gangge.layer3_agent.tools.lint_check import LintCheckTool
@@ -352,7 +356,7 @@ def create_tool_registry(
     registry.register(WriteFileTool(workspace=workspace))
     registry.register(EditFileTool(workspace=workspace))
     registry.register(LintCheckTool(workspace=workspace))
-    for cls in [GrepTool, GlobTool, ListDirTool]:
+    for cls in [GrepTool, GlobTool, ListDirTool, EverythingSearchTool]:
         registry.register(cls(workspace=workspace))
     registry.register(WebFetchTool(usage=usage))
     registry.register(WebSearchTool(usage=usage))

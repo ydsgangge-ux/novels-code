@@ -1,9 +1,11 @@
-"""Search tools — grep and glob file search."""
+"""Search tools — grep, glob, and Everything file search."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -316,3 +318,138 @@ class ListDirTool(BaseTool):
         walk(base, 1)
 
         return ToolResult(output="\n".join(lines))
+
+
+class EverythingSearchTool(BaseTool):
+    """Search files instantly using Everything (Windows).
+
+    Leverages Everything's NTFS index for sub-second file searches across
+    the entire filesystem. Requires Everything to be installed and running.
+    """
+
+    def __init__(self, workspace: str = "", es_path: str = ""):
+        self.workspace = workspace
+        self._es_path = es_path or self._find_es()
+        self._available = bool(self._es_path)
+
+    @staticmethod
+    def _find_es() -> str:
+        candidates = [
+            r"C:\Program Files\Everything\es.exe",
+            r"C:\Program Files (x86)\Everything\es.exe",
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        # Try PATH
+        try:
+            import shutil
+            found = shutil.which("es.exe")
+            if found:
+                return found
+        except Exception:
+            pass
+        return ""
+
+    @property
+    def name(self) -> str:
+        return "everything_search"
+
+    @property
+    def description(self) -> str:
+        if not self._available:
+            return "（不可用 — 未检测到 Everything 搜索工具）"
+        return (
+            "【超快】使用 Everything 引擎在 Windows 上按文件名/路径即时搜索文件。"
+            "速度比普通文件搜索快 100 倍以上，支持数百万文件毫秒级定位。"
+            "支持通配符 (*, ?)、路径筛选 (path:)、扩展名筛选 (ext:)、"
+            "大小筛选 (size:)、日期筛选 (dm:) 等 Everything 查询语法。"
+        )
+
+    @property
+    def input_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Everything 查询语句。支持：关键词模糊匹配、"
+                        "通配符 *.py、路径限定 path:C:\\Projects、"
+                        "扩展名 ext:pdf、大小 size:>1MB、"
+                        "日期 dm:2024-01-01..2024-12-31。"
+                        "多个条件用空格分隔。"
+                    ),
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "最大返回结果数",
+                    "default": 30,
+                },
+                "path": {
+                    "type": "string",
+                    "description": "限定搜索目录（可选），如 C:\\Projects",
+                },
+            },
+            "required": ["query"],
+        }
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        if not self._available:
+            return ToolResult(
+                output="❌ Everything 搜索不可用。请安装 Everything (https://www.voidtools.com) 并确保 es.exe 在系统路径中。",
+                is_error=True,
+            )
+
+        query = (kwargs.get("query") or kwargs.get("pattern") or "").strip()
+        max_results = kwargs.get("max_results", 30)
+        path_filter = kwargs.get("path", "")
+
+        if not query:
+            return ToolResult(
+                output=f"❌ everything_search 缺少 query 参数。收到的参数: {list(kwargs.keys())}。请使用 query=\"搜索关键词\"。",
+                is_error=True,
+            )
+
+        # Build es.exe command
+        cmd = [self._es_path, "-s", query, "-n", str(max_results), "-p"]
+        if path_filter:
+            cmd.extend(["-path", path_filter])
+
+        try:
+            loop = asyncio.get_event_loop()
+            proc = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            return ToolResult(output="⏱ Everything 搜索超时（30秒）", is_error=True)
+        except FileNotFoundError:
+            self._available = False
+            return ToolResult(output="❌ 找不到 es.exe，Everything 可能未安装", is_error=True)
+        except Exception as e:
+            return ToolResult(output=f"❌ Everything 搜索失败: {e}", is_error=True)
+
+        if proc.returncode != 0:
+            # es.exe returns 1 when no results — that's not an error
+            stderr = proc.stderr.strip()
+            if stderr:
+                return ToolResult(output=f"Everything 搜索错误: {stderr}", is_error=True)
+            return ToolResult(output=f"未找到匹配 '{query}' 的文件（Everything 搜索完成）")
+
+        results = [line for line in proc.stdout.splitlines() if line.strip()]
+        if not results:
+            return ToolResult(output=f"未找到匹配 '{query}' 的文件")
+
+        output = f"🔍 Everything 搜索结果: {len(results)} 个文件\n" + "\n".join(results)
+        return ToolResult(
+            output=output,
+            metadata={"total": len(results), "query": query},
+        )
