@@ -729,6 +729,40 @@ class AgenticLoop:
         }.get(profile, profile)
         logger.info(f"[Loop] Agent profile: {profile} ({profile_desc})")
 
+        # ── Quick Q&A pre-check: skip tool loop for pure explanation questions ──
+        # Questions like "解释一下你刚才做了什么" don't need tool execution.
+        # Key words that indicate Q&A: 解释/说明/为什么/怎么回事/explain/what/why/describe
+        # Key words that indicate task: 创建/修改/写/优化/改/add/create/write/edit/fix
+        last_user_text = ""
+        for msg in reversed(messages):
+            if msg.role == Role.USER:
+                t = msg.get_text().strip()
+                if t and not t.startswith("[系统提示]") and not t.startswith("##"):
+                    last_user_text = t
+                    break
+        _qa_words = ["解释", "说明", "为什么", "怎么回事", "什么意思", "explain", "what is", "why did", "describe"]
+        _task_words = ["创建", "修改", "写", "优化", "改", "加", "增加", "实现", "重构",
+                        "add", "create", "write", "edit", "fix", "implement", "refactor", "update"]
+        _is_qa = any(w in last_user_text.lower() for w in _qa_words)
+        _has_task = any(w in last_user_text.lower() for w in _task_words)
+        if _is_qa and not _has_task:
+            await self._emit(ContentBlock(
+                type=ContentType.TEXT,
+                text="📋 检测到问答请求，直接回答\n",
+            ))
+            response = await self.llm.chat(
+                messages=messages,
+                tools=[],
+                system=self._build_static_system_prompt(),
+            )
+            self.emitter.emit_done(total_steps=1)
+            return LoopResult(
+                final_response=response.text or "",
+                tool_executions=[],
+                total_rounds=1,
+                total_tokens=response.usage,
+            )
+
         # ── Build static system prompt (once, byte-identical for caching) ──
         # All dynamic state is injected as user messages per round
         static_system = self._build_static_system_prompt()
@@ -988,17 +1022,6 @@ class AgenticLoop:
                     await self._emit(ContentBlock(
                         type=ContentType.TEXT,
                         text="📋 所有任务已完成，自动退出\n",
-                    ))
-
-                # ── Model answered with meaningful text — not a task, just a Q&A ──
-                # If the model produced a substantial response (>100 chars) without
-                # calling tools, it likely answered a question (like "解释一下").
-                # Don't force tool use — fall through to normal exit.
-                elif not todo_state.get_all() and len(text) > 100:
-                    self._is_new_task = False
-                    await self._emit(ContentBlock(
-                        type=ContentType.TEXT,
-                        text="📋 已收到回答\n",
                     ))
 
                 # ── Only force retry in the first 2 rounds to get things started ──
