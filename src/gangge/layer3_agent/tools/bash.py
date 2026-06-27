@@ -100,7 +100,14 @@ class BashTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "执行 shell 命令。用于运行编译、测试、安装依赖、Git 操作等。命令在项目工作目录下执行。"
+        return (
+            "执行 shell 命令。用于运行编译、测试、安装依赖、启动服务器等。命令在项目工作目录下执行。\n"
+            "注意：命令超时（默认 120 秒）后会被强制终止。\n"
+            "启动 Web 服务器/后台进程时，请加上后台运行标记：\n"
+            "  Windows: start /B python server.py\n"
+            "  Linux:   python server.py &\n"
+            "然后用 curl/wget 单独验证服务器是否正常启动。"
+        )
 
     @property
     def input_schema(self) -> dict[str, Any]:
