@@ -22,7 +22,11 @@ class ReadFileTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "读取文件内容。支持指定偏移量和行数限制来读取大文件的部分内容。自动检测图片格式并返回文件基本信息。"
+        return (
+            "读取文件内容。支持指定偏移量和行数限制来读取大文件的部分内容。\n"
+            "自动检测图片格式并返回基本信息。path 不能为空。\n"
+            "示例: read_file(path=\"src/main.py\") 或 read_file(path=\"big.log\", offset=1, limit=50)"
+        )
 
     @property
     def input_schema(self) -> dict[str, Any]:
@@ -117,7 +121,12 @@ class WriteFileTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "将内容写入文件。如果文件已存在则覆盖。会自动创建父目录。"
+        return (
+            "将内容写入文件。如果文件已存在则覆盖，父目录会自动创建。\n"
+            "调用前务必检查 path 和 content 是否已填充，禁止传空对象 {}。\n"
+            "正确示例: write_file(path=\"src/main.py\", content=\"print('hello')\")\n"
+            "错误示例: write_file(path=\"\", content=\"\") 或 write_file()"
+        )
 
     @property
     def input_schema(self) -> dict[str, Any]:
@@ -204,8 +213,9 @@ class EditFileTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "使用搜索替换方式编辑文件。提供 old_str 和 new_str，会精确匹配 old_str 并替换为 new_str。"
-            "适合局部修改，避免重写整个文件。"
+            "使用搜索替换方式编辑文件。提供 old_str 和 new_str，会精确匹配 old_str 并替换为 new_str。\n"
+            "适合局部修改，避免重写整个文件。path、old_str、new_str 都不能为空。\n"
+            "示例: edit_file(path=\"src/main.py\", old_str=\"print('old')\", new_str=\"print('new')\")"
         )
 
     @property

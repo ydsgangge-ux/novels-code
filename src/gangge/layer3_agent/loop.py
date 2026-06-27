@@ -1144,15 +1144,22 @@ class AgenticLoop:
 
                 _elapsed = int((time.monotonic() - _t0) * 1000)
 
-                # ── Tool result truncation ──
+                # ── Tool result truncation (keep head AND tail) ──
+                # Old behavior: truncated from the front, losing error info at bottom.
+                # New: keeps first 40% and last 60% — model can always see errors
+                # at the end of long outputs.
                 result_output = result.output
                 if (
                     self.config.enable_tool_result_truncation
                     and len(result_output) > self.config.tool_result_max_chars
                 ):
+                    max_len = self.config.tool_result_max_chars
+                    head_len = max_len * 2 // 5  # 40%
+                    tail_len = max_len - head_len - 30  # ~60%, minus marker length
                     result_output = (
-                        result_output[:self.config.tool_result_max_chars]
-                        + f"\n...[截断，共{len(result_output)}字符]"
+                        result_output[:head_len]
+                        + f"\n...(中间截断，共{len(result_output)}字符)...\n"
+                        + result_output[-tail_len:]
                     )
 
                 tool_results_msg.add_tool_result(
