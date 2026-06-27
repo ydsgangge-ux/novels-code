@@ -977,8 +977,6 @@ class AgenticLoop:
 
             # 4. If no tool calls → check if done, then exit
             # Core principle: the model decides when to stop by not calling tools.
-            # We only force retry in the first 2 rounds to get things started.
-            # After that, no tool call = task is done (or model is stuck, either way we exit).
             has_tool_call = response.stop_reason == "tool_use" and response.tool_calls
             if not has_tool_call:
                 text = response.text or ""
@@ -990,6 +988,17 @@ class AgenticLoop:
                     await self._emit(ContentBlock(
                         type=ContentType.TEXT,
                         text="📋 所有任务已完成，自动退出\n",
+                    ))
+
+                # ── Model answered with meaningful text — not a task, just a Q&A ──
+                # If the model produced a substantial response (>100 chars) without
+                # calling tools, it likely answered a question (like "解释一下").
+                # Don't force tool use — fall through to normal exit.
+                elif not todo_state.get_all() and len(text) > 100:
+                    self._is_new_task = False
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text="📋 已收到回答\n",
                     ))
 
                 # ── Only force retry in the first 2 rounds to get things started ──
@@ -1016,6 +1025,17 @@ class AgenticLoop:
                         content=[ContentBlock(type=ContentType.TEXT, text=force_msg)],
                     ))
                     continue
+
+                # ── Model answered with meaningful text — not a task, just a Q&A ──
+                # If the model produced a substantial response (>100 chars) without
+                # calling tools, it likely answered a question (like "解释一下").
+                # Don't force tool use — exit normally.
+                if not todo_state.get_all() and len(text) > 100:
+                    self._is_new_task = False
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text="📋 已收到回答\n",
+                    ))
 
                 # ── All other cases: model stopped calling tools ──
                 # If there are still pending todos → nudge, don't exit
