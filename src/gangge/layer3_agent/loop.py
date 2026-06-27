@@ -744,8 +744,10 @@ class AgenticLoop:
                 if text and ("继续" in text or "continue" in text.lower()):
                     _should_keep_todos = True
                     break
+        self._is_new_task = False  # set below
         if not _should_keep_todos:
             todo_state.clear()
+            self._is_new_task = True  # new task: don't exit until model creates at least one todo
 
         # ── Load Memory Bank from .gangge/ files ──
         self._ensure_memory_bank()
@@ -1018,6 +1020,26 @@ class AgenticLoop:
                 # ── All other cases: model stopped calling tools ──
                 # If there are still pending todos → nudge, don't exit
                 todo_pending = todo_state.get_pending()
+
+                # ── New task, no todos created yet — force model to plan ──
+                if self._is_new_task and not todo_state.get_all():
+                    self._is_new_task = False  # prevent infinite nudging
+                    self.emitter.emit(EventType.WARNING,
+                                      f"第 {round_num+1} 轮未调用工具，新任务需要先规划")
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text="⚠️ 新任务，请先调用 TodoWrite 创建任务列表再开始执行\n",
+                    ))
+                    force_msg = (
+                        "这是一个新任务。请先调用 TodoWrite 创建任务计划，"
+                        "然后按步骤调用工具执行。"
+                    )
+                    messages.append(Message(
+                        role=Role.USER,
+                        content=[ContentBlock(type=ContentType.TEXT, text=force_msg)],
+                    ))
+                    continue
+
                 if todo_pending:
                     next_todo = todo_state.get_current()
                     todo_hint = f" 当前待办: {next_todo['content']}" if next_todo else ""
@@ -1284,6 +1306,14 @@ class AgenticLoop:
                     await self._emit(ContentBlock(
                         type=ContentType.TEXT,
                         text="⚠️ 还有待办任务未完成，请继续执行\n",
+                    ))
+                elif self._is_new_task and not todo_state.get_all():
+                    # New task, just reading files to understand — don't exit yet
+                    consecutive_readonly_rounds = 0
+                    self._is_new_task = False
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text="⚠️ 检测到新任务：请调用 TodoWrite 制定计划后执行\n",
                     ))
                 else:
                     await self._emit(ContentBlock(
