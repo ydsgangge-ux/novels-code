@@ -30,6 +30,7 @@ class EventType(str, Enum):
     ERROR      = "error"       # 错误
     DONE       = "done"        # 任务完成
     ROUND      = "round"       # 开始新轮次
+    METRICS    = "metrics"     # Experimental Mode: 每轮指标 (tokens/prompt/压缩/cache)
 
 
 @dataclass
@@ -89,3 +90,16 @@ class ProgressEmitter:
     def emit_done(self, total_steps: int = 0, files_created: list[str] | None = None):
         self.emit(EventType.DONE, "任务完成",
                   total_steps=total_steps, files_created=files_created or [])
+
+    def emit_metrics(self, **data: Any):
+        """Emit per-round experimental metrics.
+
+        Expected keys (all optional):
+          round, input_tokens, output_tokens, cumulative_input, cumulative_output,
+          system_chars, tools_chars, messages_chars, total_prompt_chars,
+          tools_count, messages_count, context_window, usage_ratio,
+          compression_before, compression_after, compressed (bool),
+          static_system_hash (str), dynamic_state_chars (int),
+          cache_estimated_hit (bool), tool_calls_this_round (list[str])
+        """
+        self.emit(EventType.METRICS, "metrics", **data)

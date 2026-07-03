@@ -918,6 +918,7 @@ class GanggeWorker(QThread):
     # ── CHANGE: 方案C — 每轮聚合消息信号 ──
     turn_complete = pyqtSignal(list)        # list[dict] 聚合后的消息列表
     ask_user_sig = pyqtSignal(str)          # question to ask user
+    experimental_sig = pyqtSignal(dict)     # Experimental Mode: per-round metrics
 
     def __init__(self, llm: BaseLLM, task: str, workspace: str,
                  max_rounds: int = 30, plan_mode: bool = False,
@@ -1171,6 +1172,22 @@ class GanggeWorker(QThread):
                 self.text_block.emit(_t("execution_tool_call", name=block.tool_name, input=inp), "tool")
 
         loop.set_stream_callback(stream_cb)
+
+        # ── Experimental Mode: subscribe to metrics events ──
+        from gangge.layer3_agent.progress_emitter import EventType as _Evt
+        def _on_metrics_event(event):
+            if event.type == _Evt.METRICS:
+                # Forward copy of dict to GUI thread via signal
+                try:
+                    self.experimental_sig.emit(dict(event.data))
+                except Exception:
+                    pass
+        loop.emitter.subscribe(_on_metrics_event)
+        # Also expose static system prompt for Prompt visualization
+        try:
+            self._static_system_text = loop._build_static_system_prompt()
+        except Exception:
+            self._static_system_text = ""
 
         # ── 4. Build messages ──
         batch_prefix = f"[{self.batch_index + 1}/{self.batch_total}] " if self.batch_total > 1 else ""
@@ -4908,6 +4925,346 @@ def _fetch_ollama_models(base_url: str) -> list[str]:
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Experimental Panel — Prefix Cache / Prompt / Compression / Token / Attention / Agent Graph
+# ═════════════════════════════════════════════════════════════════
+class ExperimentalPanel(QWidget):
+    """Experimental Mode panel — pure local metrics, no extra token cost.
+
+    Receives per-round metrics via `update_metrics()` and renders 6 views:
+      1. Prefix Cache 分析 (static hash + estimated hit)
+      2. Prompt 可视化 (system/tools/messages sizes + dump)
+      3. Context 压缩率 (compression events log)
+      4. Token Flow (per-round input/output table)
+      5. Attention 成本估算 (O(n²) estimate from context length)
+      6. Agent 调用图 (tool call chain)
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── Header ──
+        header = QHBoxLayout()
+        title = QLabel("🔬 Experimental Mode")
+        title.setStyleSheet("color:#f0f6fc;font-size:12px;font-weight:bold;padding:6px 8px;background:#161b22;")
+        header.addWidget(title)
+        header.addStretch()
+        self._round_label = QLabel("0 轮")
+        self._round_label.setStyleSheet("color:#8b949e;font-size:11px;padding:6px 8px;background:#161b22;")
+        header.addWidget(self._round_label)
+        clear_btn = QPushButton("清空")
+        clear_btn.setStyleSheet(
+            "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:4px;"
+            "color:#8b949e;font-size:11px;padding:2px 8px;}"
+            "QPushButton:hover{background:#30363d;color:#c9d1d9;}"
+        )
+        clear_btn.clicked.connect(self.clear_all)
+        header.addWidget(clear_btn)
+        layout.addLayout(header)
+
+        # ── Sub-tabs ──
+        self._tabs = QTabWidget()
+        self._tabs.setDocumentMode(True)
+        self._tabs.setStyleSheet(
+            "QTabWidget::pane{border:none;background:#0d1117;}"
+            "QTabBar::tab{background:#161b22;color:#8b949e;border:none;"
+            "border-bottom:2px solid transparent;padding:6px 10px;font-size:11px;}"
+            "QTabBar::tab:selected{color:#f0f6fc;border-bottom:2px solid #f78166;}"
+        )
+
+        # 1. Prefix Cache
+        self._cache_text = QTextBrowser()
+        self._cache_text.setStyleSheet(self._mono_style())
+        self._tabs.addTab(self._cache_text, "Cache")
+
+        # 2. Prompt 可视化
+        self._prompt_text = QTextBrowser()
+        self._prompt_text.setStyleSheet(self._mono_style())
+        self._tabs.addTab(self._prompt_text, "Prompt")
+
+        # 3. Context 压缩率
+        self._compress_text = QTextBrowser()
+        self._compress_text.setStyleSheet(self._mono_style())
+        self._tabs.addTab(self._compress_text, "压缩")
+
+        # 4. Token Flow
+        self._token_table = QTableWidget(0, 5)
+        self._token_table.setHorizontalHeaderLabels(["轮次", "输入", "输出", "累计", "调用工具"])
+        self._token_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self._token_table.setColumnWidth(0, 50)
+        self._token_table.setColumnWidth(1, 80)
+        self._token_table.setColumnWidth(2, 80)
+        self._token_table.setColumnWidth(3, 100)
+        self._token_table.verticalHeader().setVisible(False)
+        self._token_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._token_table.setAlternatingRowColors(True)
+        self._token_table.setStyleSheet(self._table_style())
+        self._tabs.addTab(self._token_table, "Token")
+
+        # 5. Attention 成本
+        self._attention_text = QTextBrowser()
+        self._attention_text.setStyleSheet(self._mono_style())
+        self._tabs.addTab(self._attention_text, "Attention")
+
+        # 6. Agent 调用图
+        self._graph_text = QTextBrowser()
+        self._graph_text.setStyleSheet(self._mono_style())
+        self._tabs.addTab(self._graph_text, "调用图")
+
+        layout.addWidget(self._tabs)
+
+        # ── State ──
+        self._metrics_history: list[dict] = []
+        self._compression_events: list[dict] = []
+        self._prompt_dump: str = ""  # latest full prompt text
+        self._static_system: str = ""
+
+    @staticmethod
+    def _mono_style() -> str:
+        return (
+            "QTextBrowser{background:#0d1117;border:none;"
+            "font-family:'Consolas','Courier New',monospace;font-size:11px;"
+            "color:#c9d1d9;padding:6px;}"
+        )
+
+    @staticmethod
+    def _table_style() -> str:
+        return (
+            "QTableWidget{background-color:#0d1117;border:1px solid #21262d;border-radius:6px;"
+            "gridline-color:#161b22;color:#c9d1d9;}"
+            "QTableWidget::item{padding:3px 6px;font-size:11px;}"
+            "QTableWidget::item:selected{background:#1f6feb;}"
+            "QHeaderView::section{background:#161b22;color:#8b949e;border:none;padding:4px;font-size:11px;}"
+        )
+
+    def set_static_system(self, text: str):
+        """Cache the static system prompt for the Prompt dump view."""
+        self._static_system = text
+
+    def clear_all(self):
+        self._metrics_history.clear()
+        self._compression_events.clear()
+        self._prompt_dump = ""
+        self._cache_text.clear()
+        self._prompt_text.clear()
+        self._compress_text.clear()
+        self._token_table.setRowCount(0)
+        self._attention_text.clear()
+        self._graph_text.clear()
+        self._round_label.setText("0 轮")
+
+    def update_metrics(self, data: dict):
+        """Receive a metrics dict emitted by AgenticLoop.
+
+        Keys (see progress_emitter.emit_metrics docstring):
+          round, input_tokens, output_tokens, cumulative_input, cumulative_output,
+          system_chars, tools_chars, messages_chars, total_prompt_chars,
+          tools_count, messages_count, context_window, usage_ratio,
+          static_system_hash, dynamic_state_chars, cache_estimated_hit,
+          tool_calls_this_round, model, compression_before, compression_after, compressed
+        """
+        self._metrics_history.append(data)
+        self._round_label.setText(f"{len(self._metrics_history)} 轮")
+
+        # Compression event?
+        if data.get("compressed"):
+            self._compression_events.append({
+                "round": data.get("round", 0),
+                "before": data.get("compression_before", 0),
+                "after": data.get("compression_after", 0),
+                "usage_ratio": data.get("usage_ratio", 0),
+            })
+
+        self._refresh_cache_view()
+        self._refresh_prompt_view(data)
+        self._refresh_compress_view()
+        self._refresh_token_table(data)
+        self._refresh_attention_view(data)
+        self._refresh_graph_view(data)
+
+    def _refresh_cache_view(self):
+        if not self._metrics_history:
+            return
+        lines = ["<b>Prefix Cache 分析</b> (本地估算，不依赖 API 返回)<br>",
+                 "<span style='color:#8b949e'>真实 cache_read_tokens 需 API 返回，",
+                 "智谱/OpenAI 兼容 API 通常不返回。此处用静态前缀哈希估算。</span><br><br>"]
+        lines.append("<table style='font-size:11px;'>")
+        lines.append("<tr style='color:#8b949e;'><td>轮次</td><td>静态哈希</td><td>动态状态字符</td><td>估算命中</td></tr>")
+        hits = 0
+        for m in self._metrics_history:
+            hit = m.get("cache_estimated_hit", False)
+            if hit:
+                hits += 1
+            hit_color = "#3fb950" if hit else "#f85149"
+            hit_text = "✓ 命中" if hit else "✗ 未命中"
+            lines.append(
+                f"<tr><td style='color:#58a6ff;'>#{m.get('round', 0)}</td>"
+                f"<td style='color:#c9d1d9;'>{m.get('static_system_hash', '-')[:12]}</td>"
+                f"<td style='color:#d29922;'>{m.get('dynamic_state_chars', 0)}</td>"
+                f"<td style='color:{hit_color};'>{hit_text}</td></tr>"
+            )
+        lines.append("</table>")
+        total = len(self._metrics_history)
+        rate = (hits / total * 100) if total > 0 else 0
+        lines.append(f"<br><span style='color:#3fb950;'>估算命中率: {rate:.0f}%</span> "
+                     f"<span style='color:#8b949e;'>({hits}/{total} 轮)</span>")
+        if rate < 50 and total > 2:
+            lines.append("<br><span style='color:#f85149;'>⚠ 静态前缀频繁变化，缓存几乎失效</span>")
+        self._cache_text.setHtml("".join(lines))
+
+    def _refresh_prompt_view(self, data: dict):
+        if not data:
+            return
+        sys_c = data.get("system_chars", 0)
+        tools_c = data.get("tools_chars", 0)
+        msgs_c = data.get("messages_chars", 0)
+        total_c = data.get("total_prompt_chars", 0)
+        # Rough chars→tokens estimate (1 token ≈ 3.5 chars for CJK mix)
+        est_tokens = total_c // 3
+        ctx = data.get("context_window", 0)
+        ratio = (est_tokens / ctx * 100) if ctx > 0 else 0
+
+        html = ["<b>Prompt 可视化</b> (本轮实际发送给 LLM 的内容)<br><br>"]
+        html.append("<table style='font-size:11px;'>")
+        html.append(f"<tr><td style='color:#8b949e;'>system 角色</td><td style='color:#c9d1d9;'>{sys_c:,} 字符</td></tr>")
+        html.append(f"<tr><td style='color:#8b949e;'>tools 定义</td><td style='color:#c9d1d9;'>{tools_c:,} 字符 "
+                    f"({data.get('tools_count', 0)} 个工具)</td></tr>")
+        html.append(f"<tr><td style='color:#8b949e;'>messages</td><td style='color:#c9d1d9;'>{msgs_c:,} 字符 "
+                    f"({data.get('messages_count', 0)} 条消息)</td></tr>")
+        html.append(f"<tr><td style='color:#f78166;font-weight:bold;'>总计</td>"
+                    f"<td style='color:#f78166;font-weight:bold;'>{total_c:,} 字符 ≈ {est_tokens:,} tokens</td></tr>")
+        html.append(f"<tr><td style='color:#8b949e;'>上下文窗口</td><td style='color:#c9d1d9;'>{ctx:,} tokens</td></tr>")
+        bar_color = "#3fb950" if ratio < 50 else ("#d29922" if ratio < 85 else "#f85149")
+        html.append(f"<tr><td style='color:#8b949e;'>占用率</td>"
+                    f"<td style='color:{bar_color};font-weight:bold;'>{ratio:.1f}%</td></tr>")
+        html.append("</table>")
+        # Progress bar
+        bar_w = 200
+        filled = int(bar_w * ratio / 100)
+        html.append(f"<br><span style='background:#21262d;color:transparent;'>"
+                    f"{'&nbsp;'*filled}</span>"
+                    f"<span style='background:{bar_color};color:transparent;'>"
+                    f"{'&nbsp;'*(bar_w-filled)}</span>")
+        # Static system prompt preview
+        if self._static_system:
+            preview = self._static_system[:800].replace("<", "&lt;").replace(">", "&gt;")
+            html.append(f"<br><br><b style='color:#58a6ff;'>静态 system prompt 预览 (前 800 字符):</b><br>")
+            html.append(f"<pre style='color:#8b949e;font-size:10px;white-space:pre-wrap;'>{preview}</pre>")
+        self._prompt_text.setHtml("".join(html))
+
+    def _refresh_compress_view(self):
+        if not self._compression_events:
+            self._compress_text.setHtml(
+                "<b>Context 压缩率</b><br><br>"
+                "<span style='color:#8b949e;'>暂无压缩事件。</span><br>"
+                "<span style='color:#8b949e;'>当上下文使用率超过 92% 时会自动压缩旧对话。</span>"
+            )
+            return
+        lines = ["<b>Context 压缩率</b><br><br>",
+                 "<table style='font-size:11px;'>",
+                 "<tr style='color:#8b949e;'><td>轮次</td><td>压缩前消息数</td><td>压缩后</td><td>减少</td><td>当时使用率</td></tr>"]
+        total_reduced = 0
+        for e in self._compression_events:
+            reduced = e["before"] - e["after"]
+            total_reduced += reduced
+            lines.append(
+                f"<tr><td style='color:#58a6ff;'>#{e['round']}</td>"
+                f"<td style='color:#c9d1d9;'>{e['before']}</td>"
+                f"<td style='color:#c9d1d9;'>{e['after']}</td>"
+                f"<td style='color:#3fb950;'>-{reduced}</td>"
+                f"<td style='color:#d29922;'>{e['usage_ratio']:.0%}</td></tr>"
+            )
+        lines.append("</table>")
+        lines.append(f"<br><span style='color:#3fb950;'>累计压缩消息数: {total_reduced}</span>")
+        self._compress_text.setHtml("".join(lines))
+
+    def _refresh_token_table(self, data: dict):
+        row = self._token_table.rowCount()
+        self._token_table.insertRow(row)
+        self._token_table.setRowHeight(row, 24)
+
+        items = [
+            f"#{data.get('round', 0)}",
+            f"{data.get('input_tokens', 0):,}",
+            f"{data.get('output_tokens', 0):,}",
+            f"{data.get('cumulative_input', 0)+data.get('cumulative_output', 0):,}",
+            ", ".join(data.get("tool_calls_this_round", [])) or "—",
+        ]
+        for col, text in enumerate(items):
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if col == 0:
+                item.setForeground(QColor("#58a6ff"))
+            elif col == 3:
+                item.setForeground(QColor("#d29922"))
+            self._token_table.setItem(row, col, item)
+        # Auto-scroll to bottom
+        self._token_table.scrollToBottom()
+
+    def _refresh_attention_view(self, data: dict):
+        if not data:
+            return
+        # Attention is O(n²) in sequence length. Estimate FLOPs.
+        est_tokens = data.get("total_prompt_chars", 0) // 3
+        attn_flops = est_tokens * est_tokens  # rough
+        # Convert to human-readable
+        if attn_flops > 1_000_000_000:
+            flops_str = f"{attn_flops/1_000_000_000:.2f} GFLOPs"
+        elif attn_flops > 1_000_000:
+            flops_str = f"{attn_flops/1_000_000:.2f} MFLOPs"
+        else:
+            flops_str = f"{attn_flops:,} FLOPs"
+
+        ctx = data.get("context_window", 0)
+        max_attn = (ctx * ctx) if ctx > 0 else 0
+        ratio = (est_tokens / ctx * 100) if ctx > 0 else 0
+
+        html = ["<b>Attention 成本估算</b><br>",
+                "<span style='color:#8b949e;'>Transformer 自注意力计算量为 O(n²)，n 为序列长度。</span><br><br>"]
+        html.append("<table style='font-size:11px;'>")
+        html.append(f"<tr><td style='color:#8b949e;'>本轮序列长度</td><td style='color:#c9d1d9;'>≈ {est_tokens:,} tokens</td></tr>")
+        html.append(f"<tr><td style='color:#8b949e;'>注意力 FLOPs</td><td style='color:#d29922;'>{flops_str}</td></tr>")
+        html.append(f"<tr><td style='color:#8b949e;'>窗口上限</td><td style='color:#c9d1d9;'>{ctx:,} tokens</td></tr>")
+        html.append(f"<tr><td style='color:#8b949e;'>窗口占用</td><td style='color:{('#3fb950' if ratio<50 else '#d29922') if ratio<85 else '#f85149'};'>{ratio:.1f}%</td></tr>")
+        if max_attn > 0:
+            max_str = f"{max_attn/1_000_000_000:.2f} GFLOPs" if max_attn > 1_000_000_000 else f"{max_attn:,} FLOPs"
+            html.append(f"<tr><td style='color:#8b949e;'>满载 FLOPs</td><td style='color:#8b949e;'>{max_str}</td></tr>")
+        html.append("</table>")
+        html.append("<br><span style='color:#8b949e;'>💡 说明: 此为粗略估算，实际还受 KV-cache、 batching、模型层数等影响。</span>")
+        self._attention_text.setHtml("".join(html))
+
+    def _refresh_graph_view(self, data: dict):
+        if not self._metrics_history:
+            return
+        lines = ["<b>Agent 调用图</b><br><br>",
+                 "<pre style='font-size:11px;line-height:1.4;'>"]
+        lines.append("<span style='color:#3fb950;'>● 用户</span>\n")
+        lines.append("  │\n")
+        for m in self._metrics_history:
+            r = m.get("round", 0)
+            tools = m.get("tool_calls_this_round", [])
+            inp = m.get("input_tokens", 0)
+            out = m.get("output_tokens", 0)
+            if tools:
+                tools_str = " + ".join(tools)
+                lines.append(f"  <span style='color:#58a6ff;'>├─ 轮 {r}</span> "
+                             f"<span style='color:#d29922;'>[{tools_str}]</span> "
+                             f"<span style='color:#8b949e;'>(in:{inp} out:{out})</span>\n")
+                for t in tools:
+                    lines.append(f"  │  <span style='color:#f78166;'>└─▶ {t}</span>\n")
+            else:
+                lines.append(f"  <span style='color:#58a6ff;'>├─ 轮 {r}</span> "
+                             f"<span style='color:#3fb950;'>[回答，无工具调用]</span> "
+                             f"<span style='color:#8b949e;'>(in:{inp} out:{out})</span>\n")
+            lines.append("  │\n")
+        lines.append("<span style='color:#3fb950;'>● 完成</span>\n")
+        lines.append("</pre>")
+        self._graph_text.setHtml("".join(lines))
+
+
+# ═════════════════════════════════════════════════════════════════
 #  Main Window
 # ═════════════════════════════════════════════════════════════════
 class GanggeDesktop(QMainWindow):
@@ -5423,6 +5780,10 @@ class GanggeDesktop(QMainWindow):
         self._novel_right = NovelRightPanel()
         self._novel_right.novel_action.connect(self._on_novel_action)
         right_tabs.addTab(self._novel_right, "📖 小说")
+
+        # ── Experimental Mode tab ──
+        self._experimental_panel = ExperimentalPanel()
+        right_tabs.addTab(self._experimental_panel, "🔬 实验")
 
         right_lay.addWidget(right_tabs)
 
@@ -7215,6 +7576,8 @@ class GanggeDesktop(QMainWindow):
         self._worker.tool_call_sig.connect(self._on_tool_call)
         self._worker.finished.connect(lambda s: self._on_finished(s, llm))
         self._worker.ask_user_sig.connect(self._on_ask_user)
+        # ── Experimental Mode: forward metrics to panel ──
+        self._worker.experimental_sig.connect(self._on_experimental_metrics)
         # ── Store turn messages for conversation continuity ──
         self._worker.turn_complete.connect(
             lambda msgs: self._on_turn_complete(msgs)
@@ -7362,6 +7725,16 @@ class GanggeDesktop(QMainWindow):
         else:
             self._worker._ask_user_answer = ""
         self._worker._ask_user_event.set()
+
+    def _on_experimental_metrics(self, data: dict):
+        """Receive per-round metrics from worker thread and update Experimental panel."""
+        try:
+            # Set static system prompt on first metrics event
+            if not self._experimental_panel._static_system and hasattr(self._worker, "_static_system_text"):
+                self._experimental_panel.set_static_system(self._worker._static_system_text)
+            self._experimental_panel.update_metrics(data)
+        except Exception:
+            pass
 
     def _on_tool_call(self, tool_name: str, output: str, is_error: bool, diff: str):
         self._tool_panel.add_entry(tool_name, output, is_error, diff)

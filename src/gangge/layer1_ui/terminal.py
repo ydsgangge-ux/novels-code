@@ -19,17 +19,13 @@ from textual.widgets import (
 )
 
 from gangge.layer3_agent.loop import AgenticLoop, LoopConfig
-from gangge.layer3_agent.tools.registry import ToolRegistry
-from gangge.layer3_agent.tools.bash import BashTool
-from gangge.layer3_agent.tools.file_ops import ReadFileTool, WriteFileTool, EditFileTool
-from gangge.layer3_agent.tools.search import GrepTool, GlobTool, ListDirTool
-from gangge.layer3_agent.tools.web import WebFetchTool, WebSearchTool
+from gangge.layer3_agent.tools.registry import ToolRegistry, create_tool_registry
 from gangge.layer4_permission.guard import (
     PermissionGuard,
     PermissionDecision,
     PermissionRequest,
 )
-from gangge.layer5_llm.base import BaseLLM, ContentBlock, ContentType
+from gangge.layer5_llm.base import BaseLLM, ContentBlock, ContentType, Message, Role
 from gangge.layer5_llm.registry import create_llm
 
 logger = logging.getLogger(__name__)
@@ -208,6 +204,7 @@ class GanggeApp(App):
         self.loop: AgenticLoop | None = None
 
         self._task: asyncio.Task | None = None
+        self._cancel = False  # cancel flag checked by AgenticLoop
         self._session_path = Path(self.workspace_dir) / ".gangge" / "session_history.txt"
         self._messages_path = Path(self.workspace_dir) / ".gangge" / "session_messages.json"
 
@@ -232,16 +229,20 @@ class GanggeApp(App):
             self.llm = create_llm()
             chat.add_system(f"✓ LLM 已连接: {self.llm.model}")
 
-            # Register tools (all file tools get workspace lock for relative path resolution)
-            self.tools.register(BashTool(workspace=self.workspace_dir))
-            self.tools.register(ReadFileTool(workspace=self.workspace_dir))
-            self.tools.register(WriteFileTool(workspace=self.workspace_dir))
-            self.tools.register(EditFileTool(workspace=self.workspace_dir))
-            self.tools.register(GrepTool())
-            self.tools.register(GlobTool())
-            self.tools.register(ListDirTool())
-            self.tools.register(WebFetchTool())
-            self.tools.register(WebSearchTool())
+            # Register tools via shared factory (gets ALL tools: bash, file_ops,
+            # search incl. EverythingSearch, todo, web, ask_user, novel, etc.)
+            async def _ask_user_callback(question: str) -> str:
+                # TUI: just log and return empty (no async input dialog wired)
+                chat.add_system(f"[yellow]? {question} (TUI 自动返回空)[/yellow]")
+                return ""
+
+            self.tools = create_tool_registry(
+                workspace=self.workspace_dir,
+                ask_user_callback=_ask_user_callback,
+                llm=self.llm,
+                multimodal_llm=None,
+                attachments=[],
+            )
             chat.add_system(f"✓ 已加载 {len(self.tools)} 个工具")
 
             # Create agentic loop
@@ -283,7 +284,10 @@ class GanggeApp(App):
             except Exception as e:
                 chat.add_system(f"项目分析跳过: {e}")
 
-            self.loop = AgenticLoop(self.llm, self.tools, self.guard, config)
+            self.loop = AgenticLoop(
+                self.llm, self.tools, self.guard, config,
+                cancel_check=lambda: self._cancel,
+            )
 
             status = self.query_one("#status-bar", StatusLine)
             status.update_info(self.llm.model)
@@ -339,12 +343,14 @@ class GanggeApp(App):
         chat = self.query_one("#chat-box", ChatBox)
         status = self.query_one("#status-bar", StatusLine)
 
-        from gangge.layer5_llm.base import Message, Role, ContentBlock
         from gangge.layer3_agent.progress_emitter import EventType
 
         if not self.loop:
             chat.add_error("Agent 未初始化")
             return
+
+        # Reset cancel flag for new task
+        self._cancel = False
 
         # Subscribe to progress events
         def on_event(event):
@@ -367,10 +373,12 @@ class GanggeApp(App):
 
         self.loop.emitter.subscribe(on_event)
 
-        # Set stream callback
+        # Set stream callback (handle TEXT + THINKING)
         async def on_stream(block: ContentBlock):
             if block.type == ContentType.TEXT and block.text:
                 chat.add_assistant(block.text)
+            elif block.type == ContentType.THINKING and block.text:
+                chat.add_system(f"[dim italic]💭 {block.text[:500]}[/dim italic]")
 
         self.loop.set_stream_callback(on_stream)
 
@@ -383,8 +391,17 @@ class GanggeApp(App):
 
         chat.add_system("\n[dim]⏳ 开始分析任务...[/dim]\n")
 
-        # Run the loop
-        result = await self.loop.run(messages)
+        # Run the loop (with error handling)
+        try:
+            result = await self.loop.run(messages)
+        except asyncio.CancelledError:
+            chat.add_system("[yellow]⏹ 任务已取消[/yellow]")
+            self._save_session_messages(messages)
+            return
+        except Exception as e:
+            chat.add_error(f"循环执行失败: {e}")
+            self._save_session_messages(messages)
+            return
 
         # ── Save full message history for next session ──
         self._save_session_messages(messages)
@@ -395,6 +412,8 @@ class GanggeApp(App):
         status.update_info(self.llm.model, total_in, total_out)
 
         # Show summary
+        if self._cancel:
+            chat.add_system("[yellow]⏹ 任务已被用户取消[/yellow]")
         if result.tool_executions:
             chat.add_system(
                 f"\n[dim]— {len(result.tool_executions)} 个工具调用, "
@@ -443,14 +462,21 @@ class GanggeApp(App):
         """Start a new session."""
         # Save current session first
         self._save_session_history()
+        # Clear the saved messages too — avoids dragging context into the new session
+        self._messages_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._messages_path.write_text("[]", encoding="utf-8")
+        except Exception:
+            pass
         chat = self.query_one("#chat-box", ChatBox)
         chat.clear()
         chat.add_system("\n--- 新会话 ---\n")
 
     def action_cancel(self) -> None:
-        """Cancel current operation."""
-        if self._task and not self._task.done():
-            self._task.cancel()
+        """Cancel current operation — sets the flag checked by AgenticLoop."""
+        self._cancel = True
+        chat = self.query_one("#chat-box", ChatBox)
+        chat.add_system("[yellow]⏹ 已请求取消，等待当前轮次结束...[/yellow]")
 
     def action_copy_chat(self) -> None:
         """Copy all chat content to clipboard."""

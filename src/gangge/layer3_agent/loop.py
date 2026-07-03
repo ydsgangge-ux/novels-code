@@ -9,6 +9,7 @@ Implements the Plan & Execute pattern:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -472,6 +473,87 @@ class AgenticLoop:
             round_warning=round_warning,
         )
 
+    def _emit_metrics_for_round(
+        self,
+        round_num: int,
+        response: Any,
+        total_tokens: dict[str, int],
+        system: str,
+        tool_defs: list[Any],
+        call_messages: list[Message],
+        static_system: str,
+        state_text: str,
+    ) -> None:
+        """Emit per-round experimental metrics via ProgressEmitter.
+
+        Pure local computation — does NOT send extra API requests.
+        All data is derived from already-assembled request/response.
+        """
+        import hashlib
+
+        # ── Prompt sizes (chars) ──
+        system_chars = len(system or "")
+        tools_chars = 0
+        for td in (tool_defs or []):
+            try:
+                tools_chars += len(td.description) + len(json.dumps(td.input_schema, ensure_ascii=False))
+            except Exception:
+                pass
+        messages_chars = 0
+        for m in (call_messages or []):
+            try:
+                messages_chars += len(m.get_text())
+                for b in m.content:
+                    if b.type == ContentType.TOOL_USE:
+                        messages_chars += len(json.dumps(b.tool_input, ensure_ascii=False))
+            except Exception:
+                pass
+        total_prompt_chars = system_chars + tools_chars + messages_chars
+
+        # ── Cache estimation: static system prompt hash ──
+        static_hash = hashlib.md5((static_system or "").encode("utf-8")).hexdigest()[:12]
+        dynamic_state_chars = len(state_text or "")
+        # First round: no cache possible. Later rounds: cache hit if static hash unchanged.
+        prev_hash = getattr(self, "_prev_static_hash", None)
+        cache_estimated_hit = bool(prev_hash) and prev_hash == static_hash
+        self._prev_static_hash = static_hash
+
+        # ── Token usage ──
+        input_tokens = response.usage.get("input_tokens", 0) if response.usage else 0
+        output_tokens = response.usage.get("output_tokens", 0) if response.usage else 0
+        cumulative_input = total_tokens.get("input", 0)
+        cumulative_output = total_tokens.get("output", 0)
+
+        # ── Context window usage ──
+        context_window = self.llm.max_context_tokens if self.llm else 0
+        usage_ratio = (cumulative_input / context_window) if context_window > 0 else 0.0
+
+        # ── Tool calls this round ──
+        tool_calls_this_round: list[str] = []
+        if response.tool_calls:
+            tool_calls_this_round = [tc.name for tc in response.tool_calls]
+
+        self.emitter.emit_metrics(
+            round=round_num,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cumulative_input=cumulative_input,
+            cumulative_output=cumulative_output,
+            system_chars=system_chars,
+            tools_chars=tools_chars,
+            messages_chars=messages_chars,
+            total_prompt_chars=total_prompt_chars,
+            tools_count=len(tool_defs or []),
+            messages_count=len(call_messages or []),
+            context_window=context_window,
+            usage_ratio=usage_ratio,
+            static_system_hash=static_hash,
+            dynamic_state_chars=dynamic_state_chars,
+            cache_estimated_hit=cache_estimated_hit,
+            tool_calls_this_round=tool_calls_this_round,
+            model=getattr(response, "model", "") or getattr(self.llm, "model", ""),
+        )
+
     def _deduplicate_reads(
         self, messages: list[Message], reads_cache: dict[str, int], current_round: int
     ) -> list[Message]:
@@ -896,11 +978,21 @@ class AgenticLoop:
                 if total_input > 0 and self.llm.max_context_tokens > 0:
                     usage_ratio = total_input / self.llm.max_context_tokens
                     if usage_ratio > 0.92:
+                        _before = len(messages)
                         messages = await self._compress_history(messages, round_num)
+                        _after = len(messages)
                         await self._emit(ContentBlock(
                             type=ContentType.TEXT,
                             text=f"\n📦 上下文压缩: 使用率 {usage_ratio:.0%}，已自动压缩旧对话\n",
                         ))
+                        # Experimental: record compression event
+                        self.emitter.emit_metrics(
+                            round=round_num,
+                            compression_before=_before,
+                            compression_after=_after,
+                            compressed=True,
+                            usage_ratio=usage_ratio,
+                        )
                 elif self.config.enable_sliding_window:
                     # Fallback: sliding window
                     messages = self._trim_history(messages)
@@ -996,6 +1088,21 @@ class AgenticLoop:
             # Track token usage
             total_tokens["input"] += response.usage.get("input_tokens", 0)
             total_tokens["output"] += response.usage.get("output_tokens", 0)
+
+            # ── Experimental Mode: emit per-round metrics ──
+            try:
+                self._emit_metrics_for_round(
+                    round_num=round_num,
+                    response=response,
+                    total_tokens=total_tokens,
+                    system=system,
+                    tool_defs=tool_defs,
+                    call_messages=call_messages,
+                    static_system=static_system,
+                    state_text=state_text,
+                )
+            except Exception:
+                pass
 
             # Reset consecutive failure counter on success
             self._llm_failures = 0
