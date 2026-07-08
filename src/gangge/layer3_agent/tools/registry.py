@@ -50,6 +50,7 @@ TOOL_PHASES: dict[str, int] = {
     # Phase 3: Run
     "bash":           PHASE_RUN,
     "lint_check":     PHASE_RUN,
+    "browser_debug":  PHASE_RUN,  # 浏览器调试验证 — 前端代码改完后验证页面
     # Phase 4: Special
     "ask_user":       PHASE_SPECIAL,
     "web_search":     PHASE_SPECIAL,
@@ -105,7 +106,7 @@ AGENT_PROFILES = {
             # Phase 2: Write
             "write_file", "edit_file", "create_tool",
             # Phase 3: Run
-            "bash", "lint_check",
+            "bash", "lint_check", "browser_debug",
             # Always available
             "ask_user",
             "vision",
@@ -376,6 +377,17 @@ def create_tool_registry(
             logger.debug("[Registry] Playwright not installed — browser tool skipped")
     except Exception as e:
         logger.debug("[Registry] Browser tool skipped: %s", e)
+
+    # ── Browser Debug Tool (前端调试验证) ──
+    try:
+        from gangge.layer3_agent.tools.browser_debug import BrowserDebugTool, _BROWSER_AVAILABLE as _BD_AVAIL
+        if _BD_AVAIL:
+            registry.register(BrowserDebugTool())
+            logger.info("[Registry] Browser debug tool activated — 前端验证闭环")
+        else:
+            logger.debug("[Registry] Playwright not installed — browser_debug skipped")
+    except Exception as e:
+        logger.debug("[Registry] Browser debug tool skipped: %s", e)
 
     registry.register(AskUserTool(ask_callback=ask_user_callback))
 
