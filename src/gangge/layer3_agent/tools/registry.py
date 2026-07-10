@@ -55,6 +55,7 @@ TOOL_PHASES: dict[str, int] = {
     "ask_user":       PHASE_SPECIAL,
     "web_search":     PHASE_SPECIAL,
     "web_fetch":      PHASE_SPECIAL,
+    "package_info":   PHASE_SPECIAL,  # 结构化 API 直连（GitHub/npm/PyPI）
     "generate_image": PHASE_SPECIAL,
     "browser":        PHASE_SPECIAL,
     "vision":         PHASE_EXPLORE,  # always visible — LLM needs it for image tasks
@@ -110,6 +111,7 @@ AGENT_PROFILES = {
             # Always available
             "ask_user",
             "vision",
+            "package_info",  # 查包版本/依赖（开发常见需求）
         },
     },
     "novel": {
@@ -148,7 +150,7 @@ AGENT_PROFILES = {
         ],
         "tools": {
             # Search + web
-            "web_search", "web_fetch", "grep", "glob",
+            "web_search", "web_fetch", "package_info", "grep", "glob",
             "everything_search",
             "read_file", "list_dir",
             # Planning + interaction
@@ -361,6 +363,13 @@ def create_tool_registry(
         registry.register(cls(workspace=workspace))
     registry.register(WebFetchTool(usage=usage))
     registry.register(WebSearchTool(usage=usage))
+    # ── PackageInfoTool: 结构化 API 直连（GitHub/npm/PyPI）──
+    try:
+        from gangge.layer3_agent.tools.package_info import PackageInfoTool
+        registry.register(PackageInfoTool())
+        logger.info("[Registry] Package info tool activated — GitHub/npm/PyPI 结构化查询")
+    except Exception as e:
+        logger.debug("[Registry] Package info tool skipped: %s", e)
     registry.register(FindSymbolTool(workspace=workspace))
     registry.register(FindReferencesTool(workspace=workspace))
 

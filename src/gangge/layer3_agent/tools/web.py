@@ -8,7 +8,7 @@ import re
 import time
 import logging
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin, urlparse
 from html import unescape as html_unescape
 
 import aiohttp
@@ -16,6 +16,14 @@ import aiohttp
 from gangge.layer3_agent.tools.base import BaseTool, ToolResult
 
 logger = logging.getLogger(__name__)
+
+# 检查 trafilatura 是否可用（高质量正文提取）
+_TRAFILATURA_AVAILABLE = False
+try:
+    import trafilatura
+    _TRAFILATURA_AVAILABLE = True
+except ImportError:
+    pass
 
 _AIOHTTP_REDIRECT_KWARG = "allow_redirects"
 try:
@@ -101,7 +109,10 @@ def _strip_html(text: str, max_length: int = 8000) -> str:
 
 
 class WebFetchTool(BaseTool):
-    """Fetch content from a URL (static HTTP, no JS rendering)."""
+    """Fetch content from a URL (static HTTP, no JS rendering).
+
+    升级版：优先尝试 llms.txt → trafilatura 正文提取 → regex 退化方案。
+    """
 
     def __init__(self, usage: UsageController | None = None):
         self._usage = usage or UsageController()
@@ -113,8 +124,9 @@ class WebFetchTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "获取指定 URL 的网页内容并转换为纯文本。仅支持静态 HTML，不渲染 JavaScript。"
+            "获取指定 URL 的网页正文并转换为纯文本。仅支持静态 HTML，不渲染 JavaScript。"
             "适用于查阅在线文档、API 参考、博客文章、技术文章等。"
+            "✨ 优先尝试 llms.txt（为 LLM 准备的精简版）→ trafilatura 正文提取 → 退化方案。"
             "⚠️ 优先使用此工具，仅在静态抓取无法获取内容时才考虑 browser。"
         )
 
@@ -136,6 +148,59 @@ class WebFetchTool(BaseTool):
             "required": ["url"],
         }
 
+    async def _try_llms_txt(self, session: aiohttp.ClientSession, url: str) -> str:
+        """尝试获取同域名下的 /llms.txt 或 /llms-full.txt。
+
+        llms.txt 是为 LLM 准备的精简文档格式，质量通常优于正文提取。
+        参考: https://llmstxt.org
+        """
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+
+        for path in ["/llms-full.txt", "/llms.txt"]:
+            llms_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+            try:
+                get_kwargs: dict[str, Any] = {
+                    "url": llms_url,
+                    "timeout": aiohttp.ClientTimeout(total=8),
+                    "headers": {
+                        "User-Agent": "Mozilla/5.0 GanggeBot/1.0",
+                        "Accept": "text/plain,*/*",
+                    },
+                    _AIOHTTP_REDIRECT_KWARG: True,
+                }
+                async with session.get(**get_kwargs) as resp:
+                    if resp.status == 200:
+                        text = await resp.text(errors="replace")
+                        if text and len(text.strip()) > 100:
+                            logger.info("[web_fetch] 命中 llms.txt: %s", llms_url)
+                            return text
+            except Exception:
+                continue
+        return ""
+
+    def _extract_with_trafilatura(self, html: str, url: str) -> str:
+        """用 trafilatura 提取正文（质量高于 regex）。"""
+        if not _TRAFILATURA_AVAILABLE:
+            return ""
+        try:
+            # include_links=True 保留链接（文档场景有用）
+            # include_tables=True 保留表格（API 参数表）
+            extracted = trafilatura.extract(
+                html,
+                url=url,
+                include_links=True,
+                include_tables=True,
+                include_images=False,
+                output_format="txt",
+                no_fallback=False,
+            )
+            return extracted or ""
+        except Exception as e:
+            logger.debug("[web_fetch] trafilatura 提取失败: %s", e)
+            return ""
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         url = (kwargs.get("url") or kwargs.get("link") or "").strip()
         max_length = min(kwargs.get("max_length", 6000), 16000)
@@ -152,6 +217,17 @@ class WebFetchTool(BaseTool):
 
         try:
             async with aiohttp.ClientSession() as session:
+                # 1. 优先尝试 llms.txt（为 LLM 准备的精简文档）
+                llms_content = await self._try_llms_txt(session, url)
+                if llms_content:
+                    text = llms_content[:max_length]
+                    if len(llms_content) > max_length:
+                        text += f"\n\n... (llms.txt 已截断，原始共 {len(llms_content)} 字符)"
+                    return ToolResult(
+                        output=f"[来源: {url} | via llms.txt]\n{text}\n[{self._usage.usage_summary()}]"
+                    )
+
+                # 2. 常规 HTTP 抓取
                 get_kwargs: dict[str, Any] = {
                     "url": url,
                     "timeout": aiohttp.ClientTimeout(total=15),
@@ -175,10 +251,22 @@ class WebFetchTool(BaseTool):
                             is_error=True,
                         )
 
-                    text = await resp.text(errors="replace")
-                    text = _strip_html(text, max_length)
-                    text = f"[来源: {url}]\n{text}\n[{self._usage.usage_summary()}]"
-                    return ToolResult(output=text)
+                    raw_html = await resp.text(errors="replace")
+
+                # 3. 用 trafilatura 提取正文（质量高于 regex）
+                extracted = self._extract_with_trafilatura(raw_html, url)
+                if extracted and len(extracted.strip()) > 100:
+                    text = extracted[:max_length]
+                    if len(extracted) > max_length:
+                        text += f"\n\n... (内容已截断，原始共 {len(extracted)} 字符)"
+                    source_tag = "trafilatura"
+                else:
+                    # 4. 退化方案：regex 清理
+                    text = _strip_html(raw_html, max_length)
+                    source_tag = "regex-fallback"
+
+                text = f"[来源: {url} | via {source_tag}]\n{text}\n[{self._usage.usage_summary()}]"
+                return ToolResult(output=text)
         except asyncio.TimeoutError:
             return ToolResult(output=f"请求超时 (15s): {url}", is_error=True)
         except Exception as e:
