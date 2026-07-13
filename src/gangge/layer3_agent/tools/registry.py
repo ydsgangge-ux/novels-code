@@ -43,6 +43,7 @@ TOOL_PHASES: dict[str, int] = {
     "find_symbol":    PHASE_EXPLORE,
     "find_references": PHASE_EXPLORE,
     "TodoWrite":      PHASE_EXPLORE,
+    "chat_log":       PHASE_EXPLORE,  # 纯聊天记录 — 不需要其他工具时的出口
     # Phase 2: Write
     "write_file":     PHASE_WRITE,
     "edit_file":      PHASE_WRITE,
@@ -103,7 +104,7 @@ AGENT_PROFILES = {
             # Phase 1: Explore
             "list_dir", "read_file", "grep", "glob",
             "everything_search",
-            "find_symbol", "find_references", "TodoWrite",
+            "find_symbol", "find_references", "TodoWrite", "chat_log",
             # Phase 2: Write
             "write_file", "edit_file", "create_tool",
             # Phase 3: Run
@@ -154,7 +155,7 @@ AGENT_PROFILES = {
             "everything_search",
             "read_file", "list_dir",
             # Planning + interaction
-            "TodoWrite", "ask_user",
+            "TodoWrite", "ask_user", "chat_log",
             # Can write findings
             "write_file", "edit_file",
             # Image recognition
@@ -376,6 +377,11 @@ def create_tool_registry(
     # ── TodoWrite: the most important tool for task tracking ──
     todo_state = get_todo_state()
     registry.register(TodoWriteTool(state=todo_state))
+
+    # ── ChatLog: 纯聊天场景的工具出口 ──
+    from gangge.layer3_agent.tools.chat_log import ChatLogTool
+    registry.register(ChatLogTool())
+    logger.info("[Registry] Chat log tool activated — 纯聊天/Q&A 出口")
 
     try:
         from gangge.layer3_agent.tools.browser import BrowserTool, _BROWSER_AVAILABLE

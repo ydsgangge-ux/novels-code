@@ -274,7 +274,11 @@ class WebFetchTool(BaseTool):
 
 
 class WebSearchTool(BaseTool):
-    """Search the web using DuckDuckGo (free, no API key required)."""
+    """Search the web — DuckDuckGo API → Bing 抓取双引擎降级。
+
+    优先使用 DuckDuckGo Instant Answer API（返回 JSON，稳定），
+    失败时自动降级到 Bing 搜索（国内可访问，抓取 HTML）。
+    """
 
     def __init__(self, usage: UsageController | None = None):
         self._usage = usage or UsageController()
@@ -286,7 +290,8 @@ class WebSearchTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "使用 DuckDuckGo 搜索互联网获取最新信息。返回结果包含标题、摘要和链接。"
+            "搜索互联网获取最新信息。返回结果包含标题、摘要和链接。"
+            "优先 DuckDuckGo，失败自动切换 Bing。"
             "用于查找技术文档、解决方案、最新资讯等需要联网搜索的场景。"
             "⚠️ 先搜再取: web_search 找到链接后，用 web_fetch 获取详细内容。"
             "⚠️ 搜索短语要精确、具体，避免过于宽泛的查询。"
@@ -324,56 +329,143 @@ class WebSearchTool(BaseTool):
         if not ok:
             return ToolResult(output=msg, is_error=True)
 
-        encoded = quote_plus(query)
-        search_url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        errors: list[str] = []
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                get_kwargs: dict[str, Any] = {
-                    "url": search_url,
-                    "timeout": aiohttp.ClientTimeout(total=12),
+        async with aiohttp.ClientSession() as session:
+            # ── 第 1 层: DuckDuckGo Instant Answer API ──
+            # 返回 JSON，稳定，但不保证有结果（对中文查询有时返回空）
+            try:
+                encoded = quote_plus(query)
+                ddg_url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
+                async with session.get(
+                    ddg_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        results = self._parse_ddg_api(data, max_results)
+                        if results:
+                            return self._format_results(query, results, "DuckDuckGo")
+                    errors.append(f"DDG API: 无结果或 HTTP {resp.status}")
+            except asyncio.TimeoutError:
+                errors.append("DDG API 超时")
+            except Exception as e:
+                errors.append(f"DDG API: {e}")
+
+            # ── 第 2 层: DuckDuckGo HTML 抓取 ──
+            # 比 API 更完整（有 snippet），但可能被限流
+            try:
+                encoded = quote_plus(query)
+                ddg_html_url = f"https://html.duckduckgo.com/html/?q={encoded}"
+                ddg_html_kwargs: dict[str, Any] = {
+                    "url": ddg_html_url,
                     "headers": {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 GanggeBot/1.0",
                         "Accept": "text/html",
                         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                     },
+                    "timeout": aiohttp.ClientTimeout(total=12),
                     _AIOHTTP_REDIRECT_KWARG: True,
                 }
-                async with session.get(**get_kwargs) as resp:
-                    if resp.status != 200:
-                        return ToolResult(
-                            output=f"搜索请求失败 HTTP {resp.status}。请稍后重试或尝试其他关键词。",
-                            is_error=True,
-                        )
-                    html = await resp.text(errors="replace")
+                async with session.get(**ddg_html_kwargs) as resp:
+                    if resp.status == 200:
+                        html = await resp.text(errors="replace")
+                        results = _parse_ddg_results(html, max_results)
+                        if results:
+                            return self._format_results(query, results, "DuckDuckGo-HTML")
+                errors.append("DDG HTML: 无结果")
+            except asyncio.TimeoutError:
+                errors.append("DDG HTML 超时")
+            except Exception as e:
+                errors.append(f"DDG HTML: {e}")
 
-                results = _parse_ddg_results(html, max_results)
+            # ── 第 3 层: Bing 搜索（国内可访问的兜底）──
+            try:
+                encoded = quote_plus(query)
+                bing_url = f"https://www.bing.com/search?q={encoded}&count={max_results}"
+                bing_kwargs: dict[str, Any] = {
+                    "url": bing_url,
+                    "headers": {
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        ),
+                        "Accept-Language": "zh-CN,zh;q=0.9",
+                    },
+                    "timeout": aiohttp.ClientTimeout(total=12),
+                    _AIOHTTP_REDIRECT_KWARG: True,
+                }
+                async with session.get(**bing_kwargs) as resp:
+                    if resp.status == 200:
+                        html = await resp.text(errors="replace")
+                        results = self._parse_bing_results(html, max_results)
+                        if results:
+                            return self._format_results(query, results, "Bing")
+                errors.append("Bing: 无结果")
+            except asyncio.TimeoutError:
+                errors.append("Bing 超时")
+            except Exception as e:
+                errors.append(f"Bing: {e}")
 
-                if not results:
-                    return ToolResult(
-                        output=f"未找到与 '{query}' 相关的结果。请尝试:\n"
-                        "1. 使用更通用的关键词\n2. 减少查询中的特殊符号\n3. 换成英文关键词重试",
-                        is_error=True,
-                    )
+        # 三层全部失败
+        return ToolResult(
+            output=(
+                f"搜索失败，三层引擎均不可用: {query}\n"
+                f"尝试: {'; '.join(errors)}\n"
+                f"建议: 1. 检查网络 2. 换英文关键词 3. 用 web_fetch 直接访问目标网页"
+            ),
+            is_error=True,
+        )
 
-                lines = [f"搜索结果 ({len(results)} 条): {query}\n"]
-                for i, r in enumerate(results, 1):
-                    lines.append(f"{i}. [{r['title']}]({r['url']})")
-                    if r.get("snippet"):
-                        lines.append(f"   {r['snippet'][:200]}")
-                    lines.append("")
+    def _parse_ddg_api(self, data: dict, max_results: int) -> list[dict[str, str]]:
+        """解析 DuckDuckGo Instant Answer API 的 JSON 响应。"""
+        results = []
+        if data.get("AbstractText"):
+            results.append({
+                "title": data.get("Heading", "摘要"),
+                "snippet": data["AbstractText"][:500],
+                "url": data.get("AbstractURL", ""),
+            })
+        for topic in data.get("RelatedTopics", [])[:max_results]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append({
+                    "title": topic.get("FirstURL", "").split("/")[-1].replace("_", " "),
+                    "snippet": topic["Text"][:300],
+                    "url": topic.get("FirstURL", ""),
+                })
+        return results[:max_results]
 
-                lines.append(f"[{self._usage.usage_summary()}]")
-                return ToolResult(output="\n".join(lines))
+    def _parse_bing_results(self, html: str, max_results: int) -> list[dict[str, str]]:
+        """解析 Bing 搜索结果 HTML。"""
+        results = []
+        titles = re.findall(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL)
+        snippets = re.findall(r'<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>(.*?)</p>', html, re.DOTALL)
 
-        except asyncio.TimeoutError:
-            return ToolResult(output="搜索请求超时，请稍后重试", is_error=True)
-        except Exception as e:
-            logger.warning(f"DuckDuckGo search failed: {e}")
-            return ToolResult(
-                output=f"搜索失败: {e}\n提示: 如果持续失败，可能被限流。请等几秒再试。",
-                is_error=True,
-            )
+        for i, (href, title) in enumerate(titles[:max_results]):
+            title_clean = re.sub(r"<[^>]+>", "", title).strip()
+            snippet_clean = ""
+            if i < len(snippets):
+                snippet_clean = re.sub(r"<[^>]+>", "", snippets[i]).strip()
+            if title_clean and not href.startswith("javascript"):
+                results.append({
+                    "title": title_clean[:120],
+                    "snippet": snippet_clean[:300],
+                    "url": href,
+                })
+        return results
+
+    def _format_results(self, query: str, results: list[dict], engine: str) -> ToolResult:
+        """格式化搜索结果输出。"""
+        lines = [f"搜索结果 ({len(results)} 条 | via {engine}): {query}\n"]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. [{r['title']}]({r['url']})")
+            if r.get("snippet"):
+                lines.append(f"   {r['snippet'][:200]}")
+            lines.append("")
+        lines.append(f"[{self._usage.usage_summary()}]")
+        return ToolResult(output="\n".join(lines))
 
 
 def _parse_ddg_results(html: str, max_results: int) -> list[dict[str, str]]:
