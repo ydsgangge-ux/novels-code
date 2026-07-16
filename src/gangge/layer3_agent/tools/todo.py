@@ -34,10 +34,16 @@ class TodoState:
     def __init__(self):
         self._todos: list[dict] = []
         # Each todo: {"id": str, "content": str, "status": "pending"|"in_progress"|"completed", "priority": "high"|"medium"|"low"}
+        self._productive_hits: dict[str, int] = {}  # todo_id -> count of productive tool hits
 
     def update(self, todos: list[dict]) -> None:
         """Replace the entire todo list (Claude Code style — no partial updates)."""
         self._todos = todos
+        # Clean up hit counters for completed todos
+        completed_ids = {t["id"] for t in todos if t.get("status") == "completed"}
+        for tid in list(self._productive_hits):
+            if tid in completed_ids:
+                del self._productive_hits[tid]
 
     def get_all(self) -> list[dict]:
         """Return current todo list."""
@@ -57,17 +63,24 @@ class TodoState:
                 return t
         return None
 
+    # Minimum productive tool hits before auto-completing a todo.
+    # 1 hit = old behavior (too eager, causes false completions).
+    # 2+ hits = requires the model to have done substantial work on this todo.
+    AUTO_COMPLETE_MIN_HITS = 2
+
     def auto_advance(self, tool_name: str, tool_input: dict, success: bool) -> bool:
         """Auto-advance todo state based on tool execution result.
 
-        This is the key runtime feature: the system manages todo state,
-        the model doesn't need to manually call TodoWrite to update status.
+        Accumulation-based logic: a todo must receive at least
+        AUTO_COMPLETE_MIN_HITS productive tool calls before it is
+        auto-completed. This prevents "one write_file → done" false
+        completions.
 
         Rules:
-        - If a write_file/edit_file/bash succeeds and current todo is in_progress → mark completed
+        - Each successful productive tool call increments a per-todo counter
+        - Only when counter >= AUTO_COMPLETE_MIN_HITS does the todo auto-complete
+        - When model explicitly sets status=completed via TodoWrite, reset counter
         - If current todo is completed → auto-start next pending todo
-        - If no current todo exists → auto-start first pending todo
-        - If all todos are completed → do nothing
 
         Returns True if state was changed.
         """
@@ -94,13 +107,20 @@ class TodoState:
         current = self.get_current()
 
         if current and current.get("status") == "in_progress":
-            # Mark current task as completed
-            for t in self._todos:
-                if t["id"] == current["id"]:
-                    t["status"] = "completed"
-                    changed = True
-                    logger.info(f"[TodoState] Auto-completed: {t['content']}")
-                    break
+            tid = current["id"]
+            self._productive_hits[tid] = self._productive_hits.get(tid, 0) + 1
+            hits = self._productive_hits[tid]
+
+            if hits >= self.AUTO_COMPLETE_MIN_HITS:
+                # Enough productive work done — auto-complete
+                for t in self._todos:
+                    if t["id"] == tid:
+                        t["status"] = "completed"
+                        changed = True
+                        logger.info(f"[TodoState] Auto-completed (after {hits} productive hits): {t['content']}")
+                        break
+            else:
+                logger.info(f"[TodoState] Productive hit {hits}/{self.AUTO_COMPLETE_MIN_HITS} for: {current['content']}")
 
         # Auto-start next pending task
         if changed:

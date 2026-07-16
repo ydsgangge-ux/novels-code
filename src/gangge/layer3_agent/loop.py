@@ -159,6 +159,7 @@ class LoopResult:
     total_rounds: int = 0
     total_tokens: dict[str, int] = field(default_factory=dict)
     extra: dict[str, str] = field(default_factory=dict)  # e.g. {"memory_bank_update": "..."}
+    completion_reason: str = ""  # e.g. "all_todos_done", "model_end_turn", "consecutive_readonly", "max_rounds"
 
 
 # Callback types
@@ -444,6 +445,23 @@ class AgenticLoop:
             prompt += "\n\n" + NOVEL_PROMPT
 
         return prompt
+
+    @staticmethod
+    def _build_completion_summary() -> str:
+        """Build a completion summary from completed todo items.
+
+        Uses the actual work done (completed todos) instead of
+        the user's original message, which may be negative feedback
+        or a new request — not a description of what was accomplished.
+        """
+        from gangge.layer3_agent.tools.todo import get_todo_state
+        todo_state = get_todo_state()
+        all_todos = todo_state.get_all()
+        completed = [t for t in all_todos if t.get("status") == "completed"]
+        if completed:
+            items = "; ".join(t["content"][:40] for t in completed[:5])
+            return f"completed: {items}"
+        return "task completed"
 
     def _build_dynamic_state_text(self, round_num: int = 0) -> str:
         """Build dynamic state text that changes between rounds.
@@ -843,6 +861,7 @@ class AgenticLoop:
                 tool_executions=[],
                 total_rounds=1,
                 total_tokens=response.usage,
+                completion_reason="single_turn_answer",
             )
 
         # ── Build static system prompt (once, byte-identical for caching) ──
@@ -1047,6 +1066,7 @@ class AgenticLoop:
                     tool_executions=executions,
                     total_rounds=round_num,
                     total_tokens=total_tokens,
+                    completion_reason="llm_timeout",
                 )
             except Exception as e:
                 error_str = str(e)
@@ -1083,6 +1103,7 @@ class AgenticLoop:
                     tool_executions=executions,
                     total_rounds=round_num,
                     total_tokens=total_tokens,
+                    completion_reason="llm_error",
                 )
 
             # Track token usage
@@ -1225,7 +1246,7 @@ class AgenticLoop:
                 after_checkpoint = None
                 if has_modified_files:
                     after_checkpoint = await self._git_checkpoint(
-                        f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
+                        f"checkpoint: {self._build_completion_summary()}"
                     )
 
                 self.emitter.emit_done(total_steps=round_num + 1)
@@ -1239,6 +1260,7 @@ class AgenticLoop:
                         "shadow_checkpoint_before": shadow_checkpoint or "",
                         "shadow_checkpoint_after": after_checkpoint or "",
                     },
+                    completion_reason="model_end_turn",
                 )
 
             # 5. Process tool calls
@@ -1475,7 +1497,7 @@ class AgenticLoop:
                     after_checkpoint = None
                     if has_modified_files:
                         after_checkpoint = await self._git_checkpoint(
-                            f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
+                            f"checkpoint: {self._build_completion_summary()}"
                         )
                     self.emitter.emit_done(total_steps=round_num + 1)
                     return LoopResult(
@@ -1488,6 +1510,7 @@ class AgenticLoop:
                             "shadow_checkpoint_before": shadow_checkpoint or "",
                             "shadow_checkpoint_after": after_checkpoint or "",
                         },
+                        completion_reason="consecutive_readonly",
                     )
 
             # ── Check if all todos are completed → exit early ──
@@ -1509,7 +1532,7 @@ class AgenticLoop:
                 after_checkpoint = None
                 if has_modified_files:
                     after_checkpoint = await self._git_checkpoint(
-                        f"checkpoint: completed task — {user_task_desc}" if user_task_desc else "checkpoint: after AI task completed"
+                        f"checkpoint: {self._build_completion_summary()}"
                     )
 
                 self.emitter.emit_done(total_steps=round_num + 1)
@@ -1523,6 +1546,7 @@ class AgenticLoop:
                         "shadow_checkpoint_before": shadow_checkpoint or "",
                         "shadow_checkpoint_after": after_checkpoint or "",
                     },
+                    completion_reason="all_todos_done",
                 )
 
         self.emitter.emit(EventType.WARNING, "达到最大工具调用轮数限制")
@@ -1569,4 +1593,5 @@ class AgenticLoop:
             tool_executions=executions,
             total_rounds=self.config.max_tool_rounds,
             total_tokens=total_tokens,
+            completion_reason="max_rounds",
         )
