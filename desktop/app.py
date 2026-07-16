@@ -1486,8 +1486,8 @@ class FileBrowserWidget(QWidget):
         f.setBold(True)
         root_item.setFont(0, f)
         self._tree.addTopLevelItem(root_item)
-        root_item.setExpanded(True)
         self._populate(root_item, path, 0)
+        root_item.setExpanded(True)
 
     def _populate(self, parent_item, dir_path, depth):
         if depth > 4:
