@@ -114,6 +114,8 @@ AGENT_PROFILES = {
             "ask_user",
             "vision",
             "package_info",  # 查包版本/依赖（开发常见需求）
+            # Image generation (ComfyUI)
+            "generate_image",
         },
     },
     "novel": {
@@ -135,9 +137,11 @@ AGENT_PROFILES = {
             "novel_import", "novel_imitate_write",
             "novel_chat", "novel_navigate",
             # Basic file tools (for reading reference)
-            "read_file", "list_dir", "grep", "glob",
+            "read_file", "list_dir", "grep", "glob", "everything_search",
             # Planning + interaction
             "TodoWrite", "ask_user",
+            # Image recognition + generation
+            "vision", "generate_image",
         },
     },
     "research": {
@@ -159,35 +163,8 @@ AGENT_PROFILES = {
             "TodoWrite", "ask_user", "chat_log",
             # Can write findings
             "write_file", "edit_file",
-            # Image recognition
-            "vision",
-        },
-    },
-    "novel": {
-        "description": "小说创作任务",
-        "detect_keywords": [
-            "小说", "写作", "章节", "角色", "大纲", "剧情",
-            "novel", "story", "chapter", "character", "outline",
-            "写小说", "创作", "novel_init", "novel_setup",
-            "伏笔", "人设", "世界观",
-        ],
-        "tools": {
-            # Core novel tools
-            "novel_init", "novel_setup", "novel_outline",
-            "novel_chapter_outlines", "novel_new_arc",
-            "novel_write_chapter", "novel_audit", "novel_revise",
-            "novel_status", "novel_edit", "novel_export",
-            "novel_list_books", "novel_graph_query",
-            "novel_consistency_check", "novel_graph_rebuild",
-            "novel_import", "novel_imitate_write",
-            "novel_chat", "novel_navigate",
-            # Basic file tools (for reading reference)
-            "read_file", "list_dir", "grep", "glob",
-            "everything_search",
-            # Planning + interaction
-            "TodoWrite", "ask_user",
-            # Image recognition
-            "vision",
+            # Image recognition + generation
+            "vision", "generate_image",
         },
     },
 }

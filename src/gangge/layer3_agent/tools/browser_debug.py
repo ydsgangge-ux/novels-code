@@ -4,8 +4,8 @@
 - 打开预览页 → 读取 console 报错 → 截图 → 据此判断页面是否正常
 - 支持点击/填表/滚动等交互，用于 E2E 验证闭环
 
-安全限制（MVP）：
-- 仅允许 localhost / 127.0.0.1 / [::1]，禁止访问外部 URL
+安全限制：
+- 仅允许 localhost / 127.0.0.1 / [::1]（任意端口），禁止访问外部 URL
 - 浏览器实例空闲超时自动回收，避免僵尸进程
 
 依赖：pip install playwright && playwright install chromium
@@ -32,7 +32,7 @@ try:
 except ImportError:
     pass
 
-# ── 安全：仅允许本地地址（MVP 阶段）──
+# ── 安全：仅允许本地地址（任意端口）──
 _ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 # ── 空闲超时（秒）：超过后自动关闭浏览器 ──
@@ -181,7 +181,7 @@ class BrowserDebugTool(BaseTool):
     用途：改完前端代码后，自主打开预览页、读取 console 报错、截图验证，
     完成"改代码 → 验证 → 再改"的闭环，无需人工介入。
 
-    ⚠️ MVP 阶段仅允许访问 localhost / 127.0.0.1。
+    ⚠️ 仅允许访问 localhost / 127.0.0.1（任意端口），禁止外部 URL。
     """
 
     @property
@@ -194,7 +194,7 @@ class BrowserDebugTool(BaseTool):
             "浏览器调试工具 — 打开本地预览页并读取运行时状态（console 日志、截图、DOM），"
             "用于验证前端代码修改后页面是否正常渲染。"
             "支持点击、填表、滚动等交互操作。"
-            "⚠️ 仅限 localhost / 127.0.0.1。"
+            "支持 localhost 任意端口（如 localhost:3000、localhost:5173、localhost:8080 等）。"
             "支持 action: navigate(跳转) / screenshot(截图) / console_logs(读取日志) "
             "/ dom_snapshot(DOM快照) / click(点击) / fill(填表) / scroll(滚动) "
             "/ evaluate(执行JS) / close(关闭浏览器)。"
@@ -213,7 +213,7 @@ class BrowserDebugTool(BaseTool):
                 },
                 "url": {
                     "type": "string",
-                    "description": "[navigate] 要打开的 URL，必须是 localhost",
+                    "description": "[navigate] 要打开的 URL，localhost 任意端口（如 http://localhost:3000）",
                 },
                 "selector": {
                     "type": "string",
@@ -287,7 +287,7 @@ class BrowserDebugTool(BaseTool):
             return ToolResult(output="navigate 需要 url 参数", is_error=True)
         if not _is_localhost(url):
             return ToolResult(
-                output=f"安全限制：MVP 阶段仅允许访问 localhost。被拒绝的 URL: {url}",
+                output=f"安全限制：仅允许访问 localhost（任意端口）。被拒绝的 URL: {url}",
                 is_error=True,
             )
 
