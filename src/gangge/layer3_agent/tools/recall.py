@@ -61,6 +61,10 @@ class RecallConversationTool(BaseTool):
             return path
         return None
 
+    def _get_workspace(self) -> str:
+        """从环境变量获取当前 workspace 路径，用于按项目隔离搜索。"""
+        return os.environ.get("GANGGE_WORKSPACE", "")
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         query = kwargs.get("query", "").strip()
         limit = int(kwargs.get("limit", 5))
@@ -78,7 +82,8 @@ class RecallConversationTool(BaseTool):
         try:
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
-            results = self._search(conn, query, limit)
+            workspace = self._get_workspace()
+            results = self._search(conn, query, limit, workspace)
             conn.close()
         except Exception as e:
             return ToolResult(output=f"搜索失败: {type(e).__name__}: {e}", is_error=True)
@@ -110,8 +115,15 @@ class RecallConversationTool(BaseTool):
         lines.append("提示: 如果需要某条对话的完整细节，可以查看该轮的详细消息。")
         return ToolResult(output="\n".join(lines))
 
-    def _search(self, conn: sqlite3.Connection, query: str, limit: int) -> list[dict]:
-        """执行搜索：FTS5 优先，LIKE 降级。"""
+    def _search(self, conn: sqlite3.Connection, query: str, limit: int, workspace: str = "") -> list[dict]:
+        """执行搜索：FTS5 优先，LIKE 降级。按 workspace 隔离搜索结果。"""
+        # 构建 workspace 过滤条件
+        ws_clause = ""
+        ws_params: list[str] = []
+        if workspace:
+            ws_clause = "AND s.workspace = ?"
+            ws_params = [workspace]
+
         # 检查 FTS5 是否可用
         try:
             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='turns_fts'")
@@ -125,10 +137,11 @@ class RecallConversationTool(BaseTool):
                     "SELECT t.id, t.session_id, t.turn_num, t.user_text, t.summary, "
                     "t.tools_used, t.assistant_text, t.created_at "
                     "FROM turns_fts f JOIN turns t ON t.id = f.rowid "
-                    "WHERE turns_fts MATCH ? "
+                    "JOIN sessions s ON t.session_id = s.id "
+                    "WHERE turns_fts MATCH ? " + ws_clause + " "
                     "ORDER BY t.id DESC LIMIT ?"
                 )
-                rows = conn.execute(sql, (query, limit)).fetchall()
+                rows = conn.execute(sql, [query] + ws_params + [limit]).fetchall()
                 return [dict(r) for r in rows]
             except Exception:
                 pass
@@ -136,9 +149,11 @@ class RecallConversationTool(BaseTool):
         # LIKE 降级
         pattern = f"%{query}%"
         sql = (
-            "SELECT id, session_id, turn_num, user_text, summary, tools_used, assistant_text, created_at "
-            "FROM turns WHERE (user_text LIKE ? OR summary LIKE ? OR assistant_text LIKE ? OR tools_used LIKE ?) "
-            "ORDER BY id DESC LIMIT ?"
+            "SELECT t.id, t.session_id, t.turn_num, t.user_text, t.summary, t.tools_used, t.assistant_text, t.created_at "
+            "FROM turns t JOIN sessions s ON t.session_id = s.id "
+            "WHERE (t.user_text LIKE ? OR t.summary LIKE ? OR t.assistant_text LIKE ? OR t.tools_used LIKE ?) "
+            + ws_clause + " "
+            "ORDER BY t.id DESC LIMIT ?"
         )
-        rows = conn.execute(sql, (pattern, pattern, pattern, pattern, limit)).fetchall()
+        rows = conn.execute(sql, [pattern, pattern, pattern, pattern] + ws_params + [limit]).fetchall()
         return [dict(r) for r in rows]

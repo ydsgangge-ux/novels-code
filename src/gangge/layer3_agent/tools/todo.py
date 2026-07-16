@@ -34,16 +34,10 @@ class TodoState:
     def __init__(self):
         self._todos: list[dict] = []
         # Each todo: {"id": str, "content": str, "status": "pending"|"in_progress"|"completed", "priority": "high"|"medium"|"low"}
-        self._productive_hits: dict[str, int] = {}  # todo_id -> count of productive tool hits
 
     def update(self, todos: list[dict]) -> None:
         """Replace the entire todo list (Claude Code style — no partial updates)."""
         self._todos = todos
-        # Clean up hit counters for completed todos
-        completed_ids = {t["id"] for t in todos if t.get("status") == "completed"}
-        for tid in list(self._productive_hits):
-            if tid in completed_ids:
-                del self._productive_hits[tid]
 
     def get_all(self) -> list[dict]:
         """Return current todo list."""
@@ -66,71 +60,18 @@ class TodoState:
     # Minimum productive tool hits before auto-completing a todo.
     # 1 hit = old behavior (too eager, causes false completions).
     # 2+ hits = requires the model to have done substantial work on this todo.
-    AUTO_COMPLETE_MIN_HITS = 2
-
     def auto_advance(self, tool_name: str, tool_input: dict, success: bool) -> bool:
         """Auto-advance todo state based on tool execution result.
 
-        Accumulation-based logic: a todo must receive at least
-        AUTO_COMPLETE_MIN_HITS productive tool calls before it is
-        auto-completed. This prevents "one write_file → done" false
-        completions.
-
-        Rules:
-        - Each successful productive tool call increments a per-todo counter
-        - Only when counter >= AUTO_COMPLETE_MIN_HITS does the todo auto-complete
-        - When model explicitly sets status=completed via TodoWrite, reset counter
-        - If current todo is completed → auto-start next pending todo
+        禁用自动完成：auto_advance 导致频繁伪完成（模型只做了一两步
+        操作就被系统标记为"完成"，然后所有 todo 都完成 → 自动退出）。
+        现在改为只自动启动下一个 pending todo，不自动标记 completed。
+        模型必须通过 TodoWrite 显式标记 completed。
 
         Returns True if state was changed.
         """
-        if not self._todos:
-            return False
-
-        # Only auto-advance on productive tool calls (not read/explore tools)
-        productive_tools = {
-            "write_file", "edit_file", "bash", "lint_check",
-            "novel_init", "novel_setup", "novel_outline",
-            "novel_chapter_outlines", "novel_write_chapter",
-            "novel_audit", "novel_revise", "novel_new_arc",
-            "novel_export", "novel_import",
-            "create_tool",
-        }
-
-        if tool_name not in productive_tools:
-            return False
-
-        if not success:
-            return False
-
-        changed = False
-        current = self.get_current()
-
-        if current and current.get("status") == "in_progress":
-            tid = current["id"]
-            self._productive_hits[tid] = self._productive_hits.get(tid, 0) + 1
-            hits = self._productive_hits[tid]
-
-            if hits >= self.AUTO_COMPLETE_MIN_HITS:
-                # Enough productive work done — auto-complete
-                for t in self._todos:
-                    if t["id"] == tid:
-                        t["status"] = "completed"
-                        changed = True
-                        logger.info(f"[TodoState] Auto-completed (after {hits} productive hits): {t['content']}")
-                        break
-            else:
-                logger.info(f"[TodoState] Productive hit {hits}/{self.AUTO_COMPLETE_MIN_HITS} for: {current['content']}")
-
-        # Auto-start next pending task
-        if changed:
-            for t in self._todos:
-                if t.get("status") == "pending":
-                    t["status"] = "in_progress"
-                    logger.info(f"[TodoState] Auto-started: {t['content']}")
-                    break
-
-        return changed
+        # 不再自动完成 todo — 模型必须通过 TodoWrite 显式标记
+        return False
 
     def format_for_injection(self) -> str:
         """Format the todo list for injection into the system prompt.

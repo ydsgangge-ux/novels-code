@@ -5436,6 +5436,10 @@ class GanggeDesktop(QMainWindow):
         self._setup_menu()
         self._setup_ui()
         self._load_settings()
+        # 初始 workspace（_ws_input 在 _setup_ui 中创建）
+        initial_ws = self._ws_input.text().strip() if hasattr(self, '_ws_input') else ""
+        if initial_ws:
+            os.environ["GANGGE_WORKSPACE"] = initial_ws
         self._refresh_session_list()
         self._update_provider_fields()
 
@@ -7718,6 +7722,10 @@ class GanggeDesktop(QMainWindow):
     def _on_workspace_changed(self):
         """Clear conversation history when the workspace changes."""
         self._conversation_history = []
+        # 设置 GANGGE_WORKSPACE 环境变量，让 recall_conversation 按项目隔离搜索
+        workspace = self._ws_input.text().strip()
+        if workspace:
+            os.environ["GANGGE_WORKSPACE"] = workspace
 
     def _execute_single(self, llm: BaseLLM, task: str, batch_index: int = 0, batch_total: int = 1):
         workspace = self._ws_input.text().strip()
