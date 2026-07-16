@@ -380,6 +380,7 @@ class SessionDB:
                 db_path = str(home_dir / "sessions.db")
         self._db_path = db_path
         self._conn: sqlite3.Connection | None = None
+        self._fts5_enabled = False
 
     def connect(self):
         try:
@@ -455,7 +456,28 @@ class SessionDB:
                 diff TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                turn_num INTEGER DEFAULT 0,
+                user_text TEXT DEFAULT '',
+                summary TEXT DEFAULT '',
+                tools_used TEXT DEFAULT '',
+                assistant_text TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            );
         """)
+        # FTS5 全文搜索（try-except：某些 SQLite 构建可能不支持 FTS5）
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5("
+                "user_text, summary, tools_used, assistant_text, content='turns', content_rowid='id'"
+                ")"
+            )
+            self._fts5_enabled = True
+        except Exception as e:
+            logging.getLogger("gangge").warning("FTS5 不可用，降级到 LIKE 查询: %s", e)
+            self._fts5_enabled = False
         self._conn.commit()
         # 如果已有旧库，补全新字段
         self._migrate_if_needed()
@@ -643,8 +665,130 @@ class SessionDB:
     def delete_session(self, sid: str):
         self._conn.execute("DELETE FROM tool_calls WHERE session_id=?", (sid,))
         self._conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
+        self._conn.execute("DELETE FROM turns WHERE session_id=?", (sid,))
+        if self._fts5_enabled:
+            self._conn.execute("DELETE FROM turns_fts WHERE rowid IN (SELECT id FROM turns WHERE session_id=?)", (sid,))
         self._conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
         self._conn.commit()
+
+    # ── Turn 摘要存储与搜索 ──────────────────────────────────────
+
+    def save_turn_summary(self, sid: str, msgs: list[dict]):
+        """从聚合消息中提取摘要，存入 turns 表 + FTS5 索引。
+
+        msgs 格式来自 _aggregate_turn_messages：
+          [{"role":"user","content":"..."},
+           {"role":"assistant","content":[...]},
+           {"role":"tool",...}]
+        """
+        user_text = ""
+        assistant_text = ""
+        tools_used: list[dict] = []
+
+        for msg in msgs:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                if isinstance(content, str):
+                    user_text = content
+                elif isinstance(content, list):
+                    texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    user_text = " ".join(texts)
+            elif role == "assistant":
+                if isinstance(content, str):
+                    assistant_text = content
+                elif isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text" and b.get("text"):
+                            assistant_text += b["text"]
+                        elif b.get("type") == "tool_use":
+                            inp = b.get("input", {})
+                            inp_str = json.dumps(inp, ensure_ascii=False)[:200] if inp else ""
+                            tools_used.append({"name": b.get("name", ""), "input": inp_str})
+
+        summary = assistant_text[:300] + ("..." if len(assistant_text) > 300 else "")
+        tools_json = json.dumps(tools_used, ensure_ascii=False)
+
+        now = datetime.now().isoformat()
+        row = self._conn.execute("SELECT COUNT(*) FROM turns WHERE session_id=?", (sid,)).fetchone()
+        turn_num = (row[0] if row else 0) + 1
+
+        cursor = self._conn.execute(
+            "INSERT INTO turns (session_id, turn_num, user_text, summary, tools_used, assistant_text, created_at) VALUES (?,?,?,?,?,?,?)",
+            (sid, turn_num, user_text, summary, tools_json, assistant_text, now),
+        )
+        rowid = cursor.lastrowid
+        if self._fts5_enabled:
+            self._conn.execute(
+                "INSERT INTO turns_fts (rowid, user_text, summary, tools_used, assistant_text) VALUES (?,?,?,?,?)",
+                (rowid, user_text, summary, tools_json, assistant_text),
+            )
+        self._conn.commit()
+
+    def search_turns(self, query: str, sid: str = "", limit: int = 10) -> list[dict]:
+        """搜索历史对话轮次（FTS5 优先，降级 LIKE）。"""
+        if not query.strip():
+            return []
+        if self._fts5_enabled:
+            # FTS5 搜索
+            try:
+                sql = (
+                    "SELECT t.id, t.session_id, t.turn_num, t.user_text, t.summary, "
+                    "t.tools_used, t.assistant_text, t.created_at "
+                    "FROM turns_fts f JOIN turns t ON t.id = f.rowid "
+                    "WHERE turns_fts MATCH ? "
+                )
+                params: list = [query]
+                if sid:
+                    sql += " AND t.session_id = ?"
+                    params.append(sid)
+                sql += " ORDER BY t.id DESC LIMIT ?"
+                params.append(limit)
+                rows = self._conn.execute(sql, params).fetchall()
+            except Exception:
+                rows = self._like_search(query, sid, limit)
+        else:
+            rows = self._like_search(query, sid, limit)
+        return [dict(r) for r in rows]
+
+    def _like_search(self, query: str, sid: str, limit: int) -> list:
+        """LIKE 降级搜索。"""
+        pattern = f"%{query}%"
+        sql = (
+            "SELECT id, session_id, turn_num, user_text, summary, tools_used, assistant_text, created_at "
+            "FROM turns WHERE (user_text LIKE ? OR summary LIKE ? OR assistant_text LIKE ? OR tools_used LIKE ?) "
+        )
+        params = [pattern, pattern, pattern, pattern]
+        if sid:
+            sql += " AND session_id = ?"
+            params.append(sid)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return self._conn.execute(sql, params).fetchall()
+
+    def load_turn_summaries(self, sid: str, exclude_recent: int = 0) -> list[dict]:
+        """加载会话的 turn 摘要（用于注入历史上下文）。
+
+        exclude_recent: 排除最近 N 条（这些会用完整消息恢复）。
+        """
+        sql = "SELECT turn_num, user_text, summary, tools_used, created_at FROM turns WHERE session_id = ?"
+        params: list = [sid]
+        if exclude_recent > 0:
+            # 取总数，排除最近 exclude_recent 条
+            count_row = self._conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE session_id=?", (sid,)
+            ).fetchone()
+            total = count_row[0] if count_row else 0
+            if total <= exclude_recent:
+                return []
+            sql += " ORDER BY id ASC LIMIT ?"
+            params.append(total - exclude_recent)
+        else:
+            sql += " ORDER BY id ASC"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
 
     def increment_task_count(self, sid: str):
         self._conn.execute("UPDATE sessions SET task_count=task_count+1, updated_at=? WHERE id=?",
@@ -5285,6 +5429,8 @@ class GanggeDesktop(QMainWindow):
         # Session DB
         self._db = SessionDB()
         self._db.connect()
+        # 设置环境变量让 recall_conversation 工具能访问 DB
+        os.environ["GANGGE_SESSION_DB"] = self._db._db_path
 
         self._setup_menu()
         self._setup_ui()
@@ -6280,6 +6426,9 @@ class GanggeDesktop(QMainWindow):
         for c in calls:
             self._tool_panel.add_entry(c["tool_name"], c["output"][:200], c["is_error"], c["diff"])
 
+        # ── 恢复 _conversation_history（修跨会话失忆 bug） ──
+        self._restore_conversation_history(sid, turn_msgs)
+
         # Restore session workspace if set
         sess = self._db.get_session(sid)
         if sess and sess["workspace"]:
@@ -6290,6 +6439,103 @@ class GanggeDesktop(QMainWindow):
                 self._refresh_session_list()  # 工作目录变了 → 刷新会话列表
 
         self._status_label.setText(_t("status_session", title=sess['title'] if sess else sid))
+
+    def _restore_conversation_history(self, sid: str, turn_msgs: list[dict]):
+        """从 DB 恢复对话历史，解决跨会话失忆问题。
+
+        策略：
+          1. 最近的消息用完整 Message 对象恢复（含工具调用细节）
+          2. 更早的 turn 摘要注入为一条 user 消息，让 Agent 知道之前做过什么
+          3. 限制总消息数，避免撑爆上下文
+        """
+        if not turn_msgs:
+            self._conversation_history = []
+            return
+
+        # 把 dict 转成 Message 对象（最近 MAX_LOAD_MESSAGES 条）
+        messages: list[Message] = []
+        for rm in turn_msgs:
+            role_str = rm.get("role", "user")
+            try:
+                role = Role(role_str)
+            except ValueError:
+                continue
+            content = rm.get("content", "")
+            if isinstance(content, str):
+                messages.append(Message(role=role, content=[ContentBlock(type=ContentType.TEXT, text=content)]))
+            elif isinstance(content, list):
+                blocks: list[ContentBlock] = []
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type", "text")
+                    if bt == "text" and b.get("text"):
+                        blocks.append(ContentBlock(type=ContentType.TEXT, text=b["text"]))
+                    elif bt == "tool_use":
+                        blocks.append(ContentBlock(
+                            type=ContentType.TOOL_USE,
+                            tool_name=b.get("name", ""),
+                            tool_call_id=b.get("id", ""),
+                            tool_input=b.get("input", {}),
+                        ))
+                    elif bt == "tool_result":
+                        blocks.append(ContentBlock(
+                            type=ContentType.TOOL_RESULT,
+                            tool_call_id=b.get("tool_use_id", ""),
+                            text=b.get("content", ""),
+                            is_error=bool(b.get("is_error", False)),
+                        ))
+                if blocks:
+                    messages.append(Message(role=role, content=blocks))
+            elif role_str == "tool":
+                # tool 角色：content 是字符串
+                messages.append(Message(role=Role.TOOL, content=[
+                    ContentBlock(
+                        type=ContentType.TOOL_RESULT,
+                        tool_call_id=rm.get("tool_use_id", ""),
+                        text=str(content),
+                        is_error=bool(rm.get("is_error", False)),
+                    )
+                ]))
+
+        # 加载更早的 turn 摘要（排除最近已恢复的部分）
+        # 估算已恢复的 turn 数：每轮约 3 条消息（user + assistant + tool）
+        recent_turn_count = max(1, len(turn_msgs) // 3)
+        earlier_summaries = []
+        try:
+            earlier_summaries = self._db.load_turn_summaries(sid, exclude_recent=recent_turn_count)
+        except Exception as e:
+            logging.getLogger("gangge").warning("加载 turn 摘要失败: %s", e)
+
+        if earlier_summaries:
+            summary_lines = ["[对话历史摘要 — 以下是之前几轮对话的概况]\n"]
+            for ts in earlier_summaries:
+                turn_num = ts.get("turn_num", "?")
+                user_msg = (ts.get("user_text", "") or "")[:100]
+                asst_summary = (ts.get("summary", "") or "")[:150]
+                tools_json = ts.get("tools_used", "[]")
+                try:
+                    tools_list = json.loads(tools_json) if tools_json else []
+                    tool_names = [t.get("name", "?") for t in tools_list]
+                    tools_str = ", ".join(tool_names) if tool_names else "无"
+                except Exception:
+                    tools_str = "无"
+                summary_lines.append(f"第{turn_num}轮 | 用户: {user_msg}")
+                summary_lines.append(f"        | 工具: {tools_str}")
+                summary_lines.append(f"        | 结果: {asst_summary}")
+                summary_lines.append("")
+
+            history_summary_msg = Message(
+                role=Role.USER,
+                content=[ContentBlock(
+                    type=ContentType.TEXT,
+                    text="\n".join(summary_lines),
+                )],
+            )
+            # 在最前面插入摘要
+            messages.insert(0, history_summary_msg)
+
+        self._conversation_history = messages
 
     def _delete_session(self):
         item = self._session_list.currentItem()
@@ -7602,12 +7848,18 @@ class GanggeDesktop(QMainWindow):
             self._on_finished({}, None)
 
     def _on_turn_complete(self, msgs: list):
-        """Store raw conversation history for multi-turn context."""
+        """Store raw conversation history for multi-turn context + save turn summary."""
         # Get raw Message objects from the Worker (not aggregated dicts)
         if hasattr(self, "_worker") and self._worker is not None:
             raw = getattr(self._worker, "_conversation_messages", [])
             if raw:
                 self._conversation_history = raw
+        # 存 turn 摘要到 DB（用于历史搜索 + 跨会话恢复）
+        if msgs and self._current_session_id:
+            try:
+                self._db.save_turn_summary(self._current_session_id, msgs)
+            except Exception as e:
+                logging.getLogger("gangge").warning("保存 turn 摘要失败: %s", e)
 
     def _update_elapsed(self):
         if hasattr(self, "_start_time"):

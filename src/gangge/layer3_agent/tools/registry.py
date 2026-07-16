@@ -44,6 +44,7 @@ TOOL_PHASES: dict[str, int] = {
     "find_references": PHASE_EXPLORE,
     "TodoWrite":      PHASE_EXPLORE,
     "chat_log":       PHASE_EXPLORE,  # 纯聊天记录 — 不需要其他工具时的出口
+    "recall_conversation": PHASE_EXPLORE,  # 搜索历史对话 — 跨会话记忆
     # Phase 2: Write
     "write_file":     PHASE_WRITE,
     "edit_file":      PHASE_WRITE,
@@ -104,7 +105,7 @@ AGENT_PROFILES = {
             # Phase 1: Explore
             "list_dir", "read_file", "grep", "glob",
             "everything_search",
-            "find_symbol", "find_references", "TodoWrite", "chat_log",
+            "find_symbol", "find_references", "TodoWrite", "chat_log", "recall_conversation",
             # Phase 2: Write
             "write_file", "edit_file", "create_tool",
             # Phase 3: Run
@@ -382,6 +383,14 @@ def create_tool_registry(
     from gangge.layer3_agent.tools.chat_log import ChatLogTool
     registry.register(ChatLogTool())
     logger.info("[Registry] Chat log tool activated — 纯聊天/Q&A 出口")
+
+    # ── RecallConversation: 搜索历史对话 ──
+    try:
+        from gangge.layer3_agent.tools.recall import RecallConversationTool
+        registry.register(RecallConversationTool())
+        logger.info("[Registry] Recall conversation tool activated — 历史对话搜索")
+    except Exception as e:
+        logger.debug("[Registry] Recall tool skipped: %s", e)
 
     try:
         from gangge.layer3_agent.tools.browser import BrowserTool, _BROWSER_AVAILABLE
