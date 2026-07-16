@@ -5291,11 +5291,12 @@ class ExperimentalPanel(QWidget):
                     f"{'&nbsp;'*filled}</span>"
                     f"<span style='background:{bar_color};color:transparent;'>"
                     f"{'&nbsp;'*(bar_w-filled)}</span>")
-        # Static system prompt preview
+        # Static system prompt full view
         if self._static_system:
-            preview = self._static_system[:800].replace("<", "&lt;").replace(">", "&gt;")
-            html.append(f"<br><br><b style='color:#58a6ff;'>静态 system prompt 预览 (前 800 字符):</b><br>")
-            html.append(f"<pre style='color:#8b949e;font-size:10px;white-space:pre-wrap;'>{preview}</pre>")
+            full = self._static_system.replace("<", "&lt;").replace(">", "&gt;")
+            char_count = len(self._static_system)
+            html.append(f"<br><br><b style='color:#58a6ff;'>静态 system prompt 完整内容 ({char_count:,} 字符):</b><br>")
+            html.append(f"<pre style='color:#8b949e;font-size:10px;white-space:pre-wrap;'>{full}</pre>")
         self._prompt_text.setHtml("".join(html))
 
     def _refresh_compress_view(self):
