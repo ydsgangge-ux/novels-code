@@ -161,6 +161,15 @@ def create_llm(provider: str | None = None) -> BaseLLM:
             max_tokens=max_tokens, temperature=temperature,
         )
 
+    elif provider == "mimo":
+        api_key = _env("MIMO_API_KEY", "")
+        base_url = _env("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
+        model = _env("MIMO_MODEL", "mimo-v2.5-pro")
+        return OpenAICompatLLM(
+            base_url=base_url, api_key=api_key, model=model,
+            max_tokens=max_tokens, temperature=temperature,
+        )
+
     elif provider == "custom":
         api_key = _env("CUSTOM_API_KEY", "not-needed")
         base_url = _env("CUSTOM_BASE_URL", "")
@@ -176,5 +185,5 @@ def create_llm(provider: str | None = None) -> BaseLLM:
         raise ValueError(
             f"Unknown LLM provider: {provider}. "
             f"Supported: anthropic, openai, deepseek, qwen, zhipu, moonshot, "
-            f"baichuan, yi, minimax, stepfun, siliconflow, ollama, custom"
+            f"baichuan, yi, minimax, stepfun, siliconflow, mimo, ollama, custom"
         )

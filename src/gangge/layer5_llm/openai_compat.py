@@ -295,11 +295,8 @@ class OpenAICompatLLM(BaseLLM):
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
-
             if delta.content:
                 yield ContentBlock(type=ContentType.TEXT, text=delta.content)
-
-            # ── Reasoning/thinking content (DeepSeek-R1, etc.) ──
             reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning:
                 yield ContentBlock(type=ContentType.THINKING, text=reasoning)

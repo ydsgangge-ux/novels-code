@@ -96,6 +96,7 @@ AGENT_PROFILES = {
         "description": "通用编程任务",
         "detect_keywords": [
             "创建", "写", "修改", "实现", "开发", "构建", "部署",
+            "网页", "页面", "html",
             "create", "build", "fix", "implement", "refactor",
             "bug", "错误", "修复", "测试", "test",
             "api", "项目", "project", "app", "应用",
@@ -173,27 +174,20 @@ AGENT_PROFILES = {
 def detect_agent_profile(user_message: str) -> str:
     """Detect which agent profile to use based on the user's message.
 
-    Returns the profile name. Falls back to "coding" if no match.
-
-    Priority: novel > research > coding
-    Novel keywords are strong signals — if any match, use novel profile.
+    Returns the profile with the highest keyword hit count. On ties the
+    higher-priority profile wins: novel > research > coding.
+    Falls back to "coding" when nothing matches.
     """
     msg_lower = user_message.lower()
-
-    # Novel keywords are strong signals — check first with priority
-    novel_keywords = AGENT_PROFILES["novel"]["detect_keywords"]
-    novel_score = sum(1 for kw in novel_keywords if kw in msg_lower)
-    if novel_score >= 1:
-        return "novel"
-
-    # Research keywords
-    research_keywords = AGENT_PROFILES["research"]["detect_keywords"]
-    research_score = sum(1 for kw in research_keywords if kw in msg_lower)
-    if research_score >= 1:
-        return "research"
-
-    # Default to coding
-    return "coding"
+    profiles = ("novel", "research", "coding")
+    best = "coding"
+    best_score = -1
+    for p in profiles:
+        score = sum(1 for kw in AGENT_PROFILES[p]["detect_keywords"] if kw in msg_lower)
+        if score > best_score:  # `>` keeps the earlier (higher-priority) profile on ties
+            best_score = score
+            best = p
+    return best
 
 
 class ToolRegistry:
@@ -203,6 +197,13 @@ class ToolRegistry:
         self._tools: dict[str, BaseTool] = {}
         self._current_phase: int = PHASE_EXPLORE
         self._active_profile: str = "coding"  # default profile
+        # AI-created plugin tools may live outside any profile's tool set;
+        # track them so they are still surfaced to the model after creation.
+        self._plugin_names: set[str] = set()
+
+    def mark_plugin(self, name: str) -> None:
+        """Mark a tool as an AI-created plugin so it bypasses the profile filter."""
+        self._plugin_names.add(name)
 
     def register(self, tool: BaseTool) -> None:
         """Register a tool."""
@@ -234,8 +235,14 @@ class ToolRegistry:
 
         filtered = []
         for tool in self._tools.values():
-            # Profile filter: only include tools in the active profile
-            if profile_tools is not None and tool.name not in profile_tools:
+            # Profile filter: only include tools in the active profile.
+            # AI-created plugins are exempt — they were created for a reason
+            # and must be reachable even though they're not in any profile.
+            if (
+                profile_tools is not None
+                and tool.name not in profile_tools
+                and tool.name not in self._plugin_names
+            ):
                 continue
 
             # Phase filter

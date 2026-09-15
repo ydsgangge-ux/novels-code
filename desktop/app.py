@@ -144,7 +144,7 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
     "zhipu": {
         "label": _t("zhipu_label"),
         "api_key_env": "ZHIPU_API_KEY",
-        "model_default": "glm-5-1",
+        "model_default": "glm-4-7-flash",
         "models": [
             "glm-5-1", "glm-5", "glm-5-turbo",
             "glm-4-7", "glm-4-7-flash",
@@ -233,6 +233,17 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
         ],
         "base_url_editable": True,
         "base_url_default": "https://api.siliconflow.cn/v1",
+    },
+    "mimo": {
+        "label": "小米 MiMo",
+        "api_key_env": "MIMO_API_KEY",
+        "model_default": "mimo-v2.5-pro",
+        "models": [
+            "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2.5-omni",
+            "mimo-v2-flash", "mimo-7b-instruct",
+        ],
+        "base_url_editable": True,
+        "base_url_default": "https://api.xiaomimimo.com/v1",
     },
     "openai": {
         "label": "OpenAI",
@@ -324,7 +335,11 @@ QLineEdit,QSpinBox,QPlainTextEdit,QTextEdit,QTextBrowser,QComboBox{background-co
 QLineEdit:focus,QComboBox:focus,QPlainTextEdit:focus{border-color:#58a6ff}
 QComboBox::drop-down{border:none;width:24px}
 QComboBox::down-arrow{image:none;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid #8b949e;margin-right:6px}
-QComboBox QAbstractItemView{background-color:#161b22;color:#c9d1d9;border:1px solid #30363d;selection-background-color:#1f6feb}
+QComboBox QAbstractItemView{background-color:#161b22;color:#c9d1d9;border:1px solid #30363d;selection-background-color:#1f6feb;selection-color:#ffffff;outline:0}
+QComboBox QListView{background-color:#161b22;color:#c9d1d9;outline:0}
+QComboBox QAbstractItemView::item{background-color:#161b22;color:#c9d1d9;padding:4px 8px}
+QComboBox QAbstractItemView::item:selected{background-color:#1f6feb;color:#fff}
+QComboBox QAbstractItemView::item:hover{background-color:#1f6feb;color:#fff}
 QTabWidget::pane{border:1px solid #30363d;border-radius:6px;background:#0d1117}
 QTabBar::tab{background:#161b22;color:#8b949e;border:1px solid #30363d;border-bottom:none;border-top-left-radius:6px;border-top-right-radius:6px;padding:8px 18px;margin-right:2px;font-size:12px}
 QTabBar::tab:selected{background:#0d1117;color:#f0f6fc;border-bottom:2px solid #f78166}
@@ -1452,6 +1467,24 @@ class FileBrowserWidget(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        # 顶部：标题 + 手动刷新按钮
+        header = QHBoxLayout()
+        title = QLabel("项目文件")
+        title.setStyleSheet("color:#8b949e;font-size:12px;font-weight:600;")
+        self._btn_refresh = QPushButton("🔄 刷新")
+        self._btn_refresh.setFixedSize(64, 24)
+        self._btn_refresh.setStyleSheet(
+            "QPushButton{background:#21262d;color:#c9d1d9;border:1px solid #30363d;"
+            "border-radius:4px;font-size:12px;}"
+            "QPushButton:hover{background:#30363d;}"
+        )
+        self._btn_refresh.clicked.connect(self.refresh)
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self._btn_refresh)
+        layout.addLayout(header)
+
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
         self._tree.setAnimated(True)
@@ -1468,6 +1501,11 @@ class FileBrowserWidget(QWidget):
         )
         layout.addWidget(self._tree)
         self._root_path = ""
+
+    def refresh(self):
+        """重新加载当前根目录，使磁盘上新出现的文件立即可见。"""
+        if self._root_path and os.path.isdir(self._root_path):
+            self.set_root(self._root_path)
 
     def _get_icon(self, entry: Path) -> str:
         if entry.is_dir():
@@ -5974,9 +6012,10 @@ class GanggeDesktop(QMainWindow):
             QComboBox{background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:4px 8px;}
             QComboBox::drop-down{border:none;width:24px;}
             QComboBox::down-arrow{image:none;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid #8b949e;}
-            QComboBox QAbstractItemView{background:#161b22;color:#c9d1d9;border:1px solid #30363d;outline:none;padding:2px;}
-            QComboBox QAbstractItemView::item{padding:4px 8px;}
-            QComboBox QAbstractItemView::item:selected{background:#1f6feb;color:#fff;}
+            QComboBox QAbstractItemView{background-color:#161b22;color:#c9d1d9;border:1px solid #30363d;outline:none;padding:2px;}
+            QComboBox QListView{background-color:#161b22;color:#c9d1d9;outline:none;}
+            QComboBox QAbstractItemView::item{padding:4px 8px;background-color:#161b22;color:#c9d1d9;}
+            QComboBox QAbstractItemView::item:selected{background-color:#1f6feb;color:#fff;}
         """)
 
         layout = QVBoxLayout(dlg)
@@ -6071,20 +6110,27 @@ class GanggeDesktop(QMainWindow):
             _mm_model.addItem(m)
         _mm_model.setCurrentText(self._mm_model_combo.currentText())
         mm_lay.addRow("模型", _mm_model)
-        # Auto-update model list when provider changes
-        def _update_mm_combo(prov, model_combo):
-            model_combo.clear()
-            pk = prov.currentData()
-            for m in self._MM_MODEL_PRESETS.get(pk, []):
-                model_combo.addItem(m)
-        _mm_provider.currentIndexChanged.connect(
-            lambda: _update_mm_combo(_mm_provider, _mm_model)
-        )
 
         _mm_base_url = QLineEdit()
         _mm_base_url.setPlaceholderText("Base URL（可选，默认使用 Provider 地址）")
         _mm_base_url.setText(self._mm_base_url_input.text())
         mm_lay.addRow("Base URL", _mm_base_url)
+        # 切换 Provider 时，联动更新模型列表与 Base URL
+        def _apply_mm_provider(prov, model_combo, url_edit):
+            pk = prov.currentData()
+            cfg = PROVIDER_CONFIGS.get(pk, {})
+            model_combo.clear()
+            for m in self._MM_MODEL_PRESETS.get(pk, []):
+                model_combo.addItem(m)
+            url_edit.setText(cfg.get("base_url_default", ""))
+        _mm_provider.currentIndexChanged.connect(
+            lambda: _apply_mm_provider(_mm_provider, _mm_model, _mm_base_url)
+        )
+        # 打开设置时，若未手动保存过 Base URL，则填上当前 Provider 的默认地址
+        if not self._mm_base_url_input.text().strip():
+            _mm_base_url.setText(
+                PROVIDER_CONFIGS.get(_mm_provider.currentData(), {}).get("base_url_default", "")
+            )
 
         _mm_show_key = QCheckBox(_t("settings_show_key"))
         _mm_show_key.toggled.connect(
@@ -7427,6 +7473,7 @@ class GanggeDesktop(QMainWindow):
         "anthropic": ["claude-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229"],
         "deepseek": ["deepseek-v4-pro", "deepseek-chat", "deepseek-vl2", "deepseek-vl2-small"],
         "siliconflow": ["deepseek-ai/DeepSeek-V4-Pro", "Qwen/Qwen2-VL-72B-Instruct", "Qwen/Qwen-VL-Plus", "OpenGVLab/InternVL2-8B"],
+        "mimo": ["mimo-v2.5-omni", "mimo-v2.5", "mimo-v2-flash", "mimo-7b-instruct"],
         "ollama": ["llava", "llava:13b", "bakllava"],
         "custom": [],
     }
@@ -7502,11 +7549,11 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 请输入 Anthropic API Key")
                 return None
             from gangge.layer5_llm.anthropic import AnthropicLLM
-            return AnthropicLLM(api_key=api_key, model=model, max_tokens=8192, temperature=temperature)
+            return AnthropicLLM(api_key=api_key, model=model, max_tokens=int(os.environ.get("MAX_TOKENS", "16384")), temperature=temperature)
         elif provider_key == "ollama":
             url = self._base_url_input.text().strip() or "http://localhost:11434/v1"
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=url, api_key="ollama", model=model, max_tokens=8192, temperature=temperature)
+            return OpenAICompatLLM(base_url=url, api_key="ollama", model=model, max_tokens=int(os.environ.get("MAX_TOKENS", "16384")), temperature=temperature)
         elif provider_key == "custom":
             base_url = self._base_url_input.text().strip()
             if not base_url:
@@ -7516,7 +7563,7 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 自定义模式需要填写模型名称")
                 return None
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=8192, temperature=temperature)
+            return OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=int(os.environ.get("MAX_TOKENS", "16384")), temperature=temperature)
         else:
             api_key_env = cfg.get("api_key_env", "")
             if not api_key and api_key_env:
@@ -7530,7 +7577,7 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 请填写 Base URL")
                 return None
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=base_url, api_key=api_key, model=model, max_tokens=8192, temperature=temperature)
+            return OpenAICompatLLM(base_url=base_url, api_key=api_key, model=model, max_tokens=int(os.environ.get("MAX_TOKENS", "16384")), temperature=temperature)
 
     def _build_multimodal_llm(self) -> BaseLLM | None:
         """Build a separate multimodal LLM for image recognition tasks."""
@@ -8043,6 +8090,11 @@ class GanggeDesktop(QMainWindow):
                         except Exception as e:
                             logging.getLogger("gangge").warning("面板刷新失败: %s - %s", fn.__name__, e)
                 QTimer.singleShot(0, _safe_refresh)
+
+        # ── 写文件 / 创建工具成功后，自动刷新项目文件树 ──
+        if not is_error and tool_name in ("write_file", "edit_file", "create_tool"):
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._file_browser.refresh)
 
     def _on_thinking_link(self, url):
         """Handle click on a thinking bubble's 'expand' link."""

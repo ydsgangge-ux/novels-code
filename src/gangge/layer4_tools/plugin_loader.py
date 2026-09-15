@@ -45,6 +45,7 @@ def load_plugins(workspace: str, registry: ToolRegistry) -> list[str]:
 
             instance = tool_class(workspace=workspace)
             registry.register(instance)
+            registry.mark_plugin(tool_name)
             loaded.append(tool_name)
             logger.info("[Plugin] loaded: %s", tool_name)
 

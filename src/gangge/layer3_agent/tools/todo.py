@@ -107,6 +107,16 @@ class TodoState:
         """Clear all todos."""
         self._todos = []
 
+    def mark_all_done(self) -> None:
+        """Mark every remaining non-completed todo as completed.
+
+        Used by the loop when a task stalls on self-imposed todos that can't
+        progress, but the core deliverable has already been produced.
+        """
+        for t in self._todos:
+            if t.get("status") != "completed":
+                t["status"] = "completed"
+
 
 # Module-level singleton — the loop and tool share this instance
 _global_state = TodoState()

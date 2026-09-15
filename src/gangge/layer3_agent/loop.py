@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -93,7 +94,7 @@ class LoopConfig:
     """Configuration for the agentic loop."""
 
     max_tool_rounds: int = 30        # Max tool-call iterations (可在 .env 中通过 MAX_ROUNDS 覆盖)
-    llm_timeout: float = 300.0       # LLM response timeout in seconds (本地模型可能较慢)
+    llm_timeout: float = float(os.environ.get("LLM_TIMEOUT", "600"))  # LLM response timeout in seconds (本地模型/思考型模型可能较慢，可通过 LLM_TIMEOUT 覆盖)
     max_tokens: int = 8192
     system_prompt: str = ""
     workspace_dir: str = "."
@@ -909,6 +910,7 @@ class AgenticLoop:
         any_tool_succeeded = False
         consecutive_timeouts = 0
         consecutive_readonly_rounds = 0  # Track rounds with only read tools
+        stalled_rounds = 0  # Consecutive rounds without productive output
         file_registry = dict(self.config.file_registry)  # mutable copy
         reads_cache: dict[str, int] = {}  # path -> round_number for de-dup
         memory_bank_update = ""  # extracted from LLM's final response
@@ -983,6 +985,30 @@ class AgenticLoop:
             self.config.file_registry = file_registry
             system = static_system
             self.emitter.emit(EventType.THINKING, f"正在思考...")
+
+            # ── 已建 todo 或 工作目录为空 → 解锁编写阶段 ──
+            # 两种稳定判据都说明应当允许写文件：
+            #  1) 模型已用 TodoWrite 建立了计划（先规划再写）；
+            #  2) 目录为空 + 明确要产出文件（单文件小任务常用的不用建 todo，
+            #     但必须一上来就能写文件，否则会卡在探索阶段空转）。
+            from gangge.layer3_agent.tools.registry import PHASE_WRITE
+            if self.tools.get_current_phase() < PHASE_WRITE and (
+                todo_state.get_all() or is_empty_dir
+            ):
+                self.tools.set_phase(PHASE_WRITE)
+
+            # ── 待办里出现“运行/测试/验证”意图 → 解锁运行阶段，把 bash 放出来 ──
+            # 写完代码后要跑测试是正常流程；一旦计划里有运行意图，就别让小模型
+            # 因为看不到 bash 而去瞎造运行工具。扫描待办标题里的关键词触发。
+            run_hint_words = ("运行", "测试", "pytest", "验证", "启动", "执行", "编译", "run", "test", "bash")
+            _todos_text = " ".join(
+                (t.get("content") or "") for t in todo_state.get_all()
+            ).lower()
+            if _todos_text and any(w in _todos_text for w in run_hint_words):
+                from gangge.layer3_agent.tools.registry import PHASE_RUN
+                if self.tools.get_current_phase() < PHASE_RUN:
+                    self.tools.set_phase(PHASE_RUN)
+                    logger.info("[Loop] 待办含运行/测试意图 → 解锁运行阶段(3)")
 
             # ── Refresh tool definitions based on current phase ──
             current_phase = self.tools.get_current_phase()
@@ -1270,6 +1296,8 @@ class AgenticLoop:
                 text=f"🔧 AI 调用了 {len(response.tool_calls)} 个工具:\n",
             ))
 
+            this_round_productive = False  # reset per-round; set True on write/edit/bash success
+
             for tool_call in response.tool_calls:
                 tool_name = tool_call.name
                 tool_input = tool_call.input
@@ -1374,6 +1402,9 @@ class AgenticLoop:
                 if not result.is_error:
                     any_tool_succeeded = True
                     consecutive_timeouts = 0
+                    # Productive output = a file was written/edited or a command ran
+                    if tool_name in ("write_file", "edit_file", "bash", "novel_write_chapter"):
+                        this_round_productive = True
 
                     # ── Runtime auto-advance Todo state ──
                     # The system manages todo progress, not the model.
@@ -1512,6 +1543,47 @@ class AgenticLoop:
                         },
                         completion_reason="consecutive_readonly",
                     )
+
+            # ── Stall guard: core deliverable done but no progress for several rounds ──
+            # Prevents the AI from spinning forever on self-imposed todos it can't
+            # fulfil (e.g. "run tests" when bash isn't available / a plugin won't load).
+            # If we've already produced files and nothing productive happened for
+            # STALL_LIMIT rounds, mark the remaining todos done and wrap up.
+            if this_round_productive:
+                stalled_rounds = 0
+            else:
+                stalled_rounds += 1
+                if stalled_rounds >= 4 and has_modified_files:
+                    todo_state = get_todo_state()
+                    if todo_state.get_pending():
+                        todo_state.mark_all_done()
+                        await self._emit(ContentBlock(
+                            type=ContentType.TEXT,
+                            text="📋 核心产出已生成，但后续待办持续数轮无进展，已自动收尾\n",
+                        ))
+                        final_text = "核心产出已生成；剩余待办因当前环境无法继续推进，已自动收尾。"
+                        mb_extracted = ""
+                        after_checkpoint = None
+                        if has_modified_files:
+                            after_checkpoint = await self._git_checkpoint(
+                                f"checkpoint: {self._build_completion_summary()}"
+                            )
+                        self.emitter.emit_done(total_steps=round_num + 1)
+                        return LoopResult(
+                            final_response=final_text,
+                            tool_executions=executions,
+                            total_rounds=round_num + 1,
+                            total_tokens=total_tokens,
+                            extra={
+                                "memory_bank_update": mb_extracted,
+                                "shadow_checkpoint_before": shadow_checkpoint or "",
+                                "shadow_checkpoint_after": after_checkpoint or "",
+                            },
+                            completion_reason="stalled_no_progress",
+                        )
+                    else:
+                        # No pending todos but no progress — let normal flow handle it
+                        stalled_rounds = 0
 
             # ── Check if all todos are completed → exit early ──
             # This is the key fix: even if the model keeps calling tools

@@ -144,6 +144,8 @@ class CreateToolTool(BaseTool):
             )
 
         self._registry.register(instance_or_err)
+        if hasattr(self._registry, "mark_plugin"):
+            self._registry.mark_plugin(tool_name)
         self._update_meta(tool_name, description, reason)
 
         logger.info("[create_tool] created and registered: %s", tool_name)
