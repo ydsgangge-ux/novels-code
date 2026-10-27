@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from rich.text import Text
@@ -19,14 +20,15 @@ from textual.widgets import (
 )
 
 from gangge.layer3_agent.loop import AgenticLoop, LoopConfig
-from gangge.layer3_agent.tools.registry import ToolRegistry, create_tool_registry
+from gangge.layer3_agent.tools.registry import ToolRegistry
 from gangge.layer4_permission.guard import (
-    PermissionGuard,
     PermissionDecision,
+    PermissionGuard,
     PermissionRequest,
 )
 from gangge.layer5_llm.base import BaseLLM, ContentBlock, ContentType, Message, Role
-from gangge.layer5_llm.registry import create_llm
+from gangge.runtime import bootstrap
+from gangge.runtime.profile import profile_patches
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +204,7 @@ class GanggeApp(App):
         self.tools = ToolRegistry()
         self.guard = PermissionGuard(ask_callback=self._ask_permission)
         self.loop: AgenticLoop | None = None
+        self.runtime = None  # the booted plugin tree, set in on_mount
 
         self._task: asyncio.Task | None = None
         self._cancel = False  # cancel flag checked by AgenticLoop
@@ -225,10 +228,6 @@ class GanggeApp(App):
         chat.add_system("正在初始化 Gangge Code...")
 
         try:
-            # Create LLM
-            self.llm = create_llm()
-            chat.add_system(f"✓ LLM 已连接: {self.llm.model}")
-
             # Register tools via shared factory (gets ALL tools: bash, file_ops,
             # search incl. EverythingSearch, todo, web, ask_user, novel, etc.)
             async def _ask_user_callback(question: str) -> str:
@@ -236,14 +235,35 @@ class GanggeApp(App):
                 chat.add_system(f"[yellow]? {question} (TUI 自动返回空)[/yellow]")
                 return ""
 
-            self.tools = create_tool_registry(
+            # ── Boot the plugin tree ──
+            # Which LLM adapter, tool set and permission policy are live is
+            # decided by the profile (see gangge/runtime/profiles/*.yml), not by
+            # this file. The TUI only consumes the resulting services.
+            self.runtime = bootstrap(
+                profile=os.environ.get("GANGGE_PROFILE", "standard"),
                 workspace=self.workspace_dir,
-                ask_user_callback=_ask_user_callback,
-                llm=self.llm,
-                multimodal_llm=None,
-                attachments=[],
+                patches=profile_patches(),
+                bindings={
+                    "tools": {
+                        "ask_user_callback": _ask_user_callback,
+                        "multimodal_llm": None,
+                        "attachments": [],
+                    },
+                    "permission": {"ask_callback": self._ask_permission, "ask": True},
+                },
             )
-            chat.add_system(f"✓ 已加载 {len(self.tools)} 个工具")
+            if self.runtime.failed:
+                for row_id, error in self.runtime.failed:
+                    chat.add_system(f"[yellow]⚠ 插件 {row_id} 未启用: {error}[/yellow]")
+
+            self.llm = self.runtime.llm.default()
+            self.tools = self.runtime.tools.registry
+            self.guard = self.runtime.permission
+
+            chat.add_system(f"✓ LLM 已连接: {self.llm.model}")
+            chat.add_system(
+                f"✓ 已加载 {len(self.tools)} 个工具 (profile: {self.runtime.profile})"
+            )
 
             # Create agentic loop
             import os as _os
@@ -287,6 +307,9 @@ class GanggeApp(App):
             self.loop = AgenticLoop(
                 self.llm, self.tools, self.guard, config,
                 cancel_check=lambda: self._cancel,
+                tool_service=self.runtime.tools if self.runtime else None,
+                context=self.runtime.ctx if self.runtime else None,
+                llm_factory=self.runtime.llm if self.runtime else None,
             )
 
             status = self.query_one("#status-bar", StatusLine)
@@ -535,7 +558,12 @@ class GanggeApp(App):
         self._save_session_history()
         if self._task and not self._task.done():
             self._task.cancel()
-        if self.llm:
+        # Unmount the plugin tree first: its disposers release listeners,
+        # services and the session storage in reverse registration order.
+        if self.runtime is not None:
+            await self.runtime.aclose()
+            self.runtime = None
+        elif self.llm:
             await self.llm.close()
 
 

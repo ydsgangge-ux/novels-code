@@ -1,26 +1,37 @@
-"""Tool registry — manage all available tools with phase-based layering.
+"""Tool registry — capability-scoped tool exposure.
 
-Tool layering strategy (inspired by Claude Code):
-- Phase 1 (Explore): read-only tools + TodoWrite — understand the codebase
-- Phase 2 (Write):  + file creation/editing tools — make changes
-- Phase 3 (Run):    + bash/lint — execute and verify
-- Phase 4 (Special): + novel/web/ask_user — domain-specific tools
+Two mechanisms, one job: keep the tool list small enough that a weak model can
+still pick the right one, without hiding something it legitimately needs.
 
-The model starts with a small subset and the system opens more tools
-as the task progresses. This dramatically improves tool selection accuracy,
-especially for smaller models.
+* **Profile** — the task family (coding / novel / research). Each profile
+  declares a ``core`` set that is always visible, plus the full set it may use.
+* **tool_search** — the escape hatch. A deferred tool (web, browser, symbols,
+  novel, image, …) is revealed by searching for it, which unlocks its full
+  schema for the rest of the session.
+
+What this replaces: a keyword-scored "phase" gate that opened write/run tools
+when a todo item happened to contain "测试" or when the workspace was empty.
+Those heuristics misfired (a todo saying "不要运行测试" unlocked bash; a real
+task in a non-empty repo never got write access), and no amount of keyword
+tuning fixes guessing. Asking the model to search is a decision, not a guess.
+
+``phase`` survives as a coarse counter for UI display and telemetry only — it
+no longer hides anything.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Callable, Awaitable
 
 from gangge.layer3_agent.tools.base import BaseTool, ToolResult
 from gangge.layer5_llm.base import ToolDefinition
 
 logger = logging.getLogger(__name__)
+
+_CJK = re.compile(r"[\u4e00-\u9fff]")
 
 
 # ── Tool phase definitions ──
@@ -45,9 +56,11 @@ TOOL_PHASES: dict[str, int] = {
     "TodoWrite":      PHASE_EXPLORE,
     "chat_log":       PHASE_EXPLORE,  # 纯聊天记录 — 不需要其他工具时的出口
     "recall_conversation": PHASE_EXPLORE,  # 搜索历史对话 — 跨会话记忆
+    "tool_search":    PHASE_EXPLORE,  # 元工具：始终可见，用来揭示其余工具
     # Phase 2: Write
     "write_file":     PHASE_WRITE,
     "edit_file":      PHASE_WRITE,
+    "apply_patch":    PHASE_WRITE,
     "create_tool":    PHASE_WRITE,
     # Phase 3: Run
     "bash":           PHASE_RUN,
@@ -108,7 +121,9 @@ AGENT_PROFILES = {
             "everything_search",
             "find_symbol", "find_references", "TodoWrite", "chat_log", "recall_conversation",
             # Phase 2: Write
-            "write_file", "edit_file", "create_tool",
+            "write_file", "edit_file", "apply_patch", "create_tool",
+            # Discovery (always visible even though it is listed here)
+            "tool_search",
             # Phase 3: Run
             "bash", "lint_check", "browser_debug",
             # Always available
@@ -177,7 +192,16 @@ def detect_agent_profile(user_message: str) -> str:
     Returns the profile with the highest keyword hit count. On ties the
     higher-priority profile wins: novel > research > coding.
     Falls back to "coding" when nothing matches.
+
+    Keyword scoring stays as a *fallback* only. An explicit choice — a GUI mode,
+    ``--profile``, or ``GANGGE_AGENT_PROFILE`` — always wins, because guessing a
+    task family from substrings ("画" in "画个架构图" vs "画插图") is exactly the
+    kind of heuristic that should never override what the user said.
     """
+    explicit = (os.environ.get("GANGGE_AGENT_PROFILE") or "").strip().lower()
+    if explicit in AGENT_PROFILES:
+        return explicit
+
     msg_lower = user_message.lower()
     profiles = ("novel", "research", "coding")
     best = "coding"
@@ -190,6 +214,51 @@ def detect_agent_profile(user_message: str) -> str:
     return best
 
 
+# ── Profile core sets ──
+# What the model sees *before* searching. The rule of thumb: everything needed
+# for a self-contained single-file task, so the common case costs zero extra
+# rounds. Anything domain-specific (web, browser, symbols, images, novel) is
+# deferred and reachable via tool_search.
+PROFILE_CORE: dict[str, set[str]] = {
+    "coding": {
+        "read_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "bash",
+        "lint_check",
+        "TodoWrite",
+        "ask_user",
+        "chat_log",
+        "tool_search",
+    },
+    # Novel and research sessions are domain sessions: hiding their own domain
+    # tools behind a search would only add a round to every single turn.
+    "novel": {
+        "novel_init", "novel_setup", "novel_outline", "novel_chapter_outlines",
+        "novel_new_arc", "novel_write_chapter", "novel_audit", "novel_revise",
+        "novel_status", "novel_edit", "novel_export", "novel_list_books",
+        "novel_graph_query", "novel_consistency_check", "novel_graph_rebuild",
+        "novel_import", "novel_imitate_write", "novel_chat", "novel_navigate",
+        "read_file", "list_dir", "grep", "everything_search",
+        "TodoWrite", "ask_user", "vision", "generate_image", "tool_search",
+    },
+    "research": {
+        "web_search", "web_fetch", "package_info", "grep", "glob",
+        "everything_search", "read_file", "list_dir",
+        "TodoWrite", "ask_user", "chat_log", "write_file", "edit_file",
+        "vision", "generate_image", "tool_search",
+    },
+}
+
+# Always visible regardless of profile: it is the mechanism that reveals the
+# rest, so hiding it would be self-defeating.
+ALWAYS_VISIBLE: frozenset[str] = frozenset({"tool_search"})
+
+
 class ToolRegistry:
     """Registry of all available tools with phase-based layering + agent profiles."""
 
@@ -200,10 +269,94 @@ class ToolRegistry:
         # AI-created plugin tools may live outside any profile's tool set;
         # track them so they are still surfaced to the model after creation.
         self._plugin_names: set[str] = set()
+        # Tools revealed by ``tool_search`` this session. Unlocking is
+        # permanent on purpose: a tool the model already discovered must not
+        # vanish from the next request (that is how you get repeated
+        # hallucinations of the same tool name).
+        self._unlocked: set[str] = set()
 
     def mark_plugin(self, name: str) -> None:
         """Mark a tool as an AI-created plugin so it bypasses the profile filter."""
         self._plugin_names.add(name)
+
+    # ── discovery ──────────────────────────────────────────────
+
+    def unlock(self, names: list[str] | set[str]) -> list[str]:
+        """Reveal tools for the rest of the session; returns the newly added."""
+        added: list[str] = []
+        for name in names:
+            if name in self._tools and name not in self._unlocked:
+                self._unlocked.add(name)
+                added.append(name)
+        if added:
+            logger.info("[Registry] unlocked by tool_search: %s", ", ".join(added))
+        return added
+
+    def is_visible(self, name: str, phase: int | None = None) -> bool:
+        """Whether ``name`` is currently part of the model's tool list."""
+        if name in ALWAYS_VISIBLE or name in self._plugin_names or name in self._unlocked:
+            return True
+        if phase is None:
+            return True
+        return name in PROFILE_CORE.get(self._active_profile, set())
+
+    def search(self, query: str, limit: int = 8) -> list[BaseTool]:
+        """Rank tools against ``query``.
+
+        Scoring is intentionally simple and explainable — exact name, name
+        substring, tag, description keyword — because the caller is a model that
+        can read the result and search again if it missed.
+        """
+        query = (query or "").strip()
+        if not query:
+            deferred = [
+                t for t in self._tools.values()
+                if t.name not in PROFILE_CORE.get(self._active_profile, set())
+                and t.name not in ALWAYS_VISIBLE
+            ]
+            return deferred[:limit]
+
+        lowered = query.lower()
+        words = [w for w in lowered.replace("_", " ").split() if w]
+        # Chinese queries arrive as one unspaced token ("生成图片"), so plain
+        # word matching would miss everything. Bigrams are a cheap stand-in for
+        # tokenisation and good enough for a ranked hint list.
+        grams: list[str] = []
+        for word in words:
+            if _CJK.search(word) and len(word) > 2:
+                grams.extend(word[i : i + 2] for i in range(len(word) - 1))
+
+        scored: list[tuple[float, str, BaseTool]] = []
+        for tool in self._tools.values():
+            name = tool.name.lower()
+            desc = (tool.description or "").lower()
+            tags = " ".join(tool.tags).lower()
+
+            score = 0.0
+            if lowered == name:
+                score += 100
+            elif lowered in name:
+                score += 50
+            for word in words:
+                if word in name:
+                    score += 20
+                if word in tags:
+                    score += 12
+                if word in desc:
+                    score += 8
+            for gram in grams:
+                if gram in name:
+                    score += 6
+                elif gram in desc or gram in tags:
+                    score += 4
+            if not score and words:
+                # Last resort: partial-word overlap with the description
+                score = sum(2 for w in words if w[:4] and w[:4] in desc)
+            if score > 0:
+                scored.append((score, tool.name, tool))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [tool for _, _, tool in scored[:limit]]
 
     def register(self, tool: BaseTool) -> None:
         """Register a tool."""
@@ -222,34 +375,31 @@ class ToolRegistry:
         return list(self._tools.values())
 
     def get_definitions(self, phase: int | None = None, profile: str | None = None) -> list[ToolDefinition]:
-        """Get tool definitions for LLM API, filtered by phase and profile.
+        """Get tool definitions for the LLM API.
 
         Args:
-            phase: If provided, only return tools at or below this phase.
-                   If None, return all tools (within profile).
-            profile: If provided, only return tools in this profile's tool set.
-                     If None, use the active profile.
+            phase: If provided, restrict the list to the profile's ``core`` set
+                   plus anything revealed by ``tool_search``. If None, return
+                   every tool the profile may use (introspection / tests).
+            profile: Which profile's universe to filter against; defaults to the
+                     active one.
         """
         effective_profile = profile or self._active_profile
         profile_tools = AGENT_PROFILES.get(effective_profile, {}).get("tools", None)
+        core = PROFILE_CORE.get(effective_profile, set())
 
-        filtered = []
+        filtered: list[ToolDefinition] = []
         for tool in self._tools.values():
-            # Profile filter: only include tools in the active profile.
-            # AI-created plugins are exempt — they were created for a reason
-            # and must be reachable even though they're not in any profile.
-            if (
-                profile_tools is not None
-                and tool.name not in profile_tools
-                and tool.name not in self._plugin_names
-            ):
+            name = tool.name
+            # Escape hatches: the search tool itself, AI-created plugins, and
+            # everything the model already discovered.
+            escape = name in ALWAYS_VISIBLE or name in self._plugin_names or name in self._unlocked
+
+            if profile_tools is not None and name not in profile_tools and not escape:
                 continue
 
-            # Phase filter
-            if phase is not None:
-                tool_phase = TOOL_PHASES.get(tool.name, DEFAULT_PHASE)
-                if tool_phase > phase:
-                    continue
+            if phase is not None and not escape and name not in core:
+                continue
 
             filtered.append(tool.to_definition())
         return filtered
@@ -339,11 +489,22 @@ def create_tool_registry(
 
     registry = ToolRegistry()
 
+    # ── Discovery: must exist before anything can be hidden from the model ──
+    from gangge.layer3_agent.tools.tool_search import ToolSearchTool
+
+    registry.register(ToolSearchTool(registry))
+
     # ── Phase 1: Explore tools (always available) ──
     registry.register(BashTool(workspace=workspace))  # bash is phase 3 but registered early
     registry.register(ReadFileTool(workspace=workspace))
     registry.register(WriteFileTool(workspace=workspace))
     registry.register(EditFileTool(workspace=workspace))
+    try:
+        from gangge.layer3_agent.tools.patch import ApplyPatchTool
+
+        registry.register(ApplyPatchTool(workspace=workspace))
+    except Exception as e:  # a broken patch tool must not block booting
+        logger.debug("[Registry] apply_patch skipped: %s", e)
     registry.register(LintCheckTool(workspace=workspace))
     for cls in [GrepTool, GlobTool, ListDirTool, EverythingSearchTool]:
         registry.register(cls(workspace=workspace))

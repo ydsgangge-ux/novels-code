@@ -43,6 +43,10 @@ class Planner:
         project_context: str = "",
     ) -> list[PlanStep]:
         """Ask the LLM to generate an execution plan for the given task."""
+        # The prefix is built outside the f-string: a backslash inside an
+        # f-string *expression* is a syntax error before Python 3.12, and this
+        # package declares >=3.11 support.
+        context_block = f"项目信息:\n{project_context}" if project_context else ""
         plan_prompt = f"""请为以下任务制定一个执行计划。输出 JSON 数组格式，每个元素包含:
 - "step": 步骤编号
 - "description": 步骤描述
@@ -50,7 +54,7 @@ class Planner:
 
 任务: {task}
 
-{f"项目信息:\n{project_context}" if project_context else ""}
+{context_block}
 
 只输出 JSON 数组，不要其他内容。例如:
 [{{"step": 1, "description": "xxx", "files": ["src/a.py"]}}]"""

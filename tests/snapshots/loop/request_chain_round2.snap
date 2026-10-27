@@ -1,0 +1,6 @@
+[
+  "user:text",
+  "assistant:tool_use",
+  "tool:tool_result",
+  "user:text"
+]

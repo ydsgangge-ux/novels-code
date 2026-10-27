@@ -1,0 +1,17 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# memory-bank —— 跨会话记忆。
+#
+# 它只订阅 turn/end 事件，不 import loop。这是"一切皆插件"的关键收益：
+# 把行为装成插件之后，扩展点就是事件，而不是往 loop.py 里加 if 分支。
+# ─────────────────────────────────────────────────────────────────────────────
+
+- insert:
+    - id: memory-bank
+      name: gangge.runtime.plugins.memory_bank
+      config:
+        dir: '.gangge'
+        progress_file: progress.md
+        changelog_file: changelog.md
+        decisions_file: decisions.md
+        # 只在 turn/end 且有实际改动时落盘，避免空回合刷文件
+        auto_save: true

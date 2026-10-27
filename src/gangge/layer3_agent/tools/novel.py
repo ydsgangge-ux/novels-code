@@ -157,7 +157,7 @@ def _ensure_setup(workspace: str, book_id: str, genre: str = "", title: str = ""
                     "current_goal": "",
                     "hidden_agenda": "",
                     "faction": "",
-                    "is_main_cast": true,
+                    "is_main_cast": True,
                 }
             ]
         }

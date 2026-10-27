@@ -286,44 +286,98 @@ class OpenAICompatLLM(BaseLLM):
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
 
-        current_tool_id = ""
-        current_tool_name = ""
-        current_tool_input = ""
+        # Tool calls arrive as deltas keyed by index — a model may emit several
+        # in parallel, interleaved. A single accumulator (the old code) merged
+        # them into one malformed call.
+        pending: dict[int, dict[str, str]] = {}
 
-        stream = await self.client.chat.completions.create(**kwargs, stream=True)
+        def _flush() -> list[ContentBlock]:
+            blocks: list[ContentBlock] = []
+            for index in sorted(pending):
+                slot = pending[index]
+                if not slot.get("name"):
+                    continue
+                raw = slot.get("args") or ""
+                try:
+                    parsed = json.loads(raw) if raw.strip() else {}
+                except json.JSONDecodeError:
+                    # Keep the raw payload: the schema guard can often repair it,
+                    # and an empty dict loses the model's intent entirely.
+                    parsed = {"__raw_arguments": raw}
+                blocks.append(
+                    ContentBlock(
+                        type=ContentType.TOOL_USE,
+                        tool_call_id=slot.get("id") or f"call_{index}",
+                        tool_name=slot["name"],
+                        tool_input=parsed,
+                    )
+                )
+            pending.clear()
+            return blocks
+
+        stream = await self._open_stream(kwargs)
         async for chunk in stream:
+            usage = getattr(chunk, "usage", None)
+            if usage:
+                yield ContentBlock(
+                    type=ContentType.TEXT,
+                    text="",
+                    usage={
+                        "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                        "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                    },
+                )
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+            if delta is None:
+                continue
             if delta.content:
                 yield ContentBlock(type=ContentType.TEXT, text=delta.content)
-            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(
+                delta, "reasoning", None
+            )
             if reasoning:
                 yield ContentBlock(type=ContentType.THINKING, text=reasoning)
 
-            if hasattr(delta, "tool_calls") and delta.tool_calls:
-                for tc in delta.tool_calls:
-                    if tc.id:
-                        current_tool_id = tc.id
-                    if tc.function and tc.function.name:
-                        current_tool_name = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        current_tool_input += tc.function.arguments
+            for tc in getattr(delta, "tool_calls", None) or []:
+                index = getattr(tc, "index", 0) or 0
+                slot = pending.setdefault(index, {"id": "", "name": "", "args": ""})
+                if tc.id:
+                    slot["id"] = tc.id
+                function = getattr(tc, "function", None)
+                if function is not None:
+                    if function.name:
+                        slot["name"] += function.name
+                    if function.arguments:
+                        slot["args"] += function.arguments
 
-            finish = chunk.choices[0].finish_reason
-            if finish == "tool_calls" and current_tool_name:
-                try:
-                    parsed = json.loads(current_tool_input)
-                except json.JSONDecodeError:
-                    parsed = {}
-                yield ContentBlock(
-                    type=ContentType.TOOL_USE,
-                    tool_call_id=current_tool_id,
-                    tool_name=current_tool_name,
-                    tool_input=parsed,
-                )
-                current_tool_name = ""
-                current_tool_input = ""
+            if choice.finish_reason in ("tool_calls", "stop") and pending:
+                for block in _flush():
+                    yield block
+
+        # Some servers end the stream without a finish_reason on the tool frame.
+        for block in _flush():
+            yield block
+
+    async def _open_stream(self, kwargs: dict[str, Any]) -> Any:
+        """Open the SSE stream, asking for usage when the server supports it.
+
+        ``stream_options`` is a newer OpenAI field; Ollama and some proxies
+        reject unknown keys outright. Losing token counts is acceptable, losing
+        the call is not — so the option is dropped on the first failure.
+        """
+        try:
+            return await self.client.chat.completions.create(
+                **kwargs, stream=True, stream_options={"include_usage": True}
+            )
+        except Exception as exc:
+            if "stream_options" not in str(exc).lower():
+                raise
+            logger.debug("[LLM] stream_options unsupported, retrying without it")
+            return await self.client.chat.completions.create(**kwargs, stream=True)
 
     async def close(self) -> None:
         await self.client.close()

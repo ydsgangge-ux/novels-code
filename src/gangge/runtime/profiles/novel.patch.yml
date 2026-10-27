@@ -1,0 +1,16 @@
+- patch:
+    - id: tools
+      config:
+        load_plugins: true
+        browser: false
+        comfyui: true
+        novel: true
+        profile: 'novel'
+
+    - id: memory-bank
+      config:
+        dir: '.gangge'
+        progress_file: progress.md
+        changelog_file: changelog.md
+        decisions_file: decisions.md
+        auto_save: true

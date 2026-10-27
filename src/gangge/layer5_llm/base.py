@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 
 class Role(str, Enum):
@@ -25,7 +25,12 @@ class ContentType(str, Enum):
 
 @dataclass
 class ContentBlock:
-    """A single content block in a message."""
+    """A single content block in a message.
+
+    ``usage`` is only meaningful on streaming deltas: providers report token
+    counts out-of-band (the final SSE frame, ``message_delta``), and there is no
+    other place to carry them without inventing a second event type.
+    """
 
     type: ContentType
     text: str = ""
@@ -35,6 +40,7 @@ class ContentBlock:
     is_error: bool = False
     media_type: str = ""
     media_data: str = ""
+    usage: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"type": self.type.value}
@@ -172,6 +178,12 @@ class BaseLLM(ABC):
     # Default context window — subclasses should override
     CONTEXT_WINDOW_TOKENS: int = 128_000
 
+    # Whether ``stream()`` is a real incremental stream. A provider that can
+    # only answer in one shot must set this to False, and callers then keep
+    # using ``chat()`` — pretending to stream a finished answer is what makes
+    # the UI feel worse than honest blocking output.
+    supports_streaming: bool = True
+
     def __init__(
         self,
         model: str,
@@ -208,6 +220,64 @@ class BaseLLM(ABC):
     ) -> AsyncIterator[ContentBlock]:
         """Stream response content blocks."""
         ...
+
+    async def chat_stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        system: str = "",
+        on_delta: Callable[[ContentBlock], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Stream, forward each delta, and still return a complete response.
+
+        This is the bridge that lets a streaming UI and a tool-calling loop share
+        one code path: the loop needs the assembled ``LLMResponse`` (tool calls,
+        stop reason, usage), while the UI needs the deltas as they arrive.
+
+        Aggregation rules:
+        * text deltas are concatenated into one TEXT block
+        * thinking deltas into one THINKING block, placed before the text
+        * TOOL_USE blocks are passed through in arrival order
+        * ``usage`` is merged from any delta that carries it
+        """
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_blocks: list[ContentBlock] = []
+        usage: dict[str, int] = {}
+
+        async for delta in self.stream(messages, tools=tools, system=system):
+            if delta.usage:
+                usage.update(delta.usage)
+            if delta.type == ContentType.TEXT:
+                if not delta.text:
+                    continue
+                text_parts.append(delta.text)
+                if on_delta is not None:
+                    await on_delta(delta)
+            elif delta.type == ContentType.THINKING:
+                if not delta.text:
+                    continue
+                thinking_parts.append(delta.text)
+                if on_delta is not None:
+                    await on_delta(delta)
+            elif delta.type == ContentType.TOOL_USE:
+                tool_blocks.append(delta)
+
+        content: list[ContentBlock] = []
+        if thinking_parts:
+            content.append(
+                ContentBlock(type=ContentType.THINKING, text="".join(thinking_parts))
+            )
+        if text_parts:
+            content.append(ContentBlock(type=ContentType.TEXT, text="".join(text_parts)))
+        content.extend(tool_blocks)
+
+        return LLMResponse(
+            content=content,
+            stop_reason="tool_use" if tool_blocks else "end_turn",
+            usage=usage,
+            model=self.model,
+        )
 
     async def close(self) -> None:
         """Clean up resources."""

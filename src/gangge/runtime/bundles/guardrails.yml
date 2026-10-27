@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# guardrails —— 弱模型护栏。
+#
+# 这三个插件存在的唯一理由：GLM-4.7-Flash 这类免费/小模型不是"想不明白"，
+# 而是"手脚不稳"——参数名拼错、类型写错、把文件内容包进代码围栏、同一个调用
+# 反复发、被 ANSI 噪声带偏。这些都发生在**工具边界**上，所以修在工具边界，
+# 不需要改 loop 一行。
+#
+# 用小模型就留着；换成强模型可以直接 --set 关掉，或者不加载这个 bundle：
+#   gangge --profile minimal --set repeat-guard.limit=0
+# ─────────────────────────────────────────────────────────────────────────────
+
+- insert:
+    # 1) 参数修复 + 解释：改得动就改（别名/类型/围栏），改不动就给一份
+    #    带示例和回显的错误说明，弱模型照着抄就能自愈。
+    - id: schema-guard
+      name: gangge.runtime.plugins.schema_guard
+      config:
+        coerce: true
+        prepend: true        # 必须最早跑：后面的策略要看到修好的参数
+
+    # 2) 结果裁剪：去 ANSI / 压缩空行 / 头尾截断。
+    #    只改模型看到的内容，metadata['value'] 保留完整真值。
+    - id: result-pruner
+      name: gangge.runtime.plugins.result_pruner
+      config:
+        max_chars: 8000
+        head_ratio: 0.4
+        strip_ansi: true
+        collapse_blank: true
+
+    # 3) 重复调用熔断：同参同工具第 3 次起，在结果尾部追加"换参数/换工具/直接用"。
+    - id: repeat-guard
+      name: gangge.runtime.plugins.repeat_guard
+      config:
+        limit: 3
+        hint_once: false
+
+    # 4) 下一步提示：每种工具每回合只提示一次，一行以内。
+    #    "read 完该 edit"、"改完该 verify" —— 强模型不需要，弱模型全靠这个。
+    - id: next-step
+      name: gangge.runtime.plugins.next_step
+      config:
+        on_error_only: false
+        max_hint_chars: 80
+
+    # 5) 提前收工拦截：只读不写、改了没验证，都拒绝结束回合。
+    #    这是"模型说做完了但其实什么都没改"的唯一防线。
+    - id: stop-guard
+      name: gangge.runtime.plugins.stop_guard
+      config:
+        max_nudges: 2
+        require_action: true
+        require_verification: true

@@ -179,10 +179,19 @@ class AnthropicLLM(BaseLLM):
         current_tool_id = ""
         current_tool_name = ""
         current_tool_input = ""
+        usage: dict[str, int] = {}
 
         async with self.client.messages.stream(**kwargs) as stream:
             async for event in stream:
-                if event.type == "content_block_start":
+                if event.type == "message_start":
+                    raw_usage = getattr(getattr(event, "message", None), "usage", None)
+                    if raw_usage is not None:
+                        usage["input_tokens"] = getattr(raw_usage, "input_tokens", 0) or 0
+                elif event.type == "message_delta":
+                    raw_usage = getattr(event, "usage", None)
+                    if raw_usage is not None:
+                        usage["output_tokens"] = getattr(raw_usage, "output_tokens", 0) or 0
+                elif event.type == "content_block_start":
                     if hasattr(event.content_block, "type"):
                         if event.content_block.type == "tool_use":
                             current_tool_id = event.content_block.id
@@ -193,6 +202,11 @@ class AnthropicLLM(BaseLLM):
                         if event.delta.type == "text_delta":
                             yield ContentBlock(
                                 type=ContentType.TEXT, text=event.delta.text
+                            )
+                        elif event.delta.type == "thinking_delta":
+                            yield ContentBlock(
+                                type=ContentType.THINKING,
+                                text=getattr(event.delta, "thinking", ""),
                             )
                         elif event.delta.type == "input_json_delta":
                             current_tool_input += event.delta.partial_json
@@ -212,6 +226,11 @@ class AnthropicLLM(BaseLLM):
                         )
                         current_tool_name = ""
                         current_tool_input = ""
+
+        # Usage is reported out of band; a terminal empty TEXT delta is the only
+        # channel the streaming contract has for it.
+        if usage:
+            yield ContentBlock(type=ContentType.TEXT, text="", usage=usage)
 
     async def close(self) -> None:
         await self.client.close()

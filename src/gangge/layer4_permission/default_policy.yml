@@ -1,0 +1,174 @@
+# Default permission policy for gangge.
+#
+# Semantics (see rules.py):
+#   * every `pattern` is a regular expression matched case-insensitively
+#   * ALL matching rules for the action's scope are collected, the strictest
+#     one wins: deny > ask > allow
+#   * `match` / `not_match` are examples, verified at load time — a rule whose
+#     samples disagree with its regex refuses to load
+#   * `defaults` decides the "nothing matched" case; there is deliberately no
+#     catch-all `.* -> ask` rule (it would outrank every allow rule)
+#
+# Scopes: bash | file_read | file_write | network | mcp | interactive
+#
+# Override per project by pointing GANGGE_PERMISSION_POLICY at your own file.
+
+name: default
+
+defaults:
+  bash: ask
+  file_read: allow
+  file_write: allow
+  network: ask
+  mcp: ask
+  interactive: allow
+
+rules:
+  # ── bash: destructive and unrecoverable ──────────────────────
+  - scope: bash
+    decision: deny
+    pattern: '\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)*/(\s|$)'
+    description: 删除根目录
+    match: ['rm -rf /', 'rm -r / ']
+    not_match: ['rm -rf ./build', 'rm -rf /tmp/cache']
+
+  - scope: bash
+    decision: deny
+    pattern: '\bmkfs(\.\w+)?\b'
+    description: 格式化文件系统
+    match: ['mkfs.ext4 /dev/sda1']
+
+  - scope: bash
+    decision: deny
+    pattern: '\bdd\b[^\n]*\bof=/dev/(sd|nvme|hd)'
+    description: 直接写块设备
+    match: ['dd if=/dev/zero of=/dev/sda']
+
+  - scope: bash
+    decision: deny
+    pattern: ':\s*\(\)\s*\{'
+    description: Fork 炸弹
+    match: [':(){ :|:& };:']
+
+  - scope: bash
+    decision: deny
+    pattern: '\bformat\s+[a-zA-Z]:'
+    description: 格式化 Windows 分区
+    match: ['format C: /q']
+
+  - scope: bash
+    decision: deny
+    pattern: '\bdel\s+(/[a-zA-Z]\s+)*[a-zA-Z]:\\*\s*\*?\s*$'
+    description: 删除整个盘符
+    match: ['del /f /s /q C:\']
+
+  # ── bash: dangerous but sometimes legitimate ─────────────────
+  - scope: bash
+    decision: ask
+    pattern: '\brm\s+-[a-zA-Z]*[rf]'
+    description: 递归或强制删除
+    match: ['rm -rf build']
+    not_match: ['rm build.log']
+
+  - scope: bash
+    decision: ask
+    pattern: '\bgit\s+(push\s+.*--force|reset\s+--hard|clean\s+-[a-zA-Z]*f)'
+    description: 可能丢失提交的 Git 操作
+    match: ['git reset --hard HEAD~3', 'git push origin main --force']
+    not_match: ['git status']
+
+  - scope: bash
+    decision: ask
+    pattern: '(\bcurl\b|\bwget\b|\biwr\b)[^\n|]*\|\s*(ba|z)?sh\b'
+    description: 远程脚本直接管道执行
+    match: ['curl -fsSL https://x.sh | bash']
+
+  - scope: bash
+    decision: ask
+    pattern: '\b(pip|pip3|npm|yarn|pnpm|poetry|uv)\s+(install|add|publish|uninstall)\b'
+    description: 修改依赖或发布包
+    match: ['pip install requests', 'npm install']
+    not_match: ['pip list']
+
+  - scope: bash
+    decision: ask
+    pattern: '\bsudo\b|\brunas\b|Start-Process[^\n]*-Verb\s+RunAs'
+    description: 提权执行
+    match: ['sudo systemctl restart nginx']
+
+  - scope: bash
+    decision: ask
+    pattern: '\b(docker|podman)\s+(run|exec|rm|build)\b'
+    description: 容器操作
+    match: ['docker run -it ubuntu']
+
+  # ── bash: read-only, no confirmation needed ──────────────────
+  - scope: bash
+    decision: allow
+    pattern: '^\s*(ls|dir|pwd|cat|head|tail|less|more|type|which|where|whoami|date|mkdir|touch)\b'
+    description: 只读或创建空目录的常规命令
+    # 注意：复合命令（`ls; rm -rf /`）不在这里断言，因为分段由 guard 负责——
+    # 规则只对单个命令片段负责，注入防护在 split_command + 最严优先那一层。
+    match: ['ls -la', 'cat README.md', 'mkdir -p out']
+
+  - scope: bash
+    decision: allow
+    pattern: '^\s*git\s+(status|log|diff|show|branch|remote|describe|rev-parse)\b'
+    description: Git 只读命令
+    match: ['git status', 'git log --oneline -5']
+    not_match: ['git push']
+
+  - scope: bash
+    decision: allow
+    pattern: '^\s*(python|python3|py)\s+-m\s+(pytest|unittest)\b|^\s*(pytest|tox|nox)\b'
+    description: 运行测试
+    match: ['pytest -q', 'python -m pytest tests']
+
+  - scope: bash
+    decision: allow
+    pattern: '^\s*(pip|pip3)\s+(list|show|freeze)\b|^\s*npm\s+(ls|list|outdated)\b'
+    description: 查看依赖信息
+    match: ['pip list', 'npm ls']
+
+  - scope: bash
+    decision: allow
+    pattern: '^\s*(python|python3|py|node|npm|cargo|go|rustc|java|javac)\s+(-V|--version|version)\b'
+    description: 查看工具版本
+    match: ['python --version', 'node -v']
+
+  # ── file_write: never touch system locations or VCS internals ─
+  - scope: file_write
+    decision: deny
+    pattern: '^(?:[a-zA-Z]:[\\/])?(?:windows|program files|programdata|/etc|/usr|/bin|/sbin|/boot|/sys|/proc)(?:[\\/]|$)'
+    description: 禁止写入系统目录
+    match: ['C:\Windows\System32\drivers\etc\hosts', '/etc/passwd']
+    not_match: ['src/main.py', 'D:\proj\windows_helper.py']
+
+  - scope: file_write
+    decision: deny
+    pattern: '(?:^|[\\/])\.git[\\/](?!info|hooks)'
+    description: 禁止直接改写 .git 内部状态
+    match: ['.git/config', 'repo\.git\HEAD']
+    not_match: ['.gitignore', 'src/.github/ci.yml']
+
+  # ── file_read: credentials and keys deserve a confirmation ───
+  - scope: file_read
+    decision: ask
+    pattern: '(?:^|[\\/])\.env(?:\.(?!example$|sample$|template$)[\w.-]+)?$'
+    description: 读取环境变量文件（可能含密钥）
+    match: ['.env', 'config/.env.production']
+    not_match: ['.env.example', 'env.py']
+
+  - scope: file_read
+    decision: ask
+    pattern: 'id_rsa|id_ed25519|\.pem$|\.pfx$|\.keystore$'
+    description: 读取私钥或证书
+    match: ['~/.ssh/id_rsa']
+
+  # ── network: local development servers are fine ──────────────
+  - scope: network
+    decision: allow
+    pattern: '^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(/|$)'
+    description: 本地开发服务器
+    match: ['http://localhost:8000/', 'http://127.0.0.1:3000']
+    not_match: ['https://example.com/']

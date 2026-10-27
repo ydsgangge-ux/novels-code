@@ -1,0 +1,9 @@
+# 极简模式：不装载树外插件、不开浏览器/ComfyUI、不落遥测、不要记忆库。
+# 用于"我只想让它读代码然后改几个文件"的场景 —— 工具面越小，小模型选错工具的概率越低。
+# 但护栏保留：小模型 + 小工具面，更需要参数修复和重复熔断。
+name: minimal
+description: 极简模式 —— 只保留核心读写工具，启动最快
+bundles:
+  - base
+  - guardrails
+patch: minimal.patch.yml

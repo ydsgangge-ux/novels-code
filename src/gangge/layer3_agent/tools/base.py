@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from gangge.layer3_agent.tools.validation import ToolInputError, validate_arguments
 from gangge.layer5_llm.base import ToolDefinition
 
 
@@ -47,6 +48,15 @@ class BaseTool(ABC):
         """Execute the tool with given parameters."""
         ...
 
+    @property
+    def tags(self) -> tuple[str, ...]:
+        """Search keywords beyond the name, used by ``tool_search``.
+
+        Override to make a tool discoverable by capability ("image", "pdf",
+        "单元测试") rather than by its exact name.
+        """
+        return ()
+
     def to_definition(self) -> ToolDefinition:
         """Convert to ToolDefinition for LLM API."""
         return ToolDefinition(
@@ -55,10 +65,31 @@ class BaseTool(ABC):
             input_schema=self.input_schema,
         )
 
+    def validate(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+        """Validate arguments against ``input_schema`` and fill defaults.
+
+        Raises :class:`ToolInputError` with a model-actionable message.
+        """
+        return validate_arguments(self.name, self.input_schema, arguments)
+
     async def safe_execute(self, **kwargs: Any) -> ToolResult:
-        """Execute with automatic error handling."""
+        """Validate, execute, and never raise.
+
+        Validation happens *here* rather than in the registry so that every
+        caller — the registry, a plugin pipeline, a test — gets the same
+        guarantee: a tool only ever runs with arguments matching its declared
+        schema.
+        """
         try:
-            return await self.execute(**kwargs)
+            args = self.validate(kwargs)
+        except ToolInputError as exc:
+            return ToolResult(
+                output=str(exc),
+                is_error=True,
+                metadata={"validation_errors": exc.problems},
+            )
+        try:
+            return await self.execute(**args)
         except Exception as e:
             return ToolResult(
                 output=f"工具执行错误: {type(e).__name__}: {e}",

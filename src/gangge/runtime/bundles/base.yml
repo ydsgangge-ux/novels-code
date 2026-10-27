@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# base —— 共享内核：每个 profile 的第一层。
+#
+# 这里只放"共享且不随模式变化"的行。任何按模式不同的配置都不属于本文件，
+# 它属于那个模式的 bundle —— 一条行只应有一个 bundle 层在写它，再加上用户
+# 的 overlay。这样 `--dump-config` 打印出来的每一行都能被上面某层替换掉。
+#
+# 行顺序不承载加载语义：激活顺序由服务依赖（inject）决定，不由位置决定。
+# ─────────────────────────────────────────────────────────────────────────────
+
+- insert:
+    # 模型适配器工厂。只声明"怎么造 adapter"，不在这里读密钥 ——
+    # 密钥在一次真实的 create()/default() 调用时才解析，所以启动不需要 API Key。
+    - id: llm
+      name: gangge.runtime.plugins.llm
+      config:
+        provider: ''          # 空 = 跟随 LLM_PROVIDER 环境变量
+
+    # 审批策略。软防护（规则 + 危险检测 + 记忆），不是沙箱。
+    # in_pipeline 默认关闭：AgenticLoop 自己会调 guard.check()，
+    # 再挂一个 permission/check 监听器就会重复弹窗问两次。
+    - id: permission
+      name: gangge.runtime.plugins.permission
+      config:
+        ask: true
+        strict: false
+        in_pipeline: false
+
+    # 会话生命周期。存储实现通过 storage 服务解析，缺省用 SQLite。
+    - id: session
+      name: gangge.runtime.plugins.session
+      config:
+        auto_save: true
+        db_path: '.data/gangge.db'
+
+    # 遥测出口。sink 为空时是 noop，装上才产生日志，不写任何东西时零开销。
+    - id: telemetry
+      name: gangge.runtime.plugins.telemetry
+      config:
+        sink: ''              # '' | 'jsonl'
+        path: '.gangge/telemetry.jsonl'
+
+    # 工具注册表 + 执行流水线。具体哪些工具由 full-tools 这层补丁决定。
+    - id: tools
+      name: gangge.runtime.plugins.tools
+      config:
+        load_plugins: true
+        browser: true
+        comfyui: true
+        novel: true
+        profile: ''           # 空 = 由 detect_agent_profile 自动判定

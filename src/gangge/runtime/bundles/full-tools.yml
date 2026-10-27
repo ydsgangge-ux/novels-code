@@ -1,0 +1,21 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# full-tools —— 打开完整工具面。
+#
+# 注意这里用的是 patch 而不是 insert：tools 这一行的归属是 base，
+# full-tools 只是把它的 config 整体重述一遍。一个模式的差异只写在
+# 一个地方，读者不用在两个文件之间做脑内 merge。
+# ─────────────────────────────────────────────────────────────────────────────
+
+- patch:
+    - id: tools
+      config:
+        load_plugins: true      # 启动时装载 .gangge/plugins/*.py
+        browser: true           # Playwright 可用才生效
+        comfyui: true           # 探测到本地 ComfyUI 才生效
+        novel: true             # Dramatica-Flow 可用才生效
+        profile: ''
+
+    - id: permission
+      config:
+        ask: true
+        strict: false

@@ -1,0 +1,8 @@
+# 标准模式：全能力 + 弱模型护栏。日常使用默认就是这个 profile。
+name: standard
+description: 标准模式 —— 编程 / 小说 / 研究全能力，AI 自建工具与 MCP 可用
+bundles:
+  - base
+  - guardrails
+  - full-tools
+  - memory-bank

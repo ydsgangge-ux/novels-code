@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -138,6 +139,11 @@ class LoopConfig:
     # ── ask_user callback: pause loop and wait for user input ──
     ask_user_callback: Callable[[str], Awaitable[str]] | None = None
 
+    # ── Streaming: forward model deltas to the UI as they arrive ──
+    # Off only for hosts that cannot render partial output (or adapters that do
+    # not support it — those fall back to a single shot automatically).
+    enable_streaming: bool = True
+
 
 @dataclass
 class ToolExecution:
@@ -167,6 +173,81 @@ class LoopResult:
 StreamCallback = Callable[[ContentBlock], Awaitable[None]]
 
 
+class _DeltaBatcher:
+    """Coalesce token deltas into line-sized UI updates.
+
+    A token-level emit means one Qt queued signal or one Textual message per
+    token — that floods the UI thread and *looks* slower than blocking output.
+    Batching on newline (or a character budget) keeps the cadence a reader
+    actually perceives, at a fraction of the wakeups.
+    """
+
+    def __init__(self, emit: Callable[[ContentBlock], Awaitable[None]], min_chars: int = 48):
+        self._emit = emit
+        self._min_chars = min_chars
+        self._buffer: list[str] = []
+        self._size = 0
+        self._reasoning: list[str] = []
+        self.deltas = 0          # raw text/reasoning deltas received
+        self.emitted_chars = 0   # answer characters pushed to the UI
+        self.thinking_chars = 0  # reasoning characters pushed to the UI
+
+    async def __call__(self, block: ContentBlock) -> None:
+        if block.type == ContentType.THINKING:
+            # Reasoning is delivered as ONE block per model call, never streamed
+            # token by token: a collapsible "思考过程" bubble per token is pure
+            # noise (and a UI flood), while a single block is what a reader
+            # actually wants to expand afterwards.
+            if block.text:
+                self.deltas += 1
+                self._reasoning.append(block.text)
+            return
+
+        if block.type == ContentType.TEXT:
+            if not block.text:
+                return
+            if self._reasoning:
+                # Reasoning must land before the answer it explains.
+                await self._flush_thinking()
+            self.deltas += 1
+            self._buffer.append(block.text)
+            self._size += len(block.text)
+            if self._size >= self._min_chars or "\n" in block.text:
+                await self.flush()
+            return
+
+        await self.flush()
+        await self._emit(block)
+
+    async def _flush_thinking(self) -> None:
+        if not self._reasoning:
+            return
+        text = "".join(self._reasoning)
+        self._reasoning.clear()
+        self.thinking_chars += len(text)
+        await self._emit(ContentBlock(type=ContentType.THINKING, text=text))
+
+    async def flush(self) -> None:
+        await self._flush_thinking()
+        if not self._buffer:
+            return
+        text = "".join(self._buffer)
+        self._buffer.clear()
+        self._size = 0
+        self.emitted_chars += len(text)
+        await self._emit(ContentBlock(type=ContentType.TEXT, text=text))
+
+
+@dataclass
+class _ToolRound:
+    """What one round of tool calls changed, handed back to the turn loop."""
+
+    results_message: Message
+    any_succeeded: bool
+    modified_files: bool
+    productive: bool
+
+
 class AgenticLoop:
     """The core agentic loop engine.
 
@@ -180,9 +261,26 @@ class AgenticLoop:
         permission_guard: PermissionGuard,
         config: LoopConfig | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        tool_service: Any | None = None,
+        context: Any | None = None,
+        llm_factory: Any | None = None,
     ):
         self.llm = llm
+        # Optional request gateway (``runtime.llm``). When present every model
+        # call goes through ``llm/request`` / ``llm/response``, so prompt
+        # rewriting, secret redaction, tool suppression and per-task model
+        # routing are plugins instead of edits here.
+        self.llm_factory = llm_factory
         self.tools = tools
+        # Optional execution gateway (``runtime.tools``). When present, every
+        # tool call runs through the plugin pipeline — argument repair, result
+        # pruning and repeat detection are attached there instead of here, so
+        # the loop stays unaware of them.
+        self.tool_service = tool_service
+        # Optional event bus (``runtime.ctx``). When present the loop asks
+        # ``agent/turn-stopping`` before accepting a stop, so "the model said
+        # it is done but nothing was changed" policy lives in a plugin.
+        self.context = context
         self.guard = permission_guard
         self.config = config or LoopConfig()
         self._cancel_check = cancel_check
@@ -195,6 +293,7 @@ class AgenticLoop:
         self._init_mcp()
         self._profile: str = ""  # set by run()
         self._llm_failures: int = 0  # consecutive LLM call failures
+        self._last_streamed: int = 0  # chars already shown to the UI by streaming
 
     def set_stream_callback(self, callback: StreamCallback) -> None:
         """Set callback for streaming content blocks."""
@@ -665,7 +764,7 @@ class AgenticLoop:
                 history_text += f"[{msg.role.value}]: {t}\n"
 
         try:
-            summary_response = await self.llm.chat(
+            summary_response = await self._chat(
                 messages=[
                     Message(
                         role=Role.USER,
@@ -678,6 +777,9 @@ class AgenticLoop:
                 ],
                 tools=None,
                 system="你是一个对话摘要助手，只输出摘要，不要多余内容。",
+                # Never stream a compression summary into the chat: the user
+                # asked for work, not for a progress digest.
+                stream=False,
             )
             summary = summary_response.text.strip()
             logger.info(f"History compressed at round {round_num}: {len(summary)} chars")
@@ -771,12 +873,40 @@ class AgenticLoop:
         if self._stream_callback:
             await self._stream_callback(block)
 
+    async def _emit_stream_delta(self, block: ContentBlock) -> None:
+        """Forward one model delta, and announce it on the ``llm/stream`` topic."""
+        from gangge.runtime import events as runtime_events
+
+        self._emit_lifecycle(
+            runtime_events.LLM_STREAM,
+            {"type": block.type.value, "text": (block.text or "")[:120]},
+        )
+        await self._emit(block)
+
     def _get_permission_action(self, tool_name: str, tool_input: dict) -> str:
-        """Extract the action string for permission checking."""
+        """Extract the action string for permission checking.
+
+        For ``apply_patch`` the action is *every* path the patch touches,
+        joined so the guard can judge the worst one — a patch that writes to
+        the workspace and to a system directory in one call must not be allowed
+        because the first path happened to be benign.
+        """
         if tool_name == "bash":
             return tool_input.get("command", "") or ""
-        elif tool_name in ("read_file", "write_file", "edit_file"):
+        if tool_name in ("read_file", "write_file", "edit_file"):
             return tool_input.get("path", "") or ""
+        if tool_name == "apply_patch":
+            paths: list[str] = []
+            try:
+                from gangge.layer3_agent.tools.patch import parse_patch
+
+                for op in parse_patch(tool_input.get("patch") or ""):
+                    paths.append(op.path)
+                    if op.move_to:
+                        paths.append(op.move_to)
+            except Exception:
+                paths = []
+            return "; ".join(paths) if paths else "apply_patch"
         return tool_name or ""
 
     async def _auto_lint_check(self, file_path: str) -> str:
@@ -791,7 +921,703 @@ class AgenticLoop:
         except Exception:
             return ""
 
+    async def _consult_turn_stopping(
+        self,
+        round_num: int,
+        text: str,
+        executions: "list[ToolExecution]",
+        file_registry: dict,
+        todo_all: list,
+        todo_pending: list,
+        user_task: str,
+        is_empty_dir: bool,
+    ) -> Any | None:
+        """Ask ``agent/turn-stopping`` listeners whether the turn may end.
+
+        Returns whatever the last listener returned (a ``TurnDirective`` by
+        convention), or ``None`` when nobody has an opinion — then the loop's
+        built-in rules decide exactly as before. Plugins cannot make the loop
+        unsafe: they can only answer "one more round" a bounded number of times,
+        because the loop's ``max_tool_rounds`` still applies.
+        """
+        if self.context is None:
+            return None
+        # Imported lazily so layer 3 stays usable without the runtime package.
+        from gangge.runtime import events as runtime_events
+
+        write_tools = ("write_file", "edit_file", "create_tool")
+        verify_tools = ("bash", "lint_check")
+        last_write = max(
+            (i for i, e in enumerate(executions) if e.tool_name in write_tools),
+            default=-1,
+        )
+        state = {
+            "round": round_num,
+            "text": text or "",
+            "user_task": user_task or "",
+            "is_empty_dir": is_empty_dir,
+            "has_modified_files": last_write >= 0,
+            "verified_after_write": (
+                any(
+                    e.tool_name in verify_tools and not e.is_error
+                    for e in executions[last_write + 1 :]
+                )
+                if last_write >= 0
+                else False
+            ),
+            "tool_history": [
+                {"name": e.tool_name, "is_error": e.is_error} for e in executions[-30:]
+            ],
+            "files_touched": [
+                path
+                for path, info in file_registry.items()
+                if info.get("last_action") in write_tools
+            ],
+            "todo_all": list(todo_all or []),
+            "todo_pending": list(todo_pending or []),
+        }
+        try:
+            return await self.context.serial(runtime_events.AGENT_TURN_STOPPING, state)
+        except Exception:
+            logger.exception("[Loop] agent/turn-stopping listener failed")
+            return None
+
+    async def _chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        system: str = "",
+        stream: bool = True,
+    ) -> Any:
+        """Send one request, streaming deltas to the UI when possible.
+
+        ``adapter=self.llm`` pins the instance the loop was built with, so a
+        factory default can never silently replace it — the waterfall only gets
+        to edit the request, not the identity of the caller.
+
+        Streaming is transparent to the caller: the deltas are forwarded while
+        the request is in flight, and the *assembled* response is returned.
+        ``self._last_streamed`` records how much text the UI already saw, so the
+        caller does not print the answer a second time.
+        """
+        batcher: _DeltaBatcher | None = None
+        if stream and self.config.enable_streaming and self._stream_callback is not None:
+            batcher = _DeltaBatcher(self._emit_stream_delta)
+        self._last_streamed = 0
+
+        try:
+            if self.llm_factory is not None:
+                return await self.llm_factory.chat(
+                    messages=messages,
+                    tools=tools,
+                    system=system,
+                    adapter=self.llm,
+                    on_delta=batcher,
+                )
+            if batcher is not None and getattr(self.llm, "supports_streaming", False):
+                return await self.llm.chat_stream(
+                    messages=messages,
+                    tools=tools,
+                    system=system,
+                    on_delta=batcher,
+                )
+            return await self.llm.chat(messages=messages, tools=tools, system=system)
+        finally:
+            if batcher is not None:
+                await batcher.flush()
+                self._last_streamed = batcher.emitted_chars
+
+    def _emit_lifecycle(self, event: str, payload: dict) -> None:
+        """Fire-and-forget lifecycle event. Never raises into the loop."""
+        if self.context is None:
+            return
+        try:
+            self.context.emit(event, payload)
+        except Exception:
+            logger.debug("[Loop] lifecycle listener failed: %s", event, exc_info=True)
+
+    # ── step lifecycle ──
+    # In this loop a *step* covers one model request. The tool executions that
+    # follow a request are bracketed by their own ``tool/call`` → ``tool/result``
+    # pair, which is where per-tool latency belongs. Splitting it this way keeps
+    # the step honest and needs no restructuring of the round body.
+
+    def _begin_step(self, round_num: int, n_messages: int, n_tools: int) -> dict:
+        from gangge.runtime import events as runtime_events
+
+        step = {"round": round_num, "started": time.monotonic()}
+        self._emit_lifecycle(
+            runtime_events.STEP_START,
+            {"round": round_num, "messages": n_messages, "tools": n_tools},
+        )
+        return step
+
+    def _end_step(self, step: dict | None, response: Any = None, error: str = "") -> None:
+        from gangge.runtime import events as runtime_events
+
+        started = (step or {}).get("started")
+        latency = round((time.monotonic() - started) * 1000, 1) if started else 0.0
+
+        stop_reason = ""
+        text_chars = 0
+        tool_calls = 0
+        usage: dict[str, Any] = {}
+        if response is not None:
+            stop_reason = getattr(response, "stop_reason", "") or ""
+            text_chars = len(getattr(response, "text", "") or "")
+            tool_calls = len(getattr(response, "tool_calls", None) or [])
+            usage = getattr(response, "usage", None) or {}
+
+        self._emit_lifecycle(
+            runtime_events.STEP_END,
+            {
+                "round": (step or {}).get("round", -1),
+                "latency_ms": latency,
+                "stop_reason": stop_reason,
+                "tool_calls": tool_calls,
+                "text_chars": text_chars,
+                "usage": usage,
+                "error": error,
+            },
+        )
+
+    def _repair_message_chain(self, messages: list[Message]) -> int:
+        """Close an interrupted turn so the history stays valid.
+
+        If a turn is cancelled (Ctrl+C, stop button, ``task.cancel()``) while
+        tool calls are in flight, the transcript can end with an assistant
+        message that requested N tools but carries fewer than N results.
+        Providers reject that history outright — "tool_use ids were found
+        without tool_result blocks" — so the *next* message fails before the
+        model ever sees it.
+
+        The fix mirrors DeepSeek Harness: give each unmatched ``tool_use`` a
+        synthetic error result that says the outcome is unknown and what to do
+        about it. Only the tail is repaired; a hole in the middle of the history
+        is reported instead of silently rewoven.
+
+        Returns the number of results inserted.
+        """
+        if not messages:
+            return 0
+
+        last = len(messages) - 1
+        while last >= 0 and messages[last].role != Role.ASSISTANT:
+            last -= 1
+        if last < 0 or not any(b.type == ContentType.TOOL_USE for b in messages[last].content):
+            return 0
+
+        answered = {
+            b.tool_call_id
+            for msg in messages
+            for b in msg.content
+            if b.type == ContentType.TOOL_RESULT
+        }
+        missing = [
+            b for b in messages[last].content
+            if b.type == ContentType.TOOL_USE and b.tool_call_id not in answered
+        ]
+        if not missing:
+            return 0
+
+        # Merge into the first tool-result message that already follows the
+        # assistant, so every result for one request stays in a single message.
+        target = None
+        for msg in messages[last + 1 :]:
+            if msg.role == Role.TOOL:
+                target = msg
+                break
+        if target is None:
+            target = Message(role=Role.TOOL)
+            messages.append(target)
+
+        for block in missing:
+            target.content.append(ContentBlock(
+                type=ContentType.TOOL_RESULT,
+                tool_call_id=block.tool_call_id,
+                is_error=True,
+                text=(
+                    f"[中断] 工具 `{block.tool_name}` 的调用被取消，结果未知。\n"
+                    "如果它是只读或幂等操作，可以重试；否则请先确认是否已经生效，"
+                    "避免重复执行造成副作用。"
+                ),
+            ))
+
+        logger.warning(
+            "[Loop] repaired interrupted turn: %d unmatched tool call(s) closed", len(missing)
+        )
+        self._emit_lifecycle(
+            "turn/repaired",
+            {"count": len(missing), "tools": [b.tool_name for b in missing]},
+        )
+        return len(missing)
+
     async def run(self, messages: list[Message]) -> LoopResult:
+        """Run one turn, bracketed by ``turn/start`` → ``turn/end``.
+
+        The bracket lives here rather than at each of the loop's exit points so
+        that every path — normal stop, max rounds, exception — produces exactly
+        one ``turn/end``. Subscribers (memory bank, telemetry, a stop policy)
+        can rely on that.
+        """
+        from gangge.runtime import events as runtime_events
+
+        self._emit_lifecycle(runtime_events.TURN_START, {"messages": len(messages)})
+        try:
+            result = await self._run_turn(messages)
+        except BaseException as exc:
+            # A cancelled turn can leave an assistant message that requested
+            # tools without results. Close it before anyone sends the history
+            # again, or the *next* request fails with a 400.
+            self._repair_message_chain(messages)
+            self._emit_lifecycle(
+                runtime_events.TURN_ABORTED, {"error": type(exc).__name__, "detail": str(exc)[:300]}
+            )
+            raise
+
+        self._repair_message_chain(messages)
+
+        write_tools = ("write_file", "edit_file", "create_tool")
+        touched = [
+            path
+            for path, info in self.config.file_registry.items()
+            if info.get("last_action") in write_tools
+        ]
+        self._emit_lifecycle(
+            runtime_events.TURN_END,
+            {
+                "completion_reason": result.completion_reason,
+                "total_rounds": result.total_rounds,
+                "files": touched,
+                # Only a change is worth a changelog line; a pure Q&A turn
+                # should not append anything.
+                "summary": (result.final_response or "").strip()[:300] if touched else "",
+            },
+        )
+        return result
+
+    async def _finish_turn(
+        self,
+        *,
+        final_response: str,
+        executions: list[ToolExecution],
+        round_num: int,
+        total_tokens: dict[str, int],
+        completion_reason: str,
+        has_modified_files: bool,
+        shadow_checkpoint: str | None,
+        memory_bank_update: str = "",
+    ) -> LoopResult:
+        """Close a turn: post-task checkpoint, done signal, result payload.
+
+        Every exit path used to rebuild this by hand — four near-identical
+        blocks, one of which had already drifted (it forgot ``emit_done``). One
+        constructor means a new exit path cannot get the payload wrong.
+        """
+        after_checkpoint = None
+        if has_modified_files:
+            after_checkpoint = await self._git_checkpoint(
+                f"checkpoint: {self._build_completion_summary()}"
+            )
+
+        self.emitter.emit_done(total_steps=round_num + 1)
+        return LoopResult(
+            final_response=final_response,
+            tool_executions=executions,
+            total_rounds=round_num + 1,
+            total_tokens=total_tokens,
+            extra={
+                "memory_bank_update": memory_bank_update,
+                "shadow_checkpoint_before": shadow_checkpoint or "",
+                "shadow_checkpoint_after": after_checkpoint or "",
+            },
+            completion_reason=completion_reason,
+        )
+
+    async def _execute_tool_calls(
+        self,
+        response: Any,
+        *,
+        round_num: int,
+        user_task_desc: str,
+        executions: list[ToolExecution],
+        file_registry: dict[str, Any],
+        reads_cache: dict[str, int],
+        has_modified_files: bool,
+        any_tool_succeeded: bool,
+    ) -> _ToolRound:
+        """Run every tool call of one model response, in order.
+
+        The per-call pipeline is: phase bookkeeping → permission → invoke →
+        truncate → record (todo / reads / file registry) → show. Denied calls
+        still produce a tool result, because a model that is told "denied" can
+        adapt, while a model that gets silence retries the same thing.
+
+        Returns the round's counters rather than mutating the caller's locals;
+        ``executions``, ``reads_cache`` and ``file_registry`` are shared
+        accumulators and are updated in place.
+        """
+        from gangge.layer3_agent.tools.todo import get_todo_state
+
+        results = Message(role=Role.TOOL)
+        await self._emit(ContentBlock(
+            type=ContentType.TEXT,
+            text=f"🔧 AI 调用了 {len(response.tool_calls)} 个工具:\n",
+        ))
+
+        productive = False
+        for tool_call in response.tool_calls:
+            name = tool_call.name
+            arguments = tool_call.input or {}
+
+            # Phase counter is telemetry only — visibility is decided by the
+            # registry (profile core + tool_search), not by this number.
+            self._note_tool_phase(name)
+
+            permission = await self.guard.check(
+                tool_name=name,
+                action=self._get_permission_action(name, arguments),
+                context={"input": arguments},
+            )
+            self.emitter.emit_tool_start(name, arguments)
+
+            if permission.decision == PermissionDecision.DENY:
+                results.add_tool_result(
+                    call_id=tool_call.id,
+                    result=f"权限被拒绝: {permission.reason}",
+                    is_error=True,
+                )
+                executions.append(ToolExecution(
+                    tool_name=name,
+                    input=arguments,
+                    output=f"DENIED: {permission.reason}",
+                    is_error=True,
+                    permission="denied",
+                ))
+                self.emitter.emit_tool_end(name, False)
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text=f"  ✗ {name}: 权限被拒绝\n",
+                ))
+                continue
+
+            started = time.monotonic()
+            result = await self._invoke_tool(name, arguments, tool_call.id)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+
+            output = self._truncate_tool_output(result.output)
+
+            # File changes are recorded *before* the result is sealed into the
+            # message, so the post-write lint finding travels with it. The old
+            # order appended lint to a local variable after the message had been
+            # built, which meant lint results never reached the model at all.
+            if not result.is_error and name in ("write_file", "edit_file", "apply_patch"):
+                has_modified_files = True
+                lint_note = await self._record_file_change(
+                    name, arguments, file_registry, round_num, user_task_desc
+                )
+                if lint_note:
+                    output += f"\n\n{lint_note}"
+
+            results.add_tool_result(
+                call_id=tool_call.id,
+                result=output,
+                is_error=result.is_error,
+            )
+            executions.append(ToolExecution(
+                tool_name=name,
+                input=arguments,
+                output=result.output[:2000],
+                is_error=result.is_error,
+                permission=permission.decision.value,
+                metadata=result.metadata,
+            ))
+            self.emitter.emit_tool_end(name, not result.is_error, elapsed_ms)
+
+            if result.is_error:
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text=f"  ✗ {self._display_tool_name(name)}: {result.output[:100]}...\n",
+                ))
+                continue
+
+            any_tool_succeeded = True
+            # Productive = something changed on disk or a command ran. Reads and
+            # searches never count, which is what the stall guard keys off.
+            if name in ("write_file", "edit_file", "apply_patch", "bash", "novel_write_chapter"):
+                productive = True
+
+            # ── Runtime auto-advance Todo state ──
+            # The system manages todo progress, not the model.
+            todo_state = get_todo_state()
+            if todo_state.auto_advance(name, arguments, success=True):
+                current = todo_state.get_current()
+                if current:
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text=f"  📋 自动推进: ▶️ {current['content']}\n",
+                    ))
+
+            if name == "read_file":
+                path = arguments.get("path", "")
+                if path and path not in reads_cache:
+                    reads_cache[path] = round_num + 1
+
+            await self._emit(ContentBlock(
+                type=ContentType.TEXT,
+                text=f"  ✓ {self._display_tool_name(name)}: {result.output[:100]}...\n",
+            ))
+
+        return _ToolRound(
+            results_message=results,
+            any_succeeded=any_tool_succeeded,
+            modified_files=has_modified_files,
+            productive=productive,
+        )
+
+    async def _invoke_tool(
+        self, name: str, arguments: dict[str, Any], call_id: str
+    ) -> ToolResult:
+        """Route one call to the right executor.
+
+        Four back-ends: ``ask_user`` (needs the host's prompt), MCP servers,
+        the plugin pipeline (schema repair / pruning / repeat hints), and the
+        plain registry. Anything that can block is awaited off-loop.
+        """
+        if name == "ask_user":
+            question = arguments.get("question", "")
+            await self._emit(ContentBlock(
+                type=ContentType.TEXT,
+                text=f"\n[yellow]❓ {question}[/yellow]\n",
+            ))
+            answer = (
+                await self.config.ask_user_callback(question)
+                if self.config.ask_user_callback
+                else ""
+            )
+            return ToolResult(output=answer or "(用户未提供输入)")
+
+        if "__" in name and self.mcp_manager:
+            # MCP clients are synchronous (blocking HTTP / stdio); running them
+            # on the loop thread freezes streaming and the UI for the duration
+            # of the call.
+            output = await asyncio.to_thread(self.mcp_manager.call_tool, name, arguments)
+            return ToolResult(output=output, is_error=str(output).startswith("[错误]"))
+
+        if self.tool_service is not None:
+            return await self.tool_service.execute(name, arguments, call_id)
+
+        return await self.tools.execute(name, arguments)
+
+    def _truncate_tool_output(self, output: str) -> str:
+        """Cap long output, keeping the head *and* the tail.
+
+        Errors and summaries live at the end; truncating from the front alone
+        was hiding exactly the part the model needed.
+        """
+        if (
+            not self.config.enable_tool_result_truncation
+            or len(output) <= self.config.tool_result_max_chars
+        ):
+            return output
+        max_len = self.config.tool_result_max_chars
+        head_len = max_len * 2 // 5
+        tail_len = max_len - head_len - 30
+        return (
+            output[:head_len]
+            + f"\n...(中间截断，共{len(output)}字符)...\n"
+            + output[-tail_len:]
+        )
+
+    async def _record_file_change(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        file_registry: dict[str, Any],
+        round_num: int,
+        user_task_desc: str,
+    ) -> str:
+        """Track a written file, refresh the progress journal, return lint notes."""
+        path = arguments.get("path", "")
+        lint_note = ""
+
+        if path:
+            lint_note = await self._auto_lint_check(path) or ""
+            try:
+                source = Path(path)
+                classes: list[str] = []
+                functions: list[str] = []
+                if source.exists():
+                    content = source.read_text(encoding="utf-8", errors="replace")
+                    for line in content.splitlines():
+                        stripped = line.strip()
+                        if stripped.startswith("class ") and ":" in stripped:
+                            classes.append(
+                                stripped.split("(")[0].replace("class ", "").replace(":", "").strip()
+                            )
+                        elif stripped.startswith(("def ", "async def ")):
+                            functions.append(
+                                stripped.replace("async def ", "")
+                                .replace("def ", "")
+                                .split("(")[0]
+                                .strip()
+                            )
+                    file_registry[path] = {
+                        "classes": classes[:10],
+                        "functions": functions[:15],
+                        "last_action": name,
+                        "round": round_num + 1,
+                    }
+                else:
+                    file_registry[path] = {"last_action": name, "round": round_num + 1}
+            except Exception:
+                file_registry[path] = {"last_action": name, "round": round_num + 1}
+
+        self._auto_save_progress(file_registry, round_num, user_task_desc)
+        return lint_note
+
+    def _note_tool_phase(self, tool_name: str) -> None:
+        """Keep the phase counter monotone, for status display/telemetry."""
+        from gangge.layer3_agent.tools.registry import TOOL_PHASES, DEFAULT_PHASE
+
+        tool_phase = TOOL_PHASES.get(tool_name, DEFAULT_PHASE)
+        current_phase = self.tools.get_current_phase()
+        if tool_phase > current_phase:
+            self.tools.set_phase(tool_phase)
+            logger.debug("[Loop] phase %s→%s for %s", current_phase, tool_phase, tool_name)
+
+    @staticmethod
+    def _display_tool_name(tool_name: str) -> str:
+        if "__" in tool_name:
+            server, name = tool_name.split("__", 1)
+            return f"[MCP:{server}] {name}"
+        return tool_name
+
+    async def _post_round_outcome(
+        self,
+        *,
+        response: Any,
+        round_num: int,
+        executions: list[ToolExecution],
+        total_tokens: dict[str, int],
+        has_modified_files: bool,
+        any_tool_succeeded: bool,
+        this_round_productive: bool,
+        shadow_checkpoint: str | None,
+        consecutive_readonly_rounds: int,
+        stalled_rounds: int,
+    ) -> tuple[LoopResult | None, int, int]:
+        """Decide whether the turn should end after a round's tools ran.
+
+        Three independent stop rules, in priority order:
+
+        * **read-only grace** — files are done and the model has spent three
+          rounds only reading; it is reviewing, not working.
+        * **stall guard** — something was delivered but nothing productive
+          happened for four rounds (typically a self-imposed todo the
+          environment cannot satisfy, like "run the tests" with no bash).
+        * **todos complete** — the model's own plan says it is finished, even if
+          it keeps calling tools.
+
+        Returns ``(result_or_None, readonly_counter, stall_counter)``. Counters
+        come back because they are per-turn state that survives the round.
+        """
+        from gangge.layer3_agent.tools.todo import get_todo_state
+
+        write_tools = {
+            "write_file", "edit_file", "apply_patch", "bash", "novel_write_chapter",
+            "novel_init", "novel_setup", "novel_outline", "create_tool",
+        }
+        round_had_write = any(tc.name in write_tools for tc in response.tool_calls)
+        if round_had_write:
+            consecutive_readonly_rounds = 0
+        elif any_tool_succeeded and has_modified_files:
+            consecutive_readonly_rounds += 1
+
+        if consecutive_readonly_rounds >= 3:
+            todo_state = get_todo_state()
+            if todo_state.get_pending():
+                consecutive_readonly_rounds = 0
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="⚠️ 还有待办任务未完成，请继续执行\n",
+                ))
+            elif self._is_new_task and not todo_state.get_all():
+                consecutive_readonly_rounds = 0
+                self._is_new_task = False
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="⚠️ 检测到新任务：请调用 TodoWrite 制定计划后执行\n",
+                ))
+            else:
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="📋 连续3轮仅使用只读工具，任务已完成，自动退出\n",
+                ))
+                return (
+                    await self._finish_turn(
+                        final_response="",
+                        executions=executions,
+                        round_num=round_num,
+                        total_tokens=total_tokens,
+                        completion_reason="consecutive_readonly",
+                        has_modified_files=has_modified_files,
+                        shadow_checkpoint=shadow_checkpoint,
+                    ),
+                    consecutive_readonly_rounds,
+                    stalled_rounds,
+                )
+
+        if this_round_productive:
+            stalled_rounds = 0
+        else:
+            stalled_rounds += 1
+            if stalled_rounds >= 4 and has_modified_files:
+                todo_state = get_todo_state()
+                if todo_state.get_pending():
+                    todo_state.mark_all_done()
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text="📋 核心产出已生成，但后续待办持续数轮无进展，已自动收尾\n",
+                    ))
+                    return (
+                        await self._finish_turn(
+                            final_response="核心产出已生成；剩余待办因当前环境无法继续推进，已自动收尾。",
+                            executions=executions,
+                            round_num=round_num,
+                            total_tokens=total_tokens,
+                            completion_reason="stalled_no_progress",
+                            has_modified_files=has_modified_files,
+                            shadow_checkpoint=shadow_checkpoint,
+                        ),
+                        consecutive_readonly_rounds,
+                        stalled_rounds,
+                    )
+                stalled_rounds = 0
+
+        todo_state = get_todo_state()
+        if todo_state.get_all() and not todo_state.get_pending():
+            await self._emit(ContentBlock(
+                type=ContentType.TEXT,
+                text="📋 所有任务已完成，自动退出\n",
+            ))
+            return (
+                await self._finish_turn(
+                    final_response="",
+                    executions=executions,
+                    round_num=round_num,
+                    total_tokens=total_tokens,
+                    completion_reason="all_todos_done",
+                    has_modified_files=has_modified_files,
+                    shadow_checkpoint=shadow_checkpoint,
+                ),
+                consecutive_readonly_rounds,
+                stalled_rounds,
+            )
+
+        return None, consecutive_readonly_rounds, stalled_rounds
+
+    async def _run_turn(self, messages: list[Message]) -> LoopResult:
         """Run the agentic loop — simple while loop + TodoWrite + tool layering.
 
         Core design (inspired by Claude Code):
@@ -851,11 +1677,20 @@ class AgenticLoop:
                 type=ContentType.TEXT,
                 text="📋 检测到问答请求，直接回答\n",
             ))
-            response = await self.llm.chat(
+            qa_step = self._begin_step(0, len(messages), 0)
+            response = await self._chat(
                 messages=messages,
                 tools=[],
                 system=self._build_static_system_prompt(),
             )
+            # Show the answer. Without this the Q&A path returned text the host
+            # was expected to print itself — which the desktop UI never did, so
+            # "解释一下…" asked and then appeared to hang.
+            if not self._last_streamed:
+                for block in response.content:
+                    if block.type in (ContentType.TEXT, ContentType.THINKING):
+                        await self._emit(block)
+            self._end_step(qa_step, response=response)
             self.emitter.emit_done(total_steps=1)
             return LoopResult(
                 final_response=response.text or "",
@@ -908,7 +1743,6 @@ class AgenticLoop:
         total_tokens: dict[str, int] = {"input": 0, "output": 0}
         has_modified_files = False
         any_tool_succeeded = False
-        consecutive_timeouts = 0
         consecutive_readonly_rounds = 0  # Track rounds with only read tools
         stalled_rounds = 0  # Consecutive rounds without productive output
         file_registry = dict(self.config.file_registry)  # mutable copy
@@ -986,31 +1820,15 @@ class AgenticLoop:
             system = static_system
             self.emitter.emit(EventType.THINKING, f"正在思考...")
 
-            # ── 已建 todo 或 工作目录为空 → 解锁编写阶段 ──
-            # 两种稳定判据都说明应当允许写文件：
-            #  1) 模型已用 TodoWrite 建立了计划（先规划再写）；
-            #  2) 目录为空 + 明确要产出文件（单文件小任务常用的不用建 todo，
-            #     但必须一上来就能写文件，否则会卡在探索阶段空转）。
-            from gangge.layer3_agent.tools.registry import PHASE_WRITE
-            if self.tools.get_current_phase() < PHASE_WRITE and (
-                todo_state.get_all() or is_empty_dir
-            ):
-                self.tools.set_phase(PHASE_WRITE)
+            # ── Tool exposure ──
+            # What the model can see is decided by the registry: the profile's
+            # core set, plus everything ``tool_search`` already revealed. The
+            # old keyword heuristics that lived here ("a todo mentions 测试 →
+            # unlock bash", "empty dir → unlock write") are gone: they fired on
+            # negations, misfired on real repos, and guessed where asking works
+            # better. Nothing below depends on the phase counter any more.
 
-            # ── 待办里出现“运行/测试/验证”意图 → 解锁运行阶段，把 bash 放出来 ──
-            # 写完代码后要跑测试是正常流程；一旦计划里有运行意图，就别让小模型
-            # 因为看不到 bash 而去瞎造运行工具。扫描待办标题里的关键词触发。
-            run_hint_words = ("运行", "测试", "pytest", "验证", "启动", "执行", "编译", "run", "test", "bash")
-            _todos_text = " ".join(
-                (t.get("content") or "") for t in todo_state.get_all()
-            ).lower()
-            if _todos_text and any(w in _todos_text for w in run_hint_words):
-                from gangge.layer3_agent.tools.registry import PHASE_RUN
-                if self.tools.get_current_phase() < PHASE_RUN:
-                    self.tools.set_phase(PHASE_RUN)
-                    logger.info("[Loop] 待办含运行/测试意图 → 解锁运行阶段(3)")
-
-            # ── Refresh tool definitions based on current phase ──
+            # ── Refresh tool definitions (tools may have been unlocked) ──
             current_phase = self.tools.get_current_phase()
             tool_defs = self._get_all_tool_defs(phase=current_phase)
 
@@ -1069,14 +1887,14 @@ class AgenticLoop:
             else:
                 call_messages = messages
 
-            # 1. Call LLM (with 120s timeout to prevent hanging)
-            await self._emit(ContentBlock(
-                type=ContentType.TEXT,
-                text="⏳ 等待 AI 回复...\n",
-            ))
+            # 1. Call LLM (streaming; bounded by ``llm_timeout``)
+            # No "等待回复" placeholder here any more: with streaming the first
+            # delta arrives as soon as the model starts, and a placeholder would
+            # end up glued to the front of every answer.
+            step = self._begin_step(round_num, len(call_messages), len(tool_defs))
             try:
                 response = await asyncio.wait_for(
-                    self.llm.chat(
+                    self._chat(
                         messages=call_messages,
                         tools=tool_defs,
                         system=system,
@@ -1087,6 +1905,7 @@ class AgenticLoop:
                 error_text = f"LLM 调用超时（{self.config.llm_timeout:.0f}s），请检查网络或 API 状态"
                 logger.error(error_text)
                 self.emitter.emit(EventType.ERROR, error_text)
+                self._end_step(step, error="timeout")
                 return LoopResult(
                     final_response=error_text,
                     tool_executions=executions,
@@ -1096,6 +1915,7 @@ class AgenticLoop:
                 )
             except Exception as e:
                 error_str = str(e)
+                self._end_step(step, error=error_str[:160])
                 # ── Retryable errors (rate limit / server overload) ──
                 # 429 = too many requests, 503 = service unavailable, 5xx = server error
                 is_retryable = any(code in error_str for code in ("429", "503", "502", "500"))
@@ -1158,10 +1978,18 @@ class AgenticLoop:
             assistant_msg = Message(role=Role.ASSISTANT, content=response.content)
             messages.append(assistant_msg)
 
-            # 3. Stream text content to UI
-            for block in response.content:
-                if block.type in (ContentType.TEXT, ContentType.THINKING):
-                    await self._emit(block)
+            # 3. Show text content to the UI — unless it was already streamed.
+            # ``_last_streamed`` is how many characters went out live during the
+            # call; re-emitting the assembled blocks would duplicate the answer.
+            if not self._last_streamed:
+                for block in response.content:
+                    if block.type in (ContentType.TEXT, ContentType.THINKING):
+                        await self._emit(block)
+
+            # Step ends here: the request completed. Tool execution that follows
+            # is bracketed by tool/call → tool/result, so both durations are
+            # observable without splitting the round body in two.
+            self._end_step(step, response=response)
 
             # 4. If no tool calls → check if done, then exit
             # Core principle: the model decides when to stop by not calling tools.
@@ -1179,7 +2007,11 @@ class AgenticLoop:
                     ))
 
                 # ── Only force retry in the first 2 rounds to get things started ──
-                elif round_num <= 1 and not any_tool_succeeded and not has_modified_files:
+                # "Nothing attempted yet" is the real signal, not "nothing
+                # succeeded": if the model's only call was denied or failed, it
+                # already knows and has decided to stop and report. Nudging it
+                # again just repeats the same message one round later.
+                elif round_num <= 1 and not executions and not has_modified_files:
                     # Early rounds with no tool use — give a nudge
                     self.emitter.emit(EventType.WARNING,
                                       f"第 {round_num+1} 轮未调用工具，正在引导")
@@ -1253,6 +2085,35 @@ class AgenticLoop:
                     ))
                     continue
 
+                # ── agent/turn-stopping: last vote before accepting a stop ──
+                # A weak model's most expensive failure is stopping without
+                # acting ("我已分析完毕，你可以自己改"). Plugins subscribed to
+                # this event can refuse the stop once and inject a directive.
+                directive = await self._consult_turn_stopping(
+                    round_num=round_num,
+                    text=text,
+                    executions=executions,
+                    file_registry=file_registry,
+                    todo_all=todo_state.get_all(),
+                    todo_pending=todo_state.get_pending(),
+                    user_task=user_task_desc,
+                    is_empty_dir=is_empty_dir,
+                )
+                if directive is not None and getattr(directive, "action", "") == "continue":
+                    reason = getattr(directive, "reason", "") or "继续执行"
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text=f"🔁 {reason}\n",
+                    ))
+                    messages.append(Message(
+                        role=Role.USER,
+                        content=[ContentBlock(
+                            type=ContentType.TEXT,
+                            text=getattr(directive, "message", "") or "请继续，直到任务真正完成。",
+                        )],
+                    ))
+                    continue
+
                 # No pending todos, model chose to stop → exit normally
                 # This is the Claude Code way: no tool call = done.
 
@@ -1268,358 +2129,48 @@ class AgenticLoop:
                 if mb_extracted:
                     self._save_memory_bank_update(mb_extracted)
 
-                # ── Shadow Git: post-task checkpoint ──
-                after_checkpoint = None
-                if has_modified_files:
-                    after_checkpoint = await self._git_checkpoint(
-                        f"checkpoint: {self._build_completion_summary()}"
-                    )
-
-                self.emitter.emit_done(total_steps=round_num + 1)
-                return LoopResult(
+                return await self._finish_turn(
                     final_response=final_text,
-                    tool_executions=executions,
-                    total_rounds=round_num + 1,
+                    executions=executions,
+                    round_num=round_num,
                     total_tokens=total_tokens,
-                    extra={
-                        "memory_bank_update": mb_extracted,
-                        "shadow_checkpoint_before": shadow_checkpoint or "",
-                        "shadow_checkpoint_after": after_checkpoint or "",
-                    },
                     completion_reason="model_end_turn",
+                    has_modified_files=has_modified_files,
+                    shadow_checkpoint=shadow_checkpoint,
+                    memory_bank_update=mb_extracted,
                 )
 
-            # 5. Process tool calls
-            tool_results_msg = Message(role=Role.TOOL)
-            await self._emit(ContentBlock(
-                type=ContentType.TEXT,
-                text=f"🔧 AI 调用了 {len(response.tool_calls)} 个工具:\n",
-            ))
+            # 5. Run the tools this round asked for.
+            round_io = await self._execute_tool_calls(
+                response,
+                round_num=round_num,
+                user_task_desc=user_task_desc,
+                executions=executions,
+                file_registry=file_registry,
+                reads_cache=reads_cache,
+                has_modified_files=has_modified_files,
+                any_tool_succeeded=any_tool_succeeded,
+            )
+            messages.append(round_io.results_message)
+            any_tool_succeeded = round_io.any_succeeded
+            has_modified_files = round_io.modified_files
+            this_round_productive = round_io.productive
 
-            this_round_productive = False  # reset per-round; set True on write/edit/bash success
-
-            for tool_call in response.tool_calls:
-                tool_name = tool_call.name
-                tool_input = tool_call.input
-
-                # ── Auto-advance phase if model uses a higher-phase tool ──
-                # This is intentional: the model "knows" what it needs to do,
-                # and we open the gate automatically rather than rejecting.
-                from gangge.layer3_agent.tools.registry import TOOL_PHASES, DEFAULT_PHASE
-                tool_phase = TOOL_PHASES.get(tool_name, DEFAULT_PHASE)
-                current_phase = self.tools.get_current_phase()
-                if tool_phase > current_phase:
-                    self.tools.set_phase(tool_phase)
-                    phase_names = {1: "探索", 2: "编写", 3: "运行", 4: "特殊"}
-                    logger.info(f"[Loop] Auto-advancing phase {current_phase}→{tool_phase} for {tool_name}")
-
-                action = self._get_permission_action(tool_name, tool_input)
-                self.emitter.emit_tool_start(tool_name, tool_input)
-
-                # Check permission
-                perm_result = await self.guard.check(
-                    tool_name=tool_name,
-                    action=action,
-                    context={"input": tool_input},
-                )
-
-                if perm_result.decision == PermissionDecision.DENY:
-                    tool_results_msg.add_tool_result(
-                        call_id=tool_call.id,
-                        result=f"权限被拒绝: {perm_result.reason}",
-                        is_error=True,
-                    )
-                    executions.append(ToolExecution(
-                        tool_name=tool_name,
-                        input=tool_input,
-                        output=f"DENIED: {perm_result.reason}",
-                        is_error=True,
-                        permission="denied",
-                    ))
-                    self.emitter.emit_tool_end(tool_name, False)
-                    continue
-
-                # Execute tool
-                import time
-                _t0 = time.monotonic()
-
-                # ── Special handling: ask_user ──
-                if tool_name == "ask_user":
-                    question = tool_input.get("question", "")
-                    await self._emit(ContentBlock(
-                        type=ContentType.TEXT,
-                        text=f"\n[yellow]❓ {question}[/yellow]\n",
-                    ))
-                    if self.config.ask_user_callback:
-                        user_answer = await self.config.ask_user_callback(question)
-                    else:
-                        user_answer = ""
-                    result = ToolResult(
-                        output=user_answer if user_answer else "(用户未提供输入)",
-                    )
-                # ── PATCH: MCP tool dispatch ──
-                elif "__" in tool_name and self.mcp_manager:
-                    output = self.mcp_manager.call_tool(tool_name, tool_input)
-                    result = ToolResult(output=output, is_error=output.startswith("[错误]"))
-                else:
-                    result = await self.tools.execute(tool_name, tool_input)
-
-                _elapsed = int((time.monotonic() - _t0) * 1000)
-
-                # ── Tool result truncation (keep head AND tail) ──
-                # Old behavior: truncated from the front, losing error info at bottom.
-                # New: keeps first 40% and last 60% — model can always see errors
-                # at the end of long outputs.
-                result_output = result.output
-                if (
-                    self.config.enable_tool_result_truncation
-                    and len(result_output) > self.config.tool_result_max_chars
-                ):
-                    max_len = self.config.tool_result_max_chars
-                    head_len = max_len * 2 // 5  # 40%
-                    tail_len = max_len - head_len - 30  # ~60%, minus marker length
-                    result_output = (
-                        result_output[:head_len]
-                        + f"\n...(中间截断，共{len(result_output)}字符)...\n"
-                        + result_output[-tail_len:]
-                    )
-
-                tool_results_msg.add_tool_result(
-                    call_id=tool_call.id,
-                    result=result_output,
-                    is_error=result.is_error,
-                )
-                executions.append(ToolExecution(
-                    tool_name=tool_name,
-                    input=tool_input,
-                    output=result.output[:2000],
-                    is_error=result.is_error,
-                    permission=perm_result.decision.value,
-                    metadata=result.metadata,
-                ))
-                self.emitter.emit_tool_end(tool_name, not result.is_error, _elapsed)
-
-                if not result.is_error:
-                    any_tool_succeeded = True
-                    consecutive_timeouts = 0
-                    # Productive output = a file was written/edited or a command ran
-                    if tool_name in ("write_file", "edit_file", "bash", "novel_write_chapter"):
-                        this_round_productive = True
-
-                    # ── Runtime auto-advance Todo state ──
-                    # The system manages todo progress, not the model.
-                    # When a productive tool succeeds, auto-complete current todo
-                    # and auto-start the next one.
-                    todo_state = get_todo_state()
-                    if todo_state.auto_advance(tool_name, tool_input, success=True):
-                        current = todo_state.get_current()
-                        if current:
-                            await self._emit(ContentBlock(
-                                type=ContentType.TEXT,
-                                text=f"  📋 自动推进: ▶️ {current['content']}\n",
-                            ))
-                else:
-                    is_timeout = isinstance(result.output, str) and result.output.startswith("[超时]")
-                    if is_timeout:
-                        consecutive_timeouts += 1
-                    else:
-                        consecutive_timeouts = 0
-
-                # ── Track file reads for context de-duplication ──
-                if tool_name == "read_file" and not result.is_error:
-                    path = tool_input.get("path", "")
-                    if path and path not in reads_cache:
-                        reads_cache[path] = round_num + 1
-
-                # ── Track file modifications in file registry ──
-                if tool_name in ("write_file", "edit_file") and not result.is_error:
-                    path = tool_input.get("path", "")
-                    has_modified_files = True
-
-                    # ── Auto lint check after file modification ──
-                    lint_result = await self._auto_lint_check(path)
-                    if lint_result:
-                        result_output += f"\n\n{lint_result}"
-
-                    if path:
-                        # Scan file for classes/functions
-                        try:
-                            p = Path(path)
-                            if p.exists():
-                                text = p.read_text(encoding="utf-8", errors="replace")
-                                classes: list[str] = []
-                                functions: list[str] = []
-                                for line in text.splitlines():
-                                    s = line.strip()
-                                    if s.startswith("class ") and ":" in s:
-                                        name = s.split("(")[0].replace("class ", "").replace(":", "").strip()
-                                        classes.append(name)
-                                    elif s.startswith(("def ", "async def ")):
-                                        name = s.replace("async def ", "").replace("def ", "").split("(")[0].strip()
-                                        functions.append(name)
-                                file_registry[path] = {
-                                    "classes": classes[:10],
-                                    "functions": functions[:15],
-                                    "last_action": tool_name,
-                                    "round": round_num + 1,
-                                }
-                        except Exception:
-                            file_registry[path] = {
-                                "last_action": tool_name,
-                                "round": round_num + 1,
-                            }
-
-                    self._auto_save_progress(
-                        file_registry, round_num, user_task_desc
-                    )
-
-                # Emit tool result info
-                status = "✓" if not result.is_error else "✗"
-                # ── PATCH: MCP tool display ──
-                display_name = tool_name
-                if "__" in tool_name:
-                    server, name = tool_name.split("__", 1)
-                    display_name = f"[MCP:{server}] {name}"
-                # ──────────────────────────────
-                await self._emit(ContentBlock(
-                    type=ContentType.TEXT,
-                    text=f"  {status} {display_name}: {result.output[:100]}...\n",
-                ))
-
-            messages.append(tool_results_msg)
-
-            # ── Track consecutive read-only rounds ──
-            # If the model only called read tools (read_file, grep, glob, list_dir)
-            # for several rounds after already modifying files, it's likely done
-            # and just reviewing — exit early.
-            write_tools = {"write_file", "edit_file", "bash", "novel_write_chapter",
-                           "novel_init", "novel_setup", "novel_outline", "create_tool"}
-            round_had_write = any(tc.name in write_tools for tc in response.tool_calls)
-            if round_had_write:
-                consecutive_readonly_rounds = 0
-            elif any_tool_succeeded and has_modified_files:
-                consecutive_readonly_rounds += 1
-
-            if consecutive_readonly_rounds >= 3:
-                # ── Don't exit if there are still pending todos ──
-                todo_state = get_todo_state()
-                if todo_state.get_pending():
-                    # Still have work to do — reset counter and nudge
-                    consecutive_readonly_rounds = 0
-                    await self._emit(ContentBlock(
-                        type=ContentType.TEXT,
-                        text="⚠️ 还有待办任务未完成，请继续执行\n",
-                    ))
-                elif self._is_new_task and not todo_state.get_all():
-                    # New task, just reading files to understand — don't exit yet
-                    consecutive_readonly_rounds = 0
-                    self._is_new_task = False
-                    await self._emit(ContentBlock(
-                        type=ContentType.TEXT,
-                        text="⚠️ 检测到新任务：请调用 TodoWrite 制定计划后执行\n",
-                    ))
-                else:
-                    await self._emit(ContentBlock(
-                        type=ContentType.TEXT,
-                        text="📋 连续3轮仅使用只读工具，任务已完成，自动退出\n",
-                    ))
-                    final_text = ""
-                    mb_extracted = ""
-                    after_checkpoint = None
-                    if has_modified_files:
-                        after_checkpoint = await self._git_checkpoint(
-                            f"checkpoint: {self._build_completion_summary()}"
-                        )
-                    self.emitter.emit_done(total_steps=round_num + 1)
-                    return LoopResult(
-                        final_response=final_text,
-                        tool_executions=executions,
-                        total_rounds=round_num + 1,
-                        total_tokens=total_tokens,
-                        extra={
-                            "memory_bank_update": mb_extracted,
-                            "shadow_checkpoint_before": shadow_checkpoint or "",
-                            "shadow_checkpoint_after": after_checkpoint or "",
-                        },
-                        completion_reason="consecutive_readonly",
-                    )
-
-            # ── Stall guard: core deliverable done but no progress for several rounds ──
-            # Prevents the AI from spinning forever on self-imposed todos it can't
-            # fulfil (e.g. "run tests" when bash isn't available / a plugin won't load).
-            # If we've already produced files and nothing productive happened for
-            # STALL_LIMIT rounds, mark the remaining todos done and wrap up.
-            if this_round_productive:
-                stalled_rounds = 0
-            else:
-                stalled_rounds += 1
-                if stalled_rounds >= 4 and has_modified_files:
-                    todo_state = get_todo_state()
-                    if todo_state.get_pending():
-                        todo_state.mark_all_done()
-                        await self._emit(ContentBlock(
-                            type=ContentType.TEXT,
-                            text="📋 核心产出已生成，但后续待办持续数轮无进展，已自动收尾\n",
-                        ))
-                        final_text = "核心产出已生成；剩余待办因当前环境无法继续推进，已自动收尾。"
-                        mb_extracted = ""
-                        after_checkpoint = None
-                        if has_modified_files:
-                            after_checkpoint = await self._git_checkpoint(
-                                f"checkpoint: {self._build_completion_summary()}"
-                            )
-                        self.emitter.emit_done(total_steps=round_num + 1)
-                        return LoopResult(
-                            final_response=final_text,
-                            tool_executions=executions,
-                            total_rounds=round_num + 1,
-                            total_tokens=total_tokens,
-                            extra={
-                                "memory_bank_update": mb_extracted,
-                                "shadow_checkpoint_before": shadow_checkpoint or "",
-                                "shadow_checkpoint_after": after_checkpoint or "",
-                            },
-                            completion_reason="stalled_no_progress",
-                        )
-                    else:
-                        # No pending todos but no progress — let normal flow handle it
-                        stalled_rounds = 0
-
-            # ── Check if all todos are completed → exit early ──
-            # This is the key fix: even if the model keeps calling tools
-            # (read_file, bash, etc.), if all planned tasks are done, we exit.
-            todo_state = get_todo_state()
-            todo_pending = todo_state.get_pending()
-            todo_all = todo_state.get_all()
-            if todo_all and not todo_pending:
-                # All todos completed — no need to keep looping
-                await self._emit(ContentBlock(
-                    type=ContentType.TEXT,
-                    text="📋 所有任务已完成，自动退出\n",
-                ))
-                final_text = ""
-                mb_extracted = ""
-
-                # Shadow Git checkpoint
-                after_checkpoint = None
-                if has_modified_files:
-                    after_checkpoint = await self._git_checkpoint(
-                        f"checkpoint: {self._build_completion_summary()}"
-                    )
-
-                self.emitter.emit_done(total_steps=round_num + 1)
-                return LoopResult(
-                    final_response=final_text,
-                    tool_executions=executions,
-                    total_rounds=round_num + 1,
-                    total_tokens=total_tokens,
-                    extra={
-                        "memory_bank_update": mb_extracted,
-                        "shadow_checkpoint_before": shadow_checkpoint or "",
-                        "shadow_checkpoint_after": after_checkpoint or "",
-                    },
-                    completion_reason="all_todos_done",
-                )
+            # ── Round guard: should this round be the last one? ──
+            outcome, consecutive_readonly_rounds, stalled_rounds = await self._post_round_outcome(
+                response=response,
+                round_num=round_num,
+                executions=executions,
+                total_tokens=total_tokens,
+                has_modified_files=has_modified_files,
+                any_tool_succeeded=any_tool_succeeded,
+                this_round_productive=this_round_productive,
+                shadow_checkpoint=shadow_checkpoint,
+                consecutive_readonly_rounds=consecutive_readonly_rounds,
+                stalled_rounds=stalled_rounds,
+            )
+            if outcome is not None:
+                return outcome
 
         self.emitter.emit(EventType.WARNING, "达到最大工具调用轮数限制")
 

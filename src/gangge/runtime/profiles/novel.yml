@@ -1,0 +1,10 @@
+# 小说模式：把工具面收敛到 novel profile，同时关掉浏览器（写作用不上）。
+# 注意这里没有一行 Python —— "运行模式"是组合，不是代码分支。
+name: novel
+description: 小说创作 —— Dramatica-Flow 五层流水线，工具面收敛
+bundles:
+  - base
+  - guardrails
+  - full-tools
+  - memory-bank
+patch: novel.patch.yml

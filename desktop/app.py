@@ -18,6 +18,7 @@ import difflib
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -28,6 +29,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen, Request
+
+# Module-level logger: some call sites (e.g. the thinking-model mapping) used a
+# bare ``logger`` that was never defined, so they raised NameError instead of
+# logging.
+logger = logging.getLogger("gangge")
 from urllib.error import URLError
 
 from PyQt6.QtCore import QSettings, QSize, Qt, QThread, pyqtSignal
@@ -1077,12 +1083,13 @@ class GanggeWorker(QThread):
     # ── CHANGE: 方案C — 每轮聚合消息信号 ──
     turn_complete = pyqtSignal(list)        # list[dict] 聚合后的消息列表
     ask_user_sig = pyqtSignal(str)          # question to ask user
+    permission_ask = pyqtSignal(object)     # PermissionRequest → main-thread dialog
     experimental_sig = pyqtSignal(dict)     # Experimental Mode: per-round metrics
 
     def __init__(self, llm: BaseLLM, task: str, workspace: str,
                  max_rounds: int = 30, plan_mode: bool = False,
                  project_context: str = "", system_prompt_extra: str = "",
-                 auto_allow: bool = True, batch_index: int = 0,
+                 auto_allow: bool = False, batch_index: int = 0,
                  batch_total: int = 1,
                  project_map: str = "",
                  file_registry: dict | None = None,
@@ -1121,6 +1128,10 @@ class GanggeWorker(QThread):
         self._approved_plan = ""
         self._ask_user_answer = ""
         self._ask_user_event = threading.Event()
+        # Permission dialog handshake: the worker blocks on the event while the
+        # GUI thread shows the dialog and writes the verdict back.
+        self._permission_result = PermissionDecision.DENY
+        self._permission_event = threading.Event()
 
     def cancel(self):
         self._cancel = True
@@ -1235,13 +1246,33 @@ class GanggeWorker(QThread):
         self.text_block.emit("⏱ 正在初始化 (工具注册/代码索引/系统提示)...\n", "system")
 
         async def ask_callback(req: PermissionRequest) -> PermissionDecision:
-            if self.auto_allow and req.risk.level.value in ("safe", "low"):
-                return PermissionDecision.ALLOW
+            # The policy already decided this action needs a human. The only
+            # silent path left is the explicit "auto allow" setting the user
+            # turned on themselves — never a default.
             if self._cancel:
                 return PermissionDecision.DENY
-            return PermissionDecision.ALLOW
+            if self.auto_allow:
+                return PermissionDecision.ALLOW
 
-        guard = PermissionGuard(ask_callback=ask_callback)
+            self._permission_result = PermissionDecision.DENY
+            self._permission_event.clear()
+            self.permission_ask.emit(req)
+            loop = asyncio.get_event_loop()
+            answered = await loop.run_in_executor(
+                None, lambda: self._permission_event.wait(600)
+            )
+            if not answered:
+                self.text_block.emit("⏱ 权限确认超时，已拒绝该操作\n", "system")
+                return PermissionDecision.DENY
+            return self._permission_result
+
+        guard = PermissionGuard(
+            ask_callback=ask_callback,
+            policy_path=os.environ.get("GANGGE_PERMISSION_POLICY") or None,
+        )
+        # Exposed so the GUI thread can install "always allow" rules from the
+        # permission dialog.
+        self.guard = guard
 
         from gangge.layer3_agent.tools.registry import create_tool_registry
 
@@ -1265,6 +1296,20 @@ class GanggeWorker(QThread):
         _cost = _t1 - _t0
         logging.getLogger("gangge").info("[Timing] create_tool_registry 耗时: %.1fs", _cost)
         self.text_block.emit(f"⏱ 工具注册完成: {_cost:.1f}s\n", "system")
+
+        # ── 弱模型护栏 ──
+        # 参数修复 / 结果裁剪 / 重复调用熔断。GUI 不 boot profile，只挂流水线。
+        from gangge.runtime.pipeline import attach_llm, tool_pipeline
+
+        tool_service, self._pipeline_ctx = tool_pipeline(
+            registry,
+            workspace=self.workspace,
+            max_chars=8000,
+            repeat_limit=3,
+        )
+        # The request hooks need a factory even though the GUI built its own
+        # adapter; `adapter=self.llm` pins it so routing cannot swap it out.
+        llm_factory = attach_llm(self._pipeline_ctx)
 
         extra = self.system_prompt_extra
         system_text = build_system_prompt(
@@ -1316,13 +1361,25 @@ class GanggeWorker(QThread):
                 pass
 
         # ── 3. Create loop ──
-        loop = AgenticLoop(llm=self.llm, tools=registry, permission_guard=guard, config=config, cancel_check=lambda: self._cancel)
+        loop = AgenticLoop(
+            llm=self.llm,
+            tools=registry,
+            permission_guard=guard,
+            config=config,
+            cancel_check=lambda: self._cancel,
+            tool_service=tool_service,
+            context=self._pipeline_ctx,
+            llm_factory=llm_factory,
+        )
 
         # Streaming callback
+        self._streamed_text_chars = 0
+
         async def stream_cb(block: ContentBlock):
             if self._cancel:
                 return
             if block.type == ContentType.TEXT:
+                self._streamed_text_chars += len(block.text or "")
                 self.text_block.emit(block.text, "assistant")
             elif block.type == ContentType.THINKING:
                 self.text_block.emit(block.text, "thinking")
@@ -1425,7 +1482,9 @@ class GanggeWorker(QThread):
             _t("execution_done", rounds=result.total_rounds, tools=len(result.tool_executions), input=inp, output=out, cost=cost_part),
             "system",
         )
-        if result.final_response:
+        # The answer already streamed into its bubble; emitting the assembled
+        # text again printed every response twice.
+        if result.final_response and not getattr(self, "_streamed_text_chars", 0):
             self.text_block.emit(f"\n{result.final_response}\n", "assistant")
 
         try:
@@ -5567,7 +5626,9 @@ class GanggeDesktop(QMainWindow):
         self._max_rounds_spin.hide()
 
         self._auto_allow_cb = QCheckBox(_t("cb_auto_allow"), self)
-        self._auto_allow_cb.setChecked(True)
+        # Off by default: the permission policy decides what may run silently,
+        # and this checkbox is the user's explicit "don't ask me at all".
+        self._auto_allow_cb.setChecked(False)
         self._auto_allow_cb.hide()
 
         self._auto_inject_cb = QCheckBox(_t("cb_auto_inject"), self)
@@ -5801,6 +5862,10 @@ class GanggeDesktop(QMainWindow):
         )
         self._output.anchorClicked.connect(self._on_thinking_link)
         self._thinking_bubbles: dict[str, str] = {}  # id → full text
+        # Streaming: the assistant bubble currently growing in place.
+        # "" / -1 means "no open bubble" — the next chunk starts a fresh card.
+        self._live_role: str = ""
+        self._live_pos: int = -1
         self._highlighter = OutputHighlighter(self._output.document())
         center_lay.addWidget(self._output, 1)
 
@@ -7878,6 +7943,7 @@ class GanggeDesktop(QMainWindow):
         self._worker.tool_call_sig.connect(self._on_tool_call)
         self._worker.finished.connect(lambda s: self._on_finished(s, llm))
         self._worker.ask_user_sig.connect(self._on_ask_user)
+        self._worker.permission_ask.connect(self._on_permission_ask)
         # ── Experimental Mode: forward metrics to panel ──
         self._worker.experimental_sig.connect(self._on_experimental_metrics)
         # ── Store turn messages for conversation continuity ──
@@ -8034,6 +8100,53 @@ class GanggeDesktop(QMainWindow):
             self._worker._ask_user_answer = ""
         self._worker._ask_user_event.set()
 
+    def _on_permission_ask(self, request: PermissionRequest):
+        """Ask the user about a tool call the policy marked ASK.
+
+        Runs on the GUI thread while the worker blocks on its event, so the
+        agent cannot continue behind the dialog.
+        """
+        from gangge.layer4_permission.interactive import RISK_LABELS, format_request
+
+        label, _ = RISK_LABELS.get(request.risk.level, ("低", "green"))
+        box = QMessageBox(self)
+        box.setWindowTitle("需要你的确认")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(f"AI 想要执行一个操作（风险 {label}）")
+        box.setInformativeText(format_request(request, markdown=False))
+        allow_btn = box.addButton("允许一次", QMessageBox.AcceptRole)
+        always_btn = box.addButton("本次会话总是允许", QMessageBox.YesRole)
+        deny_btn = box.addButton("拒绝", QMessageBox.RejectRole)
+        box.setDefaultButton(deny_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is always_btn:
+            from gangge.layer4_permission.rules import PermissionRule, RuleAction
+
+            guard = getattr(self._worker, "guard", None) or getattr(self._worker, "_guard", None)
+            try:
+                if guard is not None:
+                    import re as _re
+
+                    guard.add_rule(
+                        PermissionRule(
+                            action=RuleAction.ALLOW,
+                            pattern="^" + _re.escape(request.action) + "$",
+                            scope=request.scope,
+                            description=f"用户本次会话批准: {request.action[:60]}",
+                        )
+                    )
+            except Exception:
+                pass
+            self._worker._permission_result = PermissionDecision.ALLOW
+        elif clicked is allow_btn:
+            self._worker._permission_result = PermissionDecision.ALLOW
+        else:
+            self._worker._permission_result = PermissionDecision.DENY
+
+        self._worker._permission_event.set()
+
     def _on_experimental_metrics(self, data: dict):
         """Receive per-round metrics from worker thread and update Experimental panel."""
         try:
@@ -8125,10 +8238,57 @@ class GanggeDesktop(QMainWindow):
         lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
         dlg.exec()
 
+    # Zero-width marker kept at the end of an assistant bubble's body so
+    # streamed chunks can be appended inside the same card.
+    _STREAM_ANCHOR = "\u200b"
+
+    # Rich style tokens the terminal UI emits. Only these are stripped — a
+    # generic "strip anything in brackets" rule would eat markdown links and
+    # code such as ``list[int]``.
+    _RICH_TOKEN = (
+        r"(?:bright_)?(?:dim|bold|italic|underline|reverse|blink|strike|"
+        r"red|green|yellow|blue|magenta|cyan|white|black)"
+    )
+    _RICH_TAG = re.compile(
+        rf"\[/?(?:{_RICH_TOKEN})(?:\s+(?:{_RICH_TOKEN}|on\s+[a-z_]+))*\]"
+    )
+
+    @classmethod
+    def _strip_rich_markup(cls, text: str) -> str:
+        """Drop terminal-only Rich tags so they never render literally."""
+        if not text or "[" not in text:
+            return text
+        return cls._RICH_TAG.sub("", text)
+
     def _append_output(self, text: str, role: str = ""):
         """Render message as a styled bubble card."""
+        # Rich markup ([dim]…[/dim]) is a terminal-UI detail; inside this HTML
+        # card it would be shown literally.
+        text = self._strip_rich_markup(text)
+        if not text:
+            return
+
+        # ── Streaming continuation: grow the open assistant bubble ──
+        # With streaming the worker emits many small chunks. Rendering each as a
+        # card produced dozens of "🤖 AI 21:26" headers for a single answer; the
+        # chunk is inserted at the bubble's anchor instead.
+        if role == "assistant" and self._live_role == "assistant" and self._live_pos > 0:
+            doc = self._output.document()
+            if self._live_pos < doc.characterCount():
+                live = QTextCursor(doc)
+                live.setPosition(self._live_pos)
+                live.insertText(text)
+                self._live_pos += len(text)
+                tail = QTextCursor(doc)
+                tail.movePosition(QTextCursor.MoveOperation.End)
+                self._output.setTextCursor(tail)
+                self._output.ensureCursorVisible()
+                return
+            self._live_role = ""
+
         cursor = self._output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
+        start_pos = cursor.position()
 
         # ── Thinking content: render as collapsible block ──
         if role == "thinking":
@@ -8158,6 +8318,10 @@ class GanggeDesktop(QMainWindow):
                 f'<div style="color:#8b949e;font-size:12px;line-height:1.6;font-style:italic;">'
                 f'{preview}{expand_link}</div></div>'
             )
+            # Reasoning arrives as one block per model call; it never continues
+            # a previous card, so close the live bubble here.
+            self._live_role = ""
+            self._live_pos = -1
             cursor.insertHtml(bubble_html)
             self._output.setTextCursor(cursor)
             self._output.ensureCursorVisible()
@@ -8261,6 +8425,10 @@ class GanggeDesktop(QMainWindow):
             )
         else:
             margin = "margin:8px 40px 8px 8px;" if cfg["align"] == "left" else "margin:8px;"
+            # The zero-width anchor marks the end of this card's body: streamed
+            # chunks are inserted *before* it, so they inherit the card's style
+            # and the header/timestamp are rendered exactly once.
+            anchor = self._STREAM_ANCHOR if role == "assistant" else ""
             bubble_html = (
                 f'<div style="{margin}padding:10px 14px;background:{cfg["bg"]};'
                 f'border:1px solid {cfg["border"]};border-radius:10px;'
@@ -8270,12 +8438,21 @@ class GanggeDesktop(QMainWindow):
                 f'<span style="float:right;color:#484f58;">{datetime.now().strftime("%H:%M")}</span>'
                 f'</div>'
                 f'<div style="color:{cfg["text_color"]};font-size:13px;line-height:1.6;">'
-                f'{content_html}</div></div>'
+                f'{content_html}{anchor}</div></div>'
             )
 
         cursor.insertHtml(bubble_html)
         self._output.setTextCursor(cursor)
         self._output.ensureCursorVisible()
+
+        if role == "assistant":
+            found = self._output.document().find(self._STREAM_ANCHOR, start_pos)
+            if found.isNull():
+                self._live_role, self._live_pos = "", -1
+            else:
+                self._live_role, self._live_pos = "assistant", found.selectionStart()
+        else:
+            self._live_role, self._live_pos = "", -1
 
     # ── Settings ──────────────────────────────────────────────
     def _save_settings(self):
@@ -8328,7 +8505,7 @@ class GanggeDesktop(QMainWindow):
         self._max_rounds_spin.setValue(int(self._settings.value("max_rounds", 30)))
         self._plan_mode_cb.setChecked(self._settings.value("plan_mode", "false") == "true")
         self._thinking_mode_cb.setChecked(self._settings.value("thinking_mode", "false") == "true")
-        self._auto_allow_cb.setChecked(self._settings.value("auto_allow", "true") == "true")
+        self._auto_allow_cb.setChecked(self._settings.value("auto_allow", "false") == "true")
         self._auto_inject_cb.setChecked(self._settings.value("auto_inject", "true") != "false")
         self._test_verify_cb.setChecked(self._settings.value("test_verify", "true") != "false")
         self._git_commit_cb.setChecked(self._settings.value("git_commit", "true") != "false")

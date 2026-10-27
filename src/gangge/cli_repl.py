@@ -26,9 +26,9 @@ from gangge.layer3_agent.loop import AgenticLoop, LoopConfig, LoopResult
 from gangge.layer3_agent.prompts.system import build_system_prompt
 from gangge.layer4_permission.guard import (
     PermissionDecision,
-    PermissionGuard,
     PermissionRequest,
 )
+from gangge.layer4_permission.interactive import ConsolePermissionPrompter
 from gangge.layer5_llm.base import (
     BaseLLM,
     ContentBlock,
@@ -39,6 +39,8 @@ from gangge.layer5_llm.base import (
 from gangge.layer5_llm.registry import create_llm
 from gangge.layer2_session import SessionManager
 from gangge.layer2_session.storage import SessionStorage
+from gangge.runtime import bootstrap
+from gangge.runtime.profile import profile_patches
 
 logger = logging.getLogger(__name__)
 
@@ -169,15 +171,15 @@ async def execute_task(
     Returns:
         LoopResult with final response and execution records
     """
-    # ── Permission guard ──
-    async def ask_callback(req: PermissionRequest) -> PermissionDecision:
-        return PermissionDecision.ALLOW
-
-    guard = PermissionGuard(ask_callback=ask_callback)
+    # ── Permission prompts ──
+    # A real prompt, not a rubber stamp. The guard only reaches this callback for
+    # actions the policy marked ASK, so read-only work never interrupts; anything
+    # that can reach outside the workspace asks once and can be trusted for the
+    # rest of the session with "a". Pass --yes for unattended runs.
+    prompter = ConsolePermissionPrompter(console=console)
+    ask_callback = prompter
 
     # ── Tools ──
-    from gangge.layer3_agent.tools.registry import create_tool_registry
-
     async def _ask_user_callback(question: str) -> str:
         console.print(f"\n[yellow]❓ {question}[/yellow]")
         try:
@@ -186,10 +188,28 @@ async def execute_task(
             answer = ""
         return answer
 
-    registry = create_tool_registry(
+    # ── Boot the plugin tree ──
+    # The profile decides which adapters, tools and permission policy are live.
+    # Both the one-shot CLI and the TUI go through this same call, so there is
+    # exactly one place where the tree is assembled.
+    runtime = bootstrap(
+        profile=os.environ.get("GANGGE_PROFILE", "standard"),
         workspace=workspace,
-        ask_user_callback=_ask_user_callback,
+        patches=profile_patches(),
+        bindings={
+            "permission": {
+                "ask_callback": ask_callback,
+                "ask": True,
+                "policy_path": os.environ.get("GANGGE_PERMISSION_POLICY") or None,
+            },
+            "tools": {"ask_user_callback": _ask_user_callback},
+        },
     )
+    guard = runtime.permission
+    # The prompter needs the guard to install "always allow" rules for the
+    # remainder of the session.
+    prompter.attach(guard)
+    registry = runtime.tools.registry
 
     # ── Config ──
     config = LoopConfig(
@@ -234,12 +254,23 @@ async def execute_task(
             _print_info(f"项目分析跳过: {e}")
 
     # ── Loop ──
-    loop = AgenticLoop(llm=llm, tools=registry, permission_guard=guard, config=config)
+    loop = AgenticLoop(
+        llm=llm,
+        tools=registry,
+        permission_guard=guard,
+        config=config,
+        tool_service=runtime.tools,
+        context=runtime.ctx,
+        llm_factory=runtime.llm,
+    )
 
     # Streaming: print text directly (no Rich.Live — causes terminal deadlock on Windows)
+    streamed = {"chars": 0}
+
     async def stream_cb(block: ContentBlock):
         if block.type == ContentType.TEXT and block.text.strip():
             console.print(block.text, style="cyan", end="")
+            streamed["chars"] += len(block.text)
         elif block.type == ContentType.THINKING and block.text.strip():
             console.print(f"[dim]🤔 {block.text[:80]}[/dim]")
 
@@ -259,13 +290,15 @@ async def execute_task(
         status = "ok" if not exc.is_error else "err"
         _print_tool(exc.tool_name, status, exc.output[:100])
 
-    # Print final response
-    if result.final_response and not result.tool_executions:
-        _print_assistant(result.final_response)
-    elif result.final_response:
-        _print_assistant(f"\n{result.final_response}")
+    # Print final response — only if it was not already streamed to the terminal
+    if result.final_response and not streamed["chars"]:
+        if not result.tool_executions:
+            _print_assistant(result.final_response)
+        else:
+            _print_assistant(f"\n{result.final_response}")
 
     _print_summary(result, provider=provider, model=model_name)
+    runtime.dispose()
     return result
 
 
