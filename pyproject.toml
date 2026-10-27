@@ -45,6 +45,13 @@ gui = [
 web = [
     "playwright>=1.45.0",
 ]
+# demo_video: narration (edge-tts), frame capture (playwright), muxing
+# (imageio-ffmpeg ships an ffmpeg binary, so no system install is required).
+video = [
+    "playwright>=1.45.0",
+    "edge-tts>=7.3.0",
+    "imageio-ffmpeg>=0.5.1",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -52,7 +59,7 @@ dev = [
     "ruff>=0.7.0",
 ]
 all = [
-    "gangge-code[gui,web,dev]",
+    "gangge-code[gui,web,video,dev]",
 ]
 
 [project.scripts]

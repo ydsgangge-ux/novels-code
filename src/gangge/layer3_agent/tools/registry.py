@@ -72,6 +72,7 @@ TOOL_PHASES: dict[str, int] = {
     "web_fetch":      PHASE_SPECIAL,
     "package_info":   PHASE_SPECIAL,  # 结构化 API 直连（GitHub/npm/PyPI）
     "generate_image": PHASE_SPECIAL,
+    "demo_video":     PHASE_SPECIAL,  # storyboard → narrated mp4
     "browser":        PHASE_SPECIAL,
     "vision":         PHASE_EXPLORE,  # always visible — LLM needs it for image tasks
     # Novel tools — all phase 4
@@ -132,6 +133,8 @@ AGENT_PROFILES = {
             "package_info",  # 查包版本/依赖（开发常见需求）
             # Image generation (ComfyUI)
             "generate_image",
+            # Demo video (storyboard → mp4)
+            "demo_video",
         },
     },
     "novel": {
@@ -183,6 +186,22 @@ AGENT_PROFILES = {
             "vision", "generate_image",
         },
     },
+    "media": {
+        "description": "演示动画与短视频制作",
+        "detect_keywords": [
+            "视频", "短视频", "动画", "配音", "宣传片", "演示视频",
+            "分镜", "字幕", "口播", "demo_video", "tts",
+            "video", "animation", "narration",
+        ],
+        "tools": {
+            "demo_video",
+            "read_file", "list_dir", "grep", "glob", "everything_search",
+            "write_file", "edit_file", "apply_patch",
+            "TodoWrite", "ask_user", "chat_log", "tool_search",
+            # 检查渲染结果
+            "vision", "generate_image",
+        },
+    },
 }
 
 
@@ -203,7 +222,9 @@ def detect_agent_profile(user_message: str) -> str:
         return explicit
 
     msg_lower = user_message.lower()
-    profiles = ("novel", "research", "coding")
+    # Order is priority: on a tie the earlier profile wins, so the narrow,
+    # unambiguous families sit before the catch-all "coding".
+    profiles = ("novel", "research", "media", "coding")
     best = "coding"
     best_score = -1
     for p in profiles:
@@ -237,6 +258,12 @@ PROFILE_CORE: dict[str, set[str]] = {
     },
     # Novel and research sessions are domain sessions: hiding their own domain
     # tools behind a search would only add a round to every single turn.
+    "media": {
+        "demo_video",
+        "read_file", "list_dir", "grep", "glob",
+        "write_file", "edit_file", "apply_patch",
+        "TodoWrite", "ask_user", "chat_log", "tool_search",
+    },
     "novel": {
         "novel_init", "novel_setup", "novel_outline", "novel_chapter_outlines",
         "novel_new_arc", "novel_write_chapter", "novel_audit", "novel_revise",
@@ -597,6 +624,15 @@ def create_tool_registry(
             )
         except Exception as e:
             logger.warning("[Registry] Vision tool skipped: %s", e)
+
+    # ── Demo video (storyboard → narrated mp4) ──
+    try:
+        from gangge.layer3_agent.tools.demo_video import DemoVideoTool
+
+        registry.register(DemoVideoTool(llm=llm, workspace=workspace))
+        logger.info("[Registry] demo_video registered — storyboard → mp4")
+    except Exception as e:
+        logger.warning("[Registry] demo_video skipped: %s", e)
 
     create_tool = CreateToolTool(workspace=workspace, registry=registry)
     registry.register(create_tool)
