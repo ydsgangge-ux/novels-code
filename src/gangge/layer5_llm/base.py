@@ -184,6 +184,11 @@ class BaseLLM(ABC):
     # the UI feel worse than honest blocking output.
     supports_streaming: bool = True
 
+    # Whether the model accepts ``ContentType.IMAGE`` blocks. Defaults to False
+    # so an unknown model fails loudly with "configure VISION_MODEL" instead of
+    # sending an image block the provider answers with a 400.
+    supports_vision: bool = False
+
     def __init__(
         self,
         model: str,

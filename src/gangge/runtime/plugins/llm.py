@@ -27,6 +27,8 @@ class LLMFactory:
         self.ctx = ctx
         self.config = config or {}
         self._default: Any = None
+        self._vision: Any = None
+        self._vision_resolved = False
         self._adapters: list[Any] = []
         self._calls = 0
         self._latency_ms_total = 0.0
@@ -51,6 +53,32 @@ class LLMFactory:
             self._default = self.create()
         return self._default
 
+    def create_vision(self) -> Any | None:
+        """Dedicated vision adapter, or ``None`` when none is configured.
+
+        ``None`` means "let the main model handle images" — resolve that by
+        checking ``supports_vision`` on :meth:`default`. A broken vision
+        configuration is logged rather than swallowed into a later 400.
+        """
+        if self._vision_resolved:
+            return self._vision
+        self._vision_resolved = True
+        try:
+            from gangge.layer5_llm.registry import create_vision_llm
+
+            adapter = create_vision_llm()
+        except Exception as e:  # noqa: BLE001 - a missing key must not block boot
+            logger.warning("[llm] vision adapter unavailable: %s", e)
+            self._vision = None
+            return None
+        if adapter is not None:
+            self._adapters.append(adapter)
+            logger.info(
+                "[llm] vision adapter: %s/%s", type(adapter).__name__, adapter.model
+            )
+        self._vision = adapter
+        return adapter
+
     async def close(self) -> None:
         for adapter in {id(a): a for a in self._adapters}.values():
             try:
@@ -59,6 +87,8 @@ class LLMFactory:
                 logger.debug("[llm] adapter close failed", exc_info=True)
         self._adapters.clear()
         self._default = None
+        self._vision = None
+        self._vision_resolved = False
 
     # -- convenience: the event-aware call path -----------------
 

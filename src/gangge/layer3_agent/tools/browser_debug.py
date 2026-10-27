@@ -217,7 +217,24 @@ class BrowserDebugTool(BaseTool):
                 },
                 "selector": {
                     "type": "string",
-                    "description": "[click/fill] CSS 选择器，如 '#btn' / '.content'",
+                    "description": (
+                        "[click/fill] CSS 或 Playwright 选择器，如 '#btn' / '.content'。"
+                        "有 role+name 时优先用语义定位，CSS 选择器容易因改版失效"
+                    ),
+                },
+                "role": {
+                    "type": "string",
+                    "description": (
+                        "[click/fill] 语义定位：ARIA role（button / link / textbox / checkbox "
+                        "/ menuitem 等），与 name 配合。值直接取自 dom_snapshot 里的 role"
+                    ),
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "[click/fill] 语义定位：元素的可访问名称（可见文本或 aria-label），"
+                        "如「登录」「搜索」。与 role 配合使用"
+                    ),
                 },
                 "value": {
                     "type": "string",
@@ -263,10 +280,20 @@ class BrowserDebugTool(BaseTool):
             elif action == "dom_snapshot":
                 return await self._dom_snapshot(session)
             elif action == "click":
-                return await self._click(session, kwargs.get("selector", ""))
+                return await self._click(
+                    session,
+                    kwargs.get("selector", ""),
+                    kwargs.get("role", ""),
+                    kwargs.get("name", ""),
+                )
             elif action == "fill":
-                return await self._fill(session, kwargs.get("selector", ""),
-                                        kwargs.get("value", ""))
+                return await self._fill(
+                    session,
+                    kwargs.get("selector", ""),
+                    kwargs.get("value", ""),
+                    kwargs.get("role", ""),
+                    kwargs.get("name", ""),
+                )
             elif action == "scroll":
                 return await self._scroll(session, kwargs.get("direction", "down"))
             elif action == "evaluate":
@@ -321,7 +348,8 @@ class BrowserDebugTool(BaseTool):
                 output=(
                     f"截图已保存: {shot_path}\n"
                     f"尺寸: {size_kb} KB | 全页: {'是' if full_page else '否'}\n"
-                    f"→ 可用 vision 工具分析此截图，或告知用户查看。"
+                    f"→ 用 vision 工具分析此截图：image_path=\"{shot_path}\"；"
+                    f"或告知用户查看。"
                 ),
                 metadata={"screenshot_path": str(shot_path)},
             )
@@ -346,13 +374,17 @@ class BrowserDebugTool(BaseTool):
         if page.url == "about:blank":
             return ToolResult(output="当前没有打开的页面，请先 navigate", is_error=True)
 
+        hint = (
+            "\n→ 交互优先用 click/fill 的 role + name 参数，两者直接取自上面这棵树；"
+            "不要根据标签结构猜 CSS 选择器（改版即失效）。"
+        )
         try:
             # Playwright 1.60+ 用 aria_snapshot()（返回 Yaml 格式的 accessibility tree）
             snap = await page.aria_snapshot()
             if snap:
                 if len(snap) > 8000:
                     snap = snap[:8000] + "\n... (已截断)"
-                return ToolResult(output=f"DOM 快照 (aria snapshot):\n{snap}")
+                return ToolResult(output=f"DOM 快照 (aria snapshot，语义树):\n{snap}{hint}")
 
             # 退化方案：返回简化后的 body innerHTML
             html = await page.evaluate("document.body ? document.body.innerHTML : ''")
@@ -366,29 +398,74 @@ class BrowserDebugTool(BaseTool):
         except Exception as e:
             return ToolResult(output=f"DOM 快照失败: {e}", is_error=True)
 
-    async def _click(self, session: _BrowserSession, selector: str) -> ToolResult:
-        if not selector:
-            return ToolResult(output="click 需要 selector 参数", is_error=True)
-        page = await session.get_page()
-        try:
-            await page.click(selector, timeout=5000)
-            return ToolResult(output=f"已点击: {selector}")
-        except asyncio.TimeoutError:
-            return ToolResult(output=f"未找到元素或点击超时: {selector}", is_error=True)
-        except Exception as e:
-            return ToolResult(output=f"点击失败: {e}", is_error=True)
+    @staticmethod
+    def _describe(selector: str, role: str, name: str) -> str:
+        """Label used in results and error messages."""
+        if role or name:
+            parts = []
+            if role:
+                parts.append(f"role={role}")
+            if name:
+                parts.append(f'name="{name}"')
+            return " ".join(parts)
+        return f"selector={selector}"
 
-    async def _fill(self, session: _BrowserSession, selector: str, value: str) -> ToolResult:
-        if not selector:
-            return ToolResult(output="fill 需要 selector 参数", is_error=True)
+    @staticmethod
+    def _locator(page: Any, selector: str, role: str, name: str) -> Any:
+        """Semantic locator first, CSS second.
+
+        ``get_by_role`` survives class renames and DOM reshuffles; a CSS
+        selector does not. Callers pass whichever they have, and the a11y
+        snapshot hands them exactly the role/name pair this consumes.
+        """
+        if role or name:
+            return page.get_by_role(role or "button", name=name or None).first
+        return page.locator(selector).first
+
+    async def _click(
+        self,
+        session: _BrowserSession,
+        selector: str,
+        role: str = "",
+        name: str = "",
+    ) -> ToolResult:
+        if not selector and not role and not name:
+            return ToolResult(
+                output="click 需要 selector，或 role+name 语义定位（推荐后者）",
+                is_error=True,
+            )
         page = await session.get_page()
+        label = self._describe(selector, role, name)
         try:
-            await page.fill(selector, value, timeout=5000)
-            return ToolResult(output=f"已填入 {selector}: {value[:50]}")
+            await self._locator(page, selector, role, name).click(timeout=5000)
+            return ToolResult(output=f"已点击: {label}")
         except asyncio.TimeoutError:
-            return ToolResult(output=f"未找到元素或填表超时: {selector}", is_error=True)
+            return ToolResult(output=f"未找到元素或点击超时: {label}", is_error=True)
         except Exception as e:
-            return ToolResult(output=f"填表失败: {e}", is_error=True)
+            return ToolResult(output=f"点击失败 ({label}): {e}", is_error=True)
+
+    async def _fill(
+        self,
+        session: _BrowserSession,
+        selector: str,
+        value: str,
+        role: str = "",
+        name: str = "",
+    ) -> ToolResult:
+        if not selector and not role and not name:
+            return ToolResult(
+                output="fill 需要 selector，或 role+name 语义定位（推荐后者）",
+                is_error=True,
+            )
+        page = await session.get_page()
+        label = self._describe(selector, role, name)
+        try:
+            await self._locator(page, selector, role, name).fill(value, timeout=5000)
+            return ToolResult(output=f"已填入 {label}: {value[:50]}")
+        except asyncio.TimeoutError:
+            return ToolResult(output=f"未找到元素或填表超时: {label}", is_error=True)
+        except Exception as e:
+            return ToolResult(output=f"填表失败 ({label}): {e}", is_error=True)
 
     async def _scroll(self, session: _BrowserSession, direction: str) -> ToolResult:
         page = await session.get_page()

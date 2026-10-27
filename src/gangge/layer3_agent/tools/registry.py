@@ -577,16 +577,26 @@ def create_tool_registry(
     registry.register(AskUserTool(ask_callback=ask_user_callback))
 
     # ── Vision Tool (multimodal image recognition) ──
-    if multimodal_llm is not None:
+    # Registered whenever *some* model can see images: a dedicated vision
+    # adapter, or the main model itself when it declares ``supports_vision``.
+    # The tool picks the route per call, so the registry needs no knowledge of
+    # which one is live.
+    if multimodal_llm is not None or llm is not None:
         try:
             from gangge.layer3_agent.tools.vision import VisionTool
-            vt = VisionTool(multimodal_llm=multimodal_llm)
-            if attachments:
-                vt.set_attachments(attachments)
+
+            vt = VisionTool(
+                multimodal_llm=multimodal_llm,
+                fallback_llm=llm,
+                attachments=attachments,
+            )
             registry.register(vt)
-            logger.info("[Registry] Vision tool activated — multimodal LLM available")
+            logger.info(
+                "[Registry] Vision tool registered (route=%s)",
+                "dedicated" if multimodal_llm is not None else "main-model",
+            )
         except Exception as e:
-            logger.debug("[Registry] Vision tool skipped: %s", e)
+            logger.warning("[Registry] Vision tool skipped: %s", e)
 
     create_tool = CreateToolTool(workspace=workspace, registry=registry)
     registry.register(create_tool)

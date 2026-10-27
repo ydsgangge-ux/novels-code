@@ -35,6 +35,9 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 class AnthropicLLM(BaseLLM):
     """Anthropic Claude LLM adapter."""
 
+    # Every Claude 3+ model accepts image blocks.
+    supports_vision = True
+
     def __init__(self, api_key: str, **kwargs: Any):
         super().__init__(**kwargs)
         self.client = anthropic.AsyncAnthropic(api_key=api_key)

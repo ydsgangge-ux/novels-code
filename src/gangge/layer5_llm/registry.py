@@ -187,3 +187,88 @@ def create_llm(provider: str | None = None) -> BaseLLM:
             f"Supported: anthropic, openai, deepseek, qwen, zhipu, moonshot, "
             f"baichuan, yi, minimax, stepfun, siliconflow, mimo, ollama, custom"
         )
+
+
+# Default endpoints for the vision route. Non-Anthropic entries all speak the
+# OpenAI chat-completions dialect, so one adapter covers them.
+_VISION_BASE_URLS: dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "moonshot": "https://api.moonshot.cn/v1",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+    "stepfun": "https://api.stepfun.com/v1",
+    "yi": "https://api.lingyiwanwu.com/v1",
+    "minimax": "https://api.minimax.chat/v1",
+    "baichuan": "https://api.baichuan-ai.com/v1",
+    "mimo": "https://api.xiaomimimo.com/v1",
+    "ollama": "http://localhost:11434/v1",
+    "custom": "",
+}
+
+
+def create_vision_llm() -> BaseLLM | None:
+    """Build a dedicated vision adapter from ``VISION_*`` environment variables.
+
+    Returns ``None`` when nothing vision-specific is configured — the caller
+    then falls back to the main model, which is only valid if that model
+    declares ``supports_vision``.
+
+    ``VISION_MODEL`` alone is enough: provider, base URL and API key are
+    inherited from the main configuration, so pointing an existing
+    SiliconFlow / Qwen / Zhipu setup at a VL model is one line in ``.env``.
+    Set ``VISION_PROVIDER`` only when the vision model lives elsewhere.
+    """
+    _load_env()
+
+    model = _env("VISION_MODEL").strip()
+    provider = _env("VISION_PROVIDER").strip().lower()
+    if not model and not provider:
+        return None
+    if not model:
+        raise ValueError("VISION_MODEL is not set (required when VISION_PROVIDER is set)")
+
+    provider = provider or (_env("LLM_PROVIDER") or "anthropic").lower()
+    max_tokens = int(_env("VISION_MAX_TOKENS") or _env("MAX_TOKENS", "4096"))
+    temperature = float(_env("VISION_TEMPERATURE") or _env("TEMPERATURE", "0.0"))
+
+    if provider == "anthropic":
+        api_key = _env("VISION_API_KEY") or _env("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY is not set")
+        return AnthropicLLM(
+            api_key=api_key,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    if provider not in _VISION_BASE_URLS:
+        raise ValueError(
+            f"Unknown VISION_PROVIDER: {provider}. Supported: anthropic, "
+            + ", ".join(sorted(_VISION_BASE_URLS))
+        )
+
+    upper = provider.upper()
+    base_url = (
+        _env("VISION_BASE_URL")
+        or _env(f"{upper}_BASE_URL")
+        or _VISION_BASE_URLS[provider]
+    )
+    api_key = (
+        _env("VISION_API_KEY")
+        or _env(f"{upper}_API_KEY")
+        or ("ollama" if provider == "ollama" else "not-needed")
+    )
+    if not base_url:
+        raise ValueError(f"VISION_BASE_URL is not set for provider {provider}")
+
+    return OpenAICompatLLM(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        supports_vision=True,
+    )

@@ -246,6 +246,9 @@ class GanggeApp(App):
                 bindings={
                     "tools": {
                         "ask_user_callback": _ask_user_callback,
+                        # None = auto: a dedicated vision adapter is built from
+                        # VISION_* env vars; otherwise the main model handles
+                        # images when it declares supports_vision.
                         "multimodal_llm": None,
                         "attachments": [],
                     },

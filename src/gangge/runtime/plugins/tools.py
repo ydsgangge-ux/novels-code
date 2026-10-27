@@ -193,17 +193,38 @@ def _blocked_reason(verdict: Any) -> str | None:
     return str(getattr(verdict, "reason", raw))
 
 
+def _vision_adapter(ctx: Context, config: dict[str, Any]) -> Any | None:
+    """Explicit ``multimodal_llm`` binding wins; otherwise ask the LLM seam.
+
+    ``None`` is a valid answer and means "no dedicated model": the vision tool
+    then falls back to the main model when that model accepts images.
+    """
+    explicit = config.get("multimodal_llm")
+    if explicit is not None:
+        return explicit
+    factory = ctx.get("llm")
+    if factory is None:
+        return None
+    try:
+        return factory.create_vision()
+    except Exception as e:  # noqa: BLE001 - a bad VISION_MODEL must not block boot
+        logger.warning("[tools] vision adapter unavailable: %s", e)
+        return None
+
+
 def apply(ctx: Context, config: dict[str, Any]) -> None:
     workspace = config.get("workspace") or ctx.data.get("workspace") or ""
     ask_callback = config.get("ask_user_callback")
 
-    lazy_llm = _LazyLLM(ctx) if config.get("novel", True) else None
+    # Built even when the novel pipeline is off: the vision tool needs it as the
+    # fallback route, and the proxy resolves nothing until a call actually lands.
+    lazy_llm = _LazyLLM(ctx)
     registry = create_tool_registry(
         workspace=str(workspace),
         ask_user_callback=ask_callback,
         load_plugins=bool(config.get("load_plugins", True)),
         llm=lazy_llm,
-        multimodal_llm=config.get("multimodal_llm"),
+        multimodal_llm=_vision_adapter(ctx, config),
         attachments=config.get("attachments"),
     )
 

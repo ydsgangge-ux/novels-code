@@ -38,9 +38,33 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 class OpenAICompatLLM(BaseLLM):
     """OpenAI-compatible LLM adapter (OpenAI / DeepSeek / Ollama)."""
 
-    def __init__(self, base_url: str, api_key: str = "not-needed", **kwargs: Any):
+    # Name fragments of models known to accept image blocks on OpenAI-compatible
+    # endpoints. Everything else is treated as text-only, so the vision tool can
+    # say "configure VISION_MODEL" rather than surface a provider 400.
+    _VISION_HINTS = (
+        "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "chatgpt-4o",
+        "claude", "gemini", "llava", "pixtral", "internvl", "minicpm-v",
+        "-vl", "vl-", "vision", "glm-4v", "glm-4.5v", "omni", "qvq",
+        "step-1v", "yi-vision",
+    )
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "not-needed",
+        supports_vision: bool | None = None,
+        **kwargs: Any,
+    ):
         super().__init__(**kwargs)
         self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        if supports_vision is None:
+            supports_vision = self._guess_vision(self.model)
+        self.supports_vision = supports_vision
+
+    @classmethod
+    def _guess_vision(cls, model: str) -> bool:
+        lowered = (model or "").lower()
+        return any(hint in lowered for hint in cls._VISION_HINTS)
 
     def _convert_messages(
         self, messages: list[Message]
