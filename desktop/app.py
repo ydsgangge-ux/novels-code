@@ -4942,6 +4942,345 @@ def update_memory_bank(workspace: str, progress_update: str, changelog_update: s
 
 
 # ═════════════════════════════════════════════════════════════════
+#  MCP Servers Dialog — pick which MCP servers take part in this session
+# ═════════════════════════════════════════════════════════════════
+
+class MCPProbeWorker(QThread):
+    """在后台连一次 server，量出工具数与 token，避免卡住 UI。"""
+
+    probed = pyqtSignal(str, int, int)   # name, 工具数, tokens
+    failed = pyqtSignal(str, str)        # name, 错误
+
+    def __init__(self, servers: list[dict], parent=None):
+        super().__init__(parent)
+        self._servers = servers
+
+    def run(self):
+        from gangge.layer4_tools.mcp_client import MCPClientManager, MCPServerConfig
+
+        for entry in self._servers:
+            name = str(entry.get("name") or "")
+            manager = None
+            try:
+                manager = MCPClientManager([MCPServerConfig(
+                    name=name,
+                    transport=str(entry.get("transport") or "stdio"),
+                    command=str(entry.get("command") or ""),
+                    args=[str(a) for a in (entry.get("args") or [])],
+                    env={str(k): str(v) for k, v in (entry.get("env") or {}).items()},
+                    url=str(entry.get("url") or ""),
+                    enabled=True,
+                    timeout=int(entry.get("timeout") or 30),
+                )])
+                manager.connect_all()
+                self.probed.emit(name, len(manager.get_all_tools()), manager.estimate_tokens())
+            except Exception as e:
+                self.failed.emit(name, str(e)[:160])
+            finally:
+                if manager is not None:
+                    try:
+                        manager.disconnect_all()
+                    except Exception:
+                        pass
+
+
+class MCPServersDialog(QDialog):
+    """勾选要启用的 MCP server。
+
+    没勾选的连进程都不会启动，因此不占任何 token——这正是这个对话框存在的理由：
+    MCP 工具定义随**每次请求**发送，多挂一个 server 就是持续付费。
+    """
+
+    def __init__(self, workspace, parent=None):
+        super().__init__(parent)
+        from gangge.layer4_tools.mcp_client import load_merged_config
+
+        self._workspace = Path(workspace) if workspace else Path(".")
+        self._document, self._sources = load_merged_config(self._workspace)
+        self._checks: dict[str, QCheckBox] = {}
+        self._details: dict[str, QLabel] = {}
+        self._measured: dict[str, tuple[int, int]] = {}
+        self._worker: MCPProbeWorker | None = None
+        self._probe_btn: QPushButton | None = None
+        self._summary: QLabel | None = None
+
+        self.setWindowTitle("MCP 服务")
+        self.setMinimumWidth(660)
+        self.setStyleSheet(
+            "QDialog{background:#0d1117;}"
+            "QLabel{color:#c9d1d9;}"
+            "QCheckBox{color:#c9d1d9;}"
+        )
+        self._load()
+        self._build()
+
+    # ── 数据 ──────────────────────────────────────────────
+
+    def _load(self) -> None:
+        from gangge.layer4_tools.mcp_client import load_merged_config
+
+        self._document, self._sources = load_merged_config(self._workspace)
+
+    @property
+    def servers(self) -> list[dict]:
+        servers = self._document.get("servers")
+        if not isinstance(servers, list):
+            return []
+        return [s for s in servers if isinstance(s, dict)]
+
+    def selected_names(self) -> list[str]:
+        return [name for name, box in self._checks.items() if box.isChecked()]
+
+    # ── UI ────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
+
+        title = QLabel("MCP 服务（勾选后启用）")
+        title.setStyleSheet("font-size:15px;font-weight:600;color:#e6edf3;")
+        layout.addWidget(title)
+
+        hint = QLabel(
+            "没勾选的服务不会启动进程、不会产生工具定义，因此不占 token。\n"
+            "工具多的服务（如 GitHub 26 个工具 ≈ 4.3k tokens）默认延迟揭示："
+            "模型用 tool_search 搜到之后才展开；工具很少的会直接可见。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#8b949e;font-size:12px;")
+        layout.addWidget(hint)
+
+        frame = QFrame()
+        frame.setStyleSheet(
+            "QFrame{background:#161b22;border:1px solid #30363d;border-radius:6px;}"
+        )
+        rows = QVBoxLayout(frame)
+
+        if not self.servers:
+            from gangge.layer4_tools.mcp_client import GLOBAL_CONFIG_PATH, PROJECT_CONFIG_REL
+
+            empty = QLabel(
+                "还没有可用的 MCP 配置：\n"
+                f"  用户级（所有项目可用）: {GLOBAL_CONFIG_PATH}\n"
+                f"  项目级（仅本项目）    : {self._workspace / PROJECT_CONFIG_REL}\n\n"
+                "点下面的按钮会生成一份用户级模板（Blender / GitHub / memory，默认不启用），"
+                "之后就能在这里勾选。"
+            )
+            empty.setWordWrap(True)
+            rows.addWidget(empty)
+            create = QPushButton("生成用户级模板")
+            create.clicked.connect(self._create_template)
+            rows.addWidget(create)
+        else:
+            from gangge.layer4_tools.mcp_client import source_label
+
+            for entry in self.servers:
+                name = str(entry.get("name") or "?")
+                row = QHBoxLayout()
+
+                check = QCheckBox(name)
+                check.setChecked(bool(entry.get("enabled")))
+                check.setMinimumWidth(190)
+                check.stateChanged.connect(self._refresh_summary)
+                self._checks[name] = check
+                row.addWidget(check)
+
+                transport = str(entry.get("transport") or "stdio")
+                kind = QLabel(transport)
+                kind.setStyleSheet("color:#8b949e;font-size:12px;")
+                kind.setMinimumWidth(60)
+                row.addWidget(kind)
+
+                # 标明这一项来自哪一层：改的是本项目的覆盖，还是用户级定义
+                origin = QLabel(source_label(self._sources.get(name, Path()), self._workspace))
+                origin.setStyleSheet("color:#58a6ff;font-size:12px;")
+                origin.setMinimumWidth(56)
+                row.addWidget(origin)
+
+                detail = QLabel("未测量（点“测试连接”可量出 token）")
+                detail.setStyleSheet("color:#8b949e;font-size:12px;")
+                self._details[name] = detail
+                row.addWidget(detail, 1)
+
+                rows.addLayout(row)
+            # 行贴顶排列，别让 QVBoxLayout 把 N 行摊成等高
+            rows.addStretch(1)
+
+        layout.addWidget(frame, 1)
+
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color:#8b949e;font-size:12px;")
+        layout.addWidget(self._summary)
+
+        buttons = QHBoxLayout()
+        all_btn = QPushButton("全选")
+        all_btn.clicked.connect(lambda: self._set_all(True))
+        none_btn = QPushButton("全不选")
+        none_btn.clicked.connect(lambda: self._set_all(False))
+        self._probe_btn = QPushButton("测试连接")
+        self._probe_btn.clicked.connect(self._probe)
+        buttons.addWidget(all_btn)
+        buttons.addWidget(none_btn)
+        buttons.addWidget(self._probe_btn)
+        buttons.addStretch(1)
+
+        box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        buttons.addWidget(box)
+        layout.addLayout(buttons)
+
+        self._refresh_summary()
+
+    def _refresh_summary(self, *_args) -> None:
+        selected = self.selected_names()
+        if not selected:
+            text = "当前：不启用任何 MCP 服务（0 token）"
+        else:
+            parts = []
+            total = 0
+            for name in selected:
+                measured = self._measured.get(name)
+                if measured:
+                    parts.append(f"{name}({measured[0]} 个工具 ≈ {measured[1]} tokens)")
+                    total += measured[1]
+                else:
+                    parts.append(name)
+            suffix = f" ≈ {total} tokens/请求" if total else ""
+            text = f"当前：{len(selected)} 个服务已勾选 — {'、'.join(parts)}{suffix}"
+        if self._summary is not None:
+            self._summary.setText(text)
+
+    def _set_all(self, state: bool) -> None:
+        for box in self._checks.values():
+            box.setChecked(state)
+        self._refresh_summary()
+
+    def _create_template(self) -> None:
+        """生成**用户级**模板：配一次，所有项目都能勾选使用（默认全部不启用）。"""
+        from gangge.layer4_tools.mcp_client import GLOBAL_CONFIG_PATH, upsert_server
+
+        templates = [
+            {
+                "name": "blender",
+                "transport": "stdio",
+                "command": "uvx",
+                "args": ["mcp-for-blender"],
+                "enabled": False,
+                "timeout": 60,
+            },
+            {
+                "name": "github",
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": ""},
+                "enabled": False,
+                "timeout": 60,
+            },
+            {
+                "name": "memory",
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-memory"],
+                "enabled": False,
+                "timeout": 60,
+            },
+        ]
+        try:
+            for entry in templates:
+                upsert_server(entry, self._workspace, scope="global")
+        except Exception as e:
+            QMessageBox.critical(self, "MCP 服务", f"写入失败：{e}")
+            return
+        QMessageBox.information(
+            self,
+            "MCP 服务",
+            f"已生成用户级模板（全部未启用）：\n{GLOBAL_CONFIG_PATH}\n\n"
+            "按需修改 command / args / 凭据后，重新打开本窗口即可勾选。",
+        )
+        self.reject()
+
+    # ── 测量 ──────────────────────────────────────────────
+
+    def _probe(self) -> None:
+        if self._worker is not None:
+            return
+        selected = set(self.selected_names())
+        targets = [e for e in self.servers if str(e.get("name")) in selected]
+        if not targets:
+            QMessageBox.information(self, "MCP 服务", "先勾选要测试的服务。")
+            return
+        for entry in targets:
+            label = self._details.get(str(entry.get("name")))
+            if label is not None:
+                label.setText("测试中…")
+        if self._probe_btn is not None:
+            self._probe_btn.setEnabled(False)
+
+        self._worker = MCPProbeWorker(targets, self)
+        self._worker.probed.connect(self._on_probed)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._on_probe_done)
+        self._worker.start()
+
+    def _on_probed(self, name: str, count: int, tokens: int) -> None:
+        self._measured[name] = (count, tokens)
+        label = self._details.get(name)
+        if label is not None:
+            label.setText(
+                f"{count} 个工具 ≈ {tokens} tokens/请求" if count else "连上了，但这个 server 没有工具"
+            )
+        self._refresh_summary()
+
+    def _on_failed(self, name: str, error: str) -> None:
+        label = self._details.get(name)
+        if label is not None:
+            label.setText(f"连接失败：{error}")
+
+    def _on_probe_done(self) -> None:
+        self._worker = None
+        if self._probe_btn is not None:
+            self._probe_btn.setEnabled(True)
+
+    # ── 保存 ──────────────────────────────────────────────
+
+    def accept(self) -> None:
+        """只写**项目级**配置：用户级定义只写一条最小覆盖 {name, enabled}。
+
+        这样在 A 项目关掉 Blender，不会把 B 项目的 Blender 也关掉。
+        """
+        from gangge.layer4_tools.mcp_client import save_selection
+
+        states = {name: box.isChecked() for name, box in self._checks.items()}
+        try:
+            save_selection(self._workspace, states)
+        except Exception as e:
+            QMessageBox.critical(self, "MCP 服务", f"写入失败：{e}")
+            return
+        # 配置文件是唯一真源：清掉可能残留的会话级变量，避免"改了却没生效"
+        os.environ.pop("GANGGE_MCP_SERVERS", None)
+        super().accept()
+
+    def result_text(self) -> str:
+        selected = self.selected_names()
+        if not selected:
+            return "MCP: 未启用任何服务（0 token）"
+        parts = []
+        total = 0
+        for name in selected:
+            measured = self._measured.get(name)
+            if measured:
+                parts.append(f"{name}({measured[0]} 个工具)")
+                total += measured[1]
+            else:
+                parts.append(name)
+        suffix = f"，约 {total} tokens/请求" if total else ""
+        return f"MCP 已启用: {'、'.join(parts)}{suffix}"
+
+
+# ═════════════════════════════════════════════════════════════════
 #  Git Remote Dialog — bind existing repo or create new on GitHub
 # ═════════════════════════════════════════════════════════════════
 
@@ -5595,6 +5934,11 @@ class GanggeDesktop(QMainWindow):
         a = QAction(_t("menu_open_workspace"), self)
         a.setShortcut(QKeySequence("Ctrl+O"))
         a.triggered.connect(self._browse_workspace)
+        tm.addAction(a)
+        tm.addSeparator()
+        a = QAction("MCP 服务(M)…", self)
+        a.setShortcut(QKeySequence("Ctrl+M"))
+        a.triggered.connect(self._open_mcp_dialog)
         tm.addAction(a)
 
         hm = mb.addMenu(_t("menu_help"))
@@ -7096,6 +7440,16 @@ class GanggeDesktop(QMainWindow):
             self._file_browser.set_root(path)
             self._status_label.setText(f"工作目录: {path}")
             self._update_git_status()
+
+    def _open_mcp_dialog(self):
+        """勾选哪些 MCP server 参与会话。写回配置的 enabled，下一个任务生效。"""
+        ws = self._ws_input.text().strip()
+        if not ws:
+            QMessageBox.information(self, "MCP 服务", "请先选择工作目录。")
+            return
+        dialog = MCPServersDialog(ws, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._status_label.setText(dialog.result_text())
 
     # ── Novel action handler ───────────────────────────────────
     def _novel_new_book(self):

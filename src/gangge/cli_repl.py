@@ -334,6 +334,68 @@ def run_oneshot(task: str, settings: dict[str, Any]) -> int:
     return 0
 
 
+def _handle_slash(raw: str, workspace: str) -> None:
+    """会话内命令。目前只有 ``/mcp``：选择哪些 MCP server 参与本次会话。
+
+    选择结果写进环境变量，**下一条任务**重新 bootstrap 时生效（REPL 每条任务都会
+    重新装载 runtime，所以这里不维护增量状态，也不存在"选了却没生效"的中间态）。
+    没被选中的 server 连进程都不启动，因此不占任何 token。
+    """
+    from gangge.layer4_tools.mcp_client import MCPClientManager, SELECTION_ENV
+
+    parts = raw.strip().split()
+    if parts[0].lower() != "/mcp":
+        _print_info("可用命令: /mcp [status|costs|on NAME|off NAME|all|none]")
+        return
+
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+
+    if sub in ("status", "ls"):
+        manager = MCPClientManager.from_workspace(workspace, connect=False)
+        if not manager.configs:
+            _print_info(f"没有 MCP 配置: {Path(workspace) / '.gangge' / 'mcp_servers.json'}")
+            return
+        for line in manager.status_lines():
+            _print_info(line)
+        _print_info("/mcp costs 会真连一次，量出每个 server 的工具数与 token 占用")
+        return
+
+    if sub == "costs":
+        manager = MCPClientManager.from_workspace(workspace)
+        try:
+            for line in manager.status_lines():
+                _print_info(line)
+        finally:
+            manager.disconnect_all()
+        return
+
+    if sub in ("all", "none"):
+        os.environ[SELECTION_ENV] = sub
+        _print_info(f"MCP 选择已设为 {sub}，下一条任务生效")
+        return
+
+    if sub in ("on", "off"):
+        if len(parts) < 3:
+            _print_info(f"用法: /mcp {sub} <server 名字>")
+            return
+        name = parts[2]
+        manager = MCPClientManager.from_workspace(workspace, connect=False)
+        if name not in manager.available_names:
+            available = ", ".join(manager.available_names) or "无"
+            _print_info(f"没有这个 server: {name}（可选: {available}）")
+            return
+        current = {c.name for c in manager.configs if manager.is_selected(c.name)}
+        if sub == "on":
+            current.add(name)
+        else:
+            current.discard(name)
+        os.environ[SELECTION_ENV] = ",".join(sorted(current)) or "none"
+        _print_info(f"已{'启用' if sub == 'on' else '停用'} {name}，下一条任务生效")
+        return
+
+    _print_info("用法: /mcp [status|costs|on NAME|off NAME|all|none]")
+
+
 def run_repl(settings: dict[str, Any]) -> int:
     """Interactive REPL mode with session persistence."""
     try:
@@ -390,6 +452,9 @@ def run_repl(settings: dict[str, Any]) -> int:
                 continue
             if task in ("exit", "quit", "q"):
                 break
+            if task.startswith("/"):
+                _handle_slash(task, settings["workspace"])
+                continue
 
             conversation_count += 1
             _print_divider()

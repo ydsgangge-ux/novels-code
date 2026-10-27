@@ -214,9 +214,11 @@ class PlanExecutor:
             else:
                 user_answer = ""
             result = ToolResult(output=user_answer or "(用户未提供输入)")
-        elif "__" in tool_name and self.mcp_manager:
-            output = self.mcp_manager.call_tool(tool_name, tool_input)
-            result = ToolResult(output=output, is_error=output.startswith("[错误]"))
+        elif self.mcp_manager and self.mcp_manager.has_tool(tool_name):
+            # MCP 客户端是同步阻塞的（stdio 读 / HTTP 请求）。直接在事件循环
+            # 线程上调用会冻住流式输出和 UI，与 loop.py 保持一致走线程池。
+            output = await asyncio.to_thread(self.mcp_manager.call_tool, tool_name, tool_input)
+            result = ToolResult(output=output, is_error=str(output).startswith("[错误]"))
         else:
             result = await self.tools.execute(tool_name, tool_input)
 
@@ -402,11 +404,9 @@ class CodexPipeline:
         self._stream_callback = callback
 
     def _init_mcp(self):
-        ws = Path(self.config.workspace_dir) if self.config and self.config.workspace_dir else Path(".")
-        config_path = ws / ".gangge" / "mcp_servers.json"
+        ws = (self.config.workspace_dir if self.config and self.config.workspace_dir else ".") or "."
         try:
-            self.mcp_manager = MCPClientManager.from_config_file(str(config_path))
-            self.mcp_manager.connect_all()
+            self.mcp_manager = MCPClientManager.from_workspace(ws)
             tools = self.mcp_manager.get_all_tools()
             if tools:
                 names = [t.full_name for t in tools]
@@ -420,10 +420,18 @@ class CodexPipeline:
             await self._stream_callback(block)
 
     def _get_tool_list_str(self) -> str:
-        """Get a concise tool list for the planner prompt."""
+        """Get a concise tool list for the planner prompt.
+
+        Planner 是**一次性**提示，需要完整工具宇宙才能规划，所以这里不受
+        「MCP 延迟揭示」影响；但必须去重——MCP 工具可能已经注册进 registry
+        （loop 会这么做），再 extend 一遍会让 planner 看到重复条目。
+        """
         defs = list(self.tools.get_definitions())
+        seen = {d.name for d in defs}
         if self.mcp_manager:
-            defs.extend(self.mcp_manager.build_tool_definitions())
+            defs.extend(
+                d for d in self.mcp_manager.build_tool_definitions() if d.name not in seen
+            )
         lines = []
         for d in defs:
             lines.append(f"- {d.name}: {d.description}")

@@ -1,0 +1,68 @@
+{
+  "_comment": "Gangge Code MCP Server 配置示例。放到项目根的 .gangge/mcp_servers.json 才生效。",
+  "_doc": "transport 支持 stdio（本地进程）与 sse（远程 HTTP）；工具以 {server}__{tool} 的名字暴露给模型",
+  "_generate": "也可以让 `python -m gangge.layer4_tools.dsh_plugins export <插件目录>` 自动写入 mcp-client 型插件",
+
+  "servers": [
+
+    {
+      "_comment": "─── AutoCAD / 中望CAD / 浩辰CAD（Windows，需安装 multiCAD-mcp）───",
+      "name": "autocad",
+      "transport": "stdio",
+      "command": "node",
+      "args": ["C:/Users/你的用户名/AppData/Roaming/npm/node_modules/multicad-mcp/index.js"],
+      "env": {
+        "CAD_TYPE": "autocad"
+      },
+      "enabled": false,
+      "timeout": 60,
+      "_install": "npm install -g multicad-mcp",
+      "_supported_cad": ["AutoCAD 2020+", "ZWCAD 2022+", "GstarCAD 2022+", "BricsCAD V22+"]
+    },
+
+    {
+      "_comment": "─── FreeCAD（跨平台，开源）───",
+      "name": "freecad",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["/path/to/freecad-mcp/server.py"],
+      "env": {
+        "FREECAD_PATH": "C:/Program Files/FreeCAD 0.21/bin"
+      },
+      "enabled": false,
+      "timeout": 60,
+      "_install": "pip install freecad-mcp",
+      "_github": "https://github.com/nneshlur/freecad-mcp"
+    },
+
+    {
+      "_comment": "─── 官方 MCP 参考实现：memory（无需任何凭据，适合验证链路是否通）───",
+      "name": "server-memory",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "enabled": false,
+      "timeout": 60,
+      "_note": "Windows 下命令名会被解析成 npx.cmd；若卡住看 [MCP] stderr 日志"
+    },
+
+    {
+      "_comment": "─── 通用 SSE 远程 MCP Server 示例（部署在局域网服务器上）───",
+      "name": "remote_cad_server",
+      "transport": "sse",
+      "url": "http://192.168.1.100:3000/sse",
+      "enabled": false,
+      "timeout": 30,
+      "_note": "注意：当前 SSE 传输是占位实现，尚未按 MCP 的 GET /sse + message endpoint 流程实现"
+    }
+
+  ],
+
+  "_quick_start": {
+    "step1": "复制本文件到项目根目录的 .gangge/mcp_servers.json",
+    "step2": "把要用的 server 的 enabled 改成 true",
+    "step3": "修改 command/args/env 里的路径（或先跑 dsh_plugins export 自动生成）",
+    "step4": "gangge --dump-config 确认插件树，然后直接描述任务",
+    "step5": "模型会看到 autocad__draw_circle 之类的工具并按需调用"
+  }
+}

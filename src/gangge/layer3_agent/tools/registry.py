@@ -281,6 +281,22 @@ class ToolRegistry:
 
     # ── discovery ──────────────────────────────────────────────
 
+    def reveal(self, names: list[str] | set[str], reason: str = "manual") -> list[str]:
+        """Reveal tools for the rest of the session; returns the newly added.
+
+        Same effect as :meth:`unlock` but distinguishable in the log: MCP tools
+        with a small footprint are revealed up-front instead of waiting for a
+        ``tool_search`` round-trip.
+        """
+        added: list[str] = []
+        for name in names:
+            if name in self._tools and name not in self._unlocked:
+                self._unlocked.add(name)
+                added.append(name)
+        if added:
+            logger.info("[Registry] revealed (%s): %s", reason, ", ".join(added))
+        return added
+
     def unlock(self, names: list[str] | set[str]) -> list[str]:
         """Reveal tools for the rest of the session; returns the newly added."""
         added: list[str] = []

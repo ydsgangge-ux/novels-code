@@ -304,16 +304,37 @@ class AgenticLoop:
         self._text_callback = callback
 
     def _init_mcp(self):
-        """初始化 MCP 客户端管理器（连接外部工具服务器）。"""
-        ws = Path(self.config.workspace_dir) if self.config.workspace_dir else Path(".")
-        config_path = ws / ".gangge" / "mcp_servers.json"
+        """初始化 MCP 客户端管理器（只连被选中的 server）。
+
+        选择优先级：``GANGGE_MCP_SERVERS``（由 ``--mcp`` 或 ``/mcp`` 命令设置）>
+        配置里的 ``enabled``。没选中的 server 不启动进程、不产生工具定义，
+        因此不占任何 token。
+
+        连上之后把工具注册进 registry：
+        - 大 server（估算超过阈值）→ 注册但不可见，等 ``tool_search`` 揭示；
+        - 小 server → 直接 reveal，省掉一次搜索往返。
+        """
+        ws = self.config.workspace_dir or "."
         try:
-            self.mcp_manager = MCPClientManager.from_config_file(str(config_path))
-            self.mcp_manager.connect_all()
+            self.mcp_manager = MCPClientManager.from_workspace(ws)
+            # 即使一个 server 都没配，也把"自己新增 server"的能力挂上——
+            # 否则模型永远只能用手头已有的工具。
+            from gangge.layer3_agent.tools.mcp_admin import MCPAddServerTool
+
+            self.tools.register(MCPAddServerTool(self.mcp_manager, self.tools, ws))
+
             tools = self.mcp_manager.get_all_tools()
-            if tools:
-                names = [t.full_name for t in tools]
-                logger.info(f"[MCP] 已加载 {len(tools)} 个外部工具: {', '.join(names)}")
+            if not tools:
+                return
+            from gangge.layer3_agent.tools.mcp_proxy import register_mcp_tools
+
+            defer = self.mcp_manager.should_defer()
+            register_mcp_tools(self.tools, self.mcp_manager, reveal=not defer)
+            names = [t.full_name for t in tools]
+            logger.info(
+                f"[MCP] 已加载 {len(tools)} 个外部工具"
+                f"（{'延迟揭示' if defer else '直接可见'}）: {', '.join(names)}"
+            )
         except Exception as e:
             logger.info(f"[MCP] 初始化跳过: {e}")
             self.mcp_manager = None
@@ -500,10 +521,14 @@ class AgenticLoop:
             phase: 如果提供，只返回该阶段及以下的工具。
                    如果 None，返回全部工具。
         """
+        # MCP 工具已注册进 registry（见 ``_init_mcp``），这里不再单独 extend：
+        # 它们和本地工具一样受 is_visible 约束——没被揭示就不会随请求发送。
+        # 注册失败时（registry 不可用）才退回直接注入，保证功能不会彻底消失。
         defs = list(self.tools.get_definitions(phase=phase))
-        if self.mcp_manager:
-            mcp_defs = self.mcp_manager.build_tool_definitions()
-            defs.extend(mcp_defs)
+        if self.mcp_manager and not any(
+            self.tools.get(t.full_name) for t in self.mcp_manager.get_all_tools()
+        ):
+            defs.extend(self.mcp_manager.build_tool_definitions())
         return defs
 
     def _build_static_system_prompt(self) -> str:
@@ -522,6 +547,20 @@ class AgenticLoop:
         # ── Inject .ganggerules (stable per session) ──
         if self.config.ganggerules:
             prompt += f"\n\n## 项目规则 (.ganggerules)\n{self.config.ganggerules[:500]}"
+
+        # ── MCP 外部工具索引（本会话内稳定，可留在缓存前缀里）──
+        # 只写"有哪些 server、几个工具、怎么取"，不写 schema：Blender 9 个工具
+        # 完整定义约 1.2k tokens，这一行约 60。
+        if self.mcp_manager:
+            hint = self.mcp_manager.prompt_hint() if self.mcp_manager.should_defer() else ""
+            if hint:
+                prompt += f"\n\n## MCP 外部工具\n{hint}"
+            if self.tools.get("mcp_add_server") is not None:
+                # 一行索引就够：这条提示常年驻留，别写成长段说明
+                prompt += (
+                    "\n\n缺少外部能力（如 3D 建模）时，可用 "
+                    'tool_search("mcp") 找到 mcp_add_server 自行添加 MCP 服务（执行前会请你确认）。'
+                )
 
         # ── Coding profile: inject test verification instruction ──
         if getattr(self, "_profile", "") == "coding":
@@ -1397,7 +1436,14 @@ class AgenticLoop:
             )
             return ToolResult(output=answer or "(用户未提供输入)")
 
-        if "__" in name and self.mcp_manager:
+        if (
+            self.mcp_manager
+            and self.mcp_manager.has_tool(name)
+            and name not in self.tools
+        ):
+            # 兜底路径：正常情况下 MCP 工具已注册成 MCPToolProxy（走下面的
+            # tool_service / registry，享受校验与结果裁剪）；只有注册失败时
+            # 才直接打 manager。
             # MCP clients are synchronous (blocking HTTP / stdio); running them
             # on the loop thread freezes streaming and the UI for the duration
             # of the call.

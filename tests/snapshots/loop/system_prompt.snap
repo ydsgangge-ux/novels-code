@@ -56,3 +56,6 @@
 暂无历史记录
 
 
+
+
+缺少外部能力（如 3D 建模）时，可用 tool_search("mcp") 找到 mcp_add_server 自行添加 MCP 服务（执行前会请你确认）。

@@ -96,6 +96,34 @@ def _handle_runtime_flags(args: Any, ws: Path, profile: str) -> bool:
             print(f" {marker} {name:<12} {desc}")
         return True
 
+    if args.list_mcp:
+        from gangge.layer4_tools.mcp_client import (
+            MCPClientManager,
+            SELECTION_ENV,
+            workspace_config_paths,
+        )
+
+        layers = workspace_config_paths(ws)
+        if not any(p.exists() for p in layers):
+            print("没有 MCP 配置。查找顺序（用户级 → 项目级）:")
+            for path in layers:
+                print(f"  · {path}")
+            print("可以跑一次 gangge 并执行 /mcp，或在 GUI 里用「工具 → MCP 服务」生成模板。")
+            return True
+        print("配置来源:")
+        for path in layers:
+            print(f"  {'✓' if path.exists() else '·'} {path}")
+        print()
+        manager = MCPClientManager.from_workspace(ws)   # 只连接被选中的
+        try:
+            for line in manager.status_lines():
+                print(line)
+        finally:
+            manager.disconnect_all()
+        if os.environ.get(SELECTION_ENV) is None:
+            print(f"\n提示: 用 --mcp all|none|<名字,...> 选择，或设环境变量 {SELECTION_ENV}。")
+        return True
+
     if args.show_events:
         print(describe_events())
         return True
@@ -227,6 +255,17 @@ def main() -> None:
         help="列出可用 profile 并退出",
     )
     runtime.add_argument(
+        "--mcp",
+        default=None,
+        metavar="NAMES",
+        help="本次启用哪些 MCP server：all / none / 逗号分隔的名字（默认跟随配置的 enabled）",
+    )
+    runtime.add_argument(
+        "--list-mcp",
+        action="store_true",
+        help="列出 MCP server 的选择状态、工具数与 token 估算并退出",
+    )
+    runtime.add_argument(
         "--show-events",
         action="store_true",
         help="列出生命周期事件及其分发模式并退出",
@@ -283,6 +322,13 @@ def main() -> None:
     os.environ["GANGGE_PROFILE"] = profile
     if args.patch:
         os.environ["GANGGE_PATCH"] = os.pathsep.join(str(Path(p).resolve()) for p in args.patch)
+
+    # MCP selection is read by the loop through the environment, same pattern as
+    # the profile: nothing has to thread a parameter through the UI layers.
+    if args.mcp is not None:
+        from gangge.layer4_tools.mcp_client import SELECTION_ENV
+
+        os.environ[SELECTION_ENV] = args.mcp
 
     # ── Introspection: print and exit, never launch a UI ──
     if _handle_runtime_flags(args, ws, profile):
