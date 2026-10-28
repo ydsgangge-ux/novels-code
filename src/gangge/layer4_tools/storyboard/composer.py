@@ -172,10 +172,13 @@ def mux(
         base += ["-i", str(audio), "-c:a", "aac", "-b:a", "192k", "-shortest"]
 
     attempts = [
-        # veryfast is indistinguishable from medium on flat UI frames and keeps
-        # a much smaller encoder state.
+        # veryfast is indistinguishable from medium on flat UI frames. The
+        # thread cap matters more than the preset: x264 sizes its frame buffers
+        # by core count, and on a many-core machine a long encode can run out of
+        # memory partway through (observed: "malloc of size 7088704 failed"
+        # after ~900 frames, which loses the whole render).
         ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
-         "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+         "-threads", "4", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         # Last resort: two threads, no B-frames, no second moov pass.
         ["-c:v", "libx264", "-preset", "ultrafast", "-crf", str(crf + 3),
          "-pix_fmt", "yuv420p", "-threads", "2",
