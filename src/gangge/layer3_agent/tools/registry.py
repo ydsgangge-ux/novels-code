@@ -209,7 +209,7 @@ def detect_agent_profile(user_message: str) -> str:
     """Detect which agent profile to use based on the user's message.
 
     Returns the profile with the highest keyword hit count. On ties the
-    higher-priority profile wins: novel > research > coding.
+    higher-priority profile wins: novel > research > media > coding.
     Falls back to "coding" when nothing matches.
 
     Keyword scoring stays as a *fallback* only. An explicit choice — a GUI mode,
@@ -226,7 +226,10 @@ def detect_agent_profile(user_message: str) -> str:
     # unambiguous families sit before the catch-all "coding".
     profiles = ("novel", "research", "media", "coding")
     best = "coding"
-    best_score = -1
+    # Starting at 0 (not -1) is what makes "no keyword at all" fall through to
+    # coding: with -1 the first profile wins every empty match and a plain
+    # "你好" would land in novel, hiding the entire coding toolset.
+    best_score = 0
     for p in profiles:
         score = sum(1 for kw in AGENT_PROFILES[p]["detect_keywords"] if kw in msg_lower)
         if score > best_score:  # `>` keeps the earlier (higher-priority) profile on ties

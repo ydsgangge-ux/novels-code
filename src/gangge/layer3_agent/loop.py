@@ -1698,7 +1698,8 @@ class AgenticLoop:
         self._profile = profile  # store for _build_system_prompt
         self.tools.set_profile(profile)
         profile_desc = {
-            "coding": "编程", "novel": "小说创作", "research": "研究搜索"
+            "coding": "编程", "novel": "小说创作", "research": "研究搜索",
+            "media": "演示视频",
         }.get(profile, profile)
         logger.info(f"[Loop] Agent profile: {profile} ({profile_desc})")
 

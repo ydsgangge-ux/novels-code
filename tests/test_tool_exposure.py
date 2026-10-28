@@ -116,6 +116,24 @@ def test_profile_env_override_beats_keyword_detection(monkeypatch):
     assert detect_agent_profile("帮我写小说第一章") == "novel"
 
 
+def test_no_keyword_falls_back_to_coding(monkeypatch):
+    """A message with no signal must not pick whichever profile is listed first.
+
+    This regressed once: initialising the score at -1 let ``novel`` win every
+    empty match, which silently hid the entire coding toolset from a plain
+    "你好" — and with it every non-novel tool.
+    """
+    monkeypatch.delenv("GANGGE_AGENT_PROFILE", raising=False)
+    assert detect_agent_profile("你好") == "coding"
+    assert detect_agent_profile("") == "coding"
+
+
+def test_video_intent_selects_media_profile(monkeypatch):
+    monkeypatch.delenv("GANGGE_AGENT_PROFILE", raising=False)
+    assert detect_agent_profile("帮我做个演示短视频，要有配音和字幕") == "media"
+    assert "demo_video" in PROFILE_CORE["media"]
+
+
 def test_every_profile_core_is_a_subset_of_its_tools():
     for profile, core in PROFILE_CORE.items():
         allowed = AGENT_PROFILES[profile]["tools"]

@@ -1,0 +1,148 @@
+"""Command line entry: ``python -m gangge.layer4_tools.storyboard``.
+
+Exists so the pipeline is usable without the agent loop — no chat session, no
+tool-calling round-trip. ``--file`` renders a storyboard you already have;
+``--topic`` borrows the main model once to draft one, then does the rest here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+
+SAMPLE_STORYBOARD: dict = {
+    "title": "演示视频示例",
+    "scenes": [
+        {
+            "template": "title",
+            "title": "自动生成演示视频",
+            "text": "文案 · 动画 · 配音，一条流水线",
+            "voiceover": "这是一条自动生成的演示视频，文案、动画和配音都由流水线完成。",
+        },
+        {
+            "template": "bullets",
+            "title": "三个环节",
+            "items": ["模型只写分镜", "TTS 逐句配音", "逐帧渲染成片"],
+            "voiceover": "整条链路只有三步：模型负责写分镜，语音合成负责配音，渲染器把画面逐帧拍下来。",
+        },
+        {
+            "template": "flow",
+            "title": "处理流程",
+            "nodes": ["主题", "分镜", "配音", "成片"],
+            "voiceover": "你只需要给一个主题，剩下的分镜、配音、合成都自动完成。",
+        },
+        {
+            "template": "outro",
+            "title": "现在就能用",
+            "text": "说出主题，等待出片",
+            "items": ["demo_video"],
+            "voiceover": "打开演示视频工具，描述你想演示的内容，剩下的交给流水线。",
+        },
+    ],
+}
+
+
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m gangge.layer4_tools.storyboard",
+        description="分镜 → 带配音的演示视频（mp4），不进入 agent 会话。",
+    )
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("-f", "--file", metavar="JSON", help="分镜 JSON 文件")
+    src.add_argument("-t", "--topic", metavar="TEXT", help="主题，用主模型自动写分镜")
+    src.add_argument("-s", "--sample", action="store_true", help="使用内置示例分镜")
+
+    p.add_argument("-o", "--out", metavar="DIR", help="输出目录，默认 .gangge/demo_videos/<slug>")
+    p.add_argument("--voice", default="zh-CN-XiaoxiaoNeural", help="edge-tts 音色")
+    p.add_argument("--fps", type=int, help="帧率，默认沿用分镜（30）")
+    p.add_argument("--no-narration", action="store_true", help="不配音，按字数估算时长")
+    p.add_argument("--preview", action="store_true", help="只生成 HTML，不渲染视频")
+    p.add_argument("--keep-frames", action="store_true", help="保留 PNG 帧序列")
+    return p
+
+
+async def _run(args: argparse.Namespace) -> int:
+    from gangge.layer4_tools.storyboard import Storyboard, build_video, write_preview
+
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            print(f"分镜文件不存在: {path}", file=sys.stderr)
+            return 2
+        storyboard = Storyboard.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        label = storyboard.title or "storyboard"
+    elif args.sample:
+        storyboard = Storyboard.from_dict(SAMPLE_STORYBOARD)
+        label = "示例"
+    else:
+        # Imported lazily: drafting needs a model, rendering does not, and this
+        # module must stay importable on a machine with no API key.
+        from gangge.layer3_agent.tools.demo_video import DemoVideoTool
+
+        tool = DemoVideoTool(workspace=".")
+        try:
+            storyboard = Storyboard.from_dict(await tool._draft(args.topic))
+        except Exception as e:  # noqa: BLE001 - surfaced to the operator
+            print(f"自动写分镜失败: {e}", file=sys.stderr)
+            print("可以先用 --preview 检查，或手写 JSON 用 --file 传入。", file=sys.stderr)
+            return 1
+        label = args.topic
+
+    if args.voice:
+        storyboard.voice = args.voice
+    if args.fps:
+        storyboard.fps = max(10, min(60, args.fps))
+
+    out_dir = Path(args.out) if args.out else Path(".gangge") / "demo_videos" / _slug(label)
+    print(f"分镜: {len(storyboard.scenes)} 个镜头，预计 {storyboard.total_duration:.1f}s")
+    print(f"输出: {out_dir}")
+
+    if args.preview:
+        html = write_preview(storyboard, out_dir)
+        print(f"预览已生成: {html}")
+        return 0
+
+    result = await build_video(
+        storyboard,
+        out_dir,
+        narration=not args.no_narration,
+        keep_frames=args.keep_frames,
+        on_progress=lambda msg: print(f"  · {msg}"),
+    )
+
+    if result.video:
+        print(f"\n✅ 视频: {result.video}  ({result.duration:.1f}s, {result.fps}fps)")
+    else:
+        print("\n⚠️ 视频未生成：")
+        for note in result.notes:
+            print(f"  - {note}")
+        if result.frames_dir:
+            print(f"  帧序列: {result.frames_dir}")
+    if result.srt:
+        print(f"字幕: {result.srt}")
+    print(f"分镜页: {result.html}")
+    return 0 if result.video else 1
+
+
+def _slug(text: str) -> str:
+    import re
+    import time
+
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", "-", text or "").strip("-")
+    return (cleaned[:16] or "demo") + "-" + time.strftime("%Y%m%d-%H%M%S")
+
+
+def main() -> int:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    return asyncio.run(_run(_parser().parse_args()))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

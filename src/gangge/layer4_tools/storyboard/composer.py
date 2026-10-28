@@ -9,6 +9,7 @@ trail of half-written files.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import wave
@@ -48,8 +49,16 @@ def _run(args: Sequence[str]) -> None:
         list(args), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
     if proc.returncode != 0:
-        tail = proc.stderr.decode("utf-8", "ignore").strip().splitlines()[-6:]
-        raise RuntimeError("ffmpeg 失败:\n" + "\n".join(tail))
+        text = proc.stderr.decode("utf-8", "ignore")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        # The tail is usually encoder progress noise; the diagnosis is a line
+        # containing "error"/"failed"/"invalid". Prefer those, fall back to tail.
+        important = [
+            line for line in lines
+            if re.search(r"error|failed|invalid|no such|denied|cannot|malloc", line, re.I)
+        ]
+        detail = important[-6:] if important else lines[-6:]
+        raise RuntimeError("ffmpeg 失败:\n" + "\n".join(detail))
 
 
 # ── audio ───────────────────────────────────────────────────────
@@ -147,17 +156,38 @@ def mux(
     dst: Path,
     crf: int = 20,
 ) -> Path:
-    """Turn a numbered PNG sequence (plus optional audio) into an H.264 mp4."""
+    """Turn a numbered PNG sequence (plus optional audio) into an H.264 mp4.
+
+    Two escalating parameter sets: a busy machine can fail x264's internal
+    allocation ("malloc of size ... failed") and lose the whole encode, so a
+    lighter single-threaded pass is attempted before giving up. Losing a little
+    compression efficiency beats losing a three-minute render.
+    """
     pattern = frames_dir / "%05d.png"
     if not any(frames_dir.glob("*.png")):
         raise RuntimeError(f"帧目录为空: {frames_dir}")
 
-    args = [ffmpeg_exe(), "-y", "-framerate", str(fps), "-i", str(pattern)]
+    base = [ffmpeg_exe(), "-y", "-framerate", str(fps), "-i", str(pattern)]
     if audio is not None and Path(audio).exists():
-        args += ["-i", str(audio), "-c:a", "aac", "-b:a", "192k", "-shortest"]
-    args += [
-        "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dst),
+        base += ["-i", str(audio), "-c:a", "aac", "-b:a", "192k", "-shortest"]
+
+    attempts = [
+        # veryfast is indistinguishable from medium on flat UI frames and keeps
+        # a much smaller encoder state.
+        ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+         "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        # Last resort: two threads, no B-frames, no second moov pass.
+        ["-c:v", "libx264", "-preset", "ultrafast", "-crf", str(crf + 3),
+         "-pix_fmt", "yuv420p", "-threads", "2",
+         "-x264-params", "ref=1:bframes=0"],
     ]
-    _run(args)
-    return dst
+
+    last_error: Exception | None = None
+    for extra in attempts:
+        try:
+            _run(base + extra + [str(dst)])
+            return dst
+        except RuntimeError as e:
+            last_error = e
+            logger.warning("[composer] mux failed, retrying lighter params")
+    raise last_error if last_error else RuntimeError("视频合成失败")
