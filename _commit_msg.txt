@@ -1,6 +1,0 @@
-fix(composer): cap x264 threads to avoid mid-encode malloc failure
-
-On a many-core machine x264 sizes its frame buffers by core count and can run
-out of memory ~900 frames into a 1080p encode ("malloc of size 7088704
-failed"), losing the whole render. Capping at 4 threads keeps the peak well
-inside budget; the ultrafast pass remains as a last resort.
