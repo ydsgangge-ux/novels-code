@@ -15,6 +15,7 @@ tells you what is missing beats a stack trace after two minutes of TTS.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from dataclasses import dataclass, field
@@ -118,6 +119,7 @@ async def build_video(
     total = round(slots[-1][2], 3)
 
     # ── 3. page ─────────────────────────────────────────────────
+    save_storyboard(storyboard, out_dir)
     html_path = out_dir / "storyboard.html"
     html_path.write_text(render_page(storyboard, slots), encoding="utf-8")
 
@@ -187,13 +189,26 @@ async def build_video(
     )
 
 
+def save_storyboard(storyboard: Storyboard, out_dir: Path | str) -> Path:
+    """Persist the storyboard as JSON — the one artifact worth editing by hand."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "storyboard.json"
+    path.write_text(
+        json.dumps(storyboard.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return path
+
+
 def write_preview(storyboard: Storyboard, out_dir: Path | str) -> Path:
     """Emit the HTML alone — opens in a browser, no encoder needed.
 
-    Useful as a fast look before paying for narration and frame capture.
+    Also writes ``storyboard.json``: the point of a preview is to decide what to
+    change, and that means handing back something editable.
     """
     slots = storyboard.timeline()
     html_path = Path(out_dir) / "storyboard.html"
-    html_path.parent.mkdir(parents=True, exist_ok=True)
+    save_storyboard(storyboard, out_dir)
     html_path.write_text(render_page(storyboard, slots), encoding="utf-8")
     return html_path

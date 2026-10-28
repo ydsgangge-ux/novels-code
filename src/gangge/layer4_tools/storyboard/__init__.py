@@ -13,7 +13,12 @@ output predictable and the cost of a re-render near zero.
 
 from __future__ import annotations
 
-from gangge.layer4_tools.storyboard.pipeline import BuildResult, build_video, write_preview
+from gangge.layer4_tools.storyboard.pipeline import (
+    BuildResult,
+    build_video,
+    save_storyboard,
+    write_preview,
+)
 from gangge.layer4_tools.storyboard.schema import (
     DEFAULT_THEME,
     TEMPLATE_NAMES,
@@ -37,5 +42,6 @@ __all__ = [
     "create_tts",
     "estimate_speech_seconds",
     "render_page",
+    "save_storyboard",
     "write_preview",
 ]

@@ -57,6 +57,9 @@ def _parser() -> argparse.ArgumentParser:
     src.add_argument("-s", "--sample", action="store_true", help="使用内置示例分镜")
 
     p.add_argument("-o", "--out", metavar="DIR", help="输出目录，默认 .gangge/demo_videos/<slug>")
+    p.add_argument("--provider", help="LLM provider，覆盖 .env 的 LLM_PROVIDER")
+    p.add_argument("--model", help="模型名，覆盖 provider 默认值")
+    p.add_argument("--api-key", dest="api_key", help="API Key，仅本次生效")
     p.add_argument("--voice", default="zh-CN-XiaoxiaoNeural", help="edge-tts 音色")
     p.add_argument("--fps", type=int, help="帧率，默认沿用分镜（30）")
     p.add_argument("--no-narration", action="store_true", help="不配音，按字数估算时长")
@@ -81,9 +84,29 @@ async def _run(args: argparse.Namespace) -> int:
     else:
         # Imported lazily: drafting needs a model, rendering does not, and this
         # module must stay importable on a machine with no API key.
-        from gangge.layer3_agent.tools.demo_video import DemoVideoTool
+        import os
 
-        tool = DemoVideoTool(workspace=".")
+        from gangge.layer3_agent.tools.demo_video import DemoVideoTool
+        from gangge.layer5_llm.registry import create_llm
+
+        try:
+            if args.api_key and args.provider:
+                os.environ[f"{args.provider.upper()}_API_KEY"] = args.api_key
+            llm = create_llm(args.provider)
+            if args.model:
+                llm.model = args.model
+        except Exception as e:  # noqa: BLE001 - configuration problem, not a crash
+            env_path = Path(".env")
+            print(f"无法初始化主模型: {e}", file=sys.stderr)
+            print(
+                f"检查 {env_path.resolve() if env_path.exists() else '.env（不存在）'}："
+                "需要 LLM_PROVIDER 和该 provider 的 *_API_KEY。",
+                file=sys.stderr,
+            )
+            print("也可以用 --sample 生成示例视频，不需要模型。", file=sys.stderr)
+            return 1
+
+        tool = DemoVideoTool(workspace=".", llm=llm)
         try:
             storyboard = Storyboard.from_dict(await tool._draft(args.topic))
         except Exception as e:  # noqa: BLE001 - surfaced to the operator

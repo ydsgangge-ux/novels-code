@@ -194,7 +194,11 @@ class DemoVideoTool(BaseTool):
     # ── execution ───────────────────────────────────────────────
 
     async def execute(self, **kwargs: Any) -> ToolResult:
-        from gangge.layer4_tools.storyboard import build_video, write_preview
+        from gangge.layer4_tools.storyboard import (
+            build_video,
+            save_storyboard,
+            write_preview,
+        )
 
         action = str(kwargs.get("action") or "auto").strip().lower()
         if action not in ("auto", "write", "preview", "render"):
@@ -220,12 +224,7 @@ class DemoVideoTool(BaseTool):
         # Persist the resolved storyboard first: it is the smallest artifact and
         # the one worth editing by hand when the wording is off.
         try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            sb_path = out_dir / "storyboard.json"
-            sb_path.write_text(
-                json.dumps(storyboard.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            sb_path = save_storyboard(storyboard, out_dir)
         except OSError as e:
             return ToolResult(output=f"❌ 无法写入输出目录 {out_dir}: {e}", is_error=True)
 

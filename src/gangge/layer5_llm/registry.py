@@ -222,19 +222,29 @@ def create_vision_llm() -> BaseLLM | None:
     """
     _load_env()
 
-    model = _env("VISION_MODEL").strip()
-    provider = _env("VISION_PROVIDER").strip().lower()
+    # ``MM_*`` is what the desktop GUI writes to .env; ``VISION_*`` is the
+    # documented name for the same thing. Both are accepted, VISION_ wins when
+    # a machine somehow has both, and ``MM_ENABLED=false`` suppresses MM_*.
+    mm_active = _env("MM_ENABLED").strip().lower() not in ("0", "false", "no", "off")
+
+    def pick(primary: str, fallback: str) -> str:
+        return _env(primary).strip() or (_env(fallback).strip() if mm_active else "")
+
+    model = pick("VISION_MODEL", "MM_MODEL")
+    provider = pick("VISION_PROVIDER", "MM_PROVIDER").lower()
     if not model and not provider:
         return None
     if not model:
-        raise ValueError("VISION_MODEL is not set (required when VISION_PROVIDER is set)")
+        raise ValueError(
+            "VISION_MODEL / MM_MODEL is not set (required when a provider is given)"
+        )
 
     provider = provider or (_env("LLM_PROVIDER") or "anthropic").lower()
     max_tokens = int(_env("VISION_MAX_TOKENS") or _env("MAX_TOKENS", "4096"))
     temperature = float(_env("VISION_TEMPERATURE") or _env("TEMPERATURE", "0.0"))
 
     if provider == "anthropic":
-        api_key = _env("VISION_API_KEY") or _env("ANTHROPIC_API_KEY")
+        api_key = pick("VISION_API_KEY", "MM_API_KEY") or _env("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY is not set")
         return AnthropicLLM(
@@ -252,12 +262,12 @@ def create_vision_llm() -> BaseLLM | None:
 
     upper = provider.upper()
     base_url = (
-        _env("VISION_BASE_URL")
+        pick("VISION_BASE_URL", "MM_BASE_URL")
         or _env(f"{upper}_BASE_URL")
         or _VISION_BASE_URLS[provider]
     )
     api_key = (
-        _env("VISION_API_KEY")
+        pick("VISION_API_KEY", "MM_API_KEY")
         or _env(f"{upper}_API_KEY")
         or ("ollama" if provider == "ollama" else "not-needed")
     )

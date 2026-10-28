@@ -172,17 +172,19 @@ def mux(
         base += ["-i", str(audio), "-c:a", "aac", "-b:a", "192k", "-shortest"]
 
     attempts = [
-        # veryfast is indistinguishable from medium on flat UI frames. The
-        # thread cap matters more than the preset: x264 sizes its frame buffers
-        # by core count, and on a many-core machine a long encode can run out of
-        # memory partway through (observed: "malloc of size 7088704 failed"
-        # after ~900 frames, which loses the whole render).
+        # veryfast is indistinguishable from medium on flat UI frames. The real
+        # knob is memory: x264 holds every lookahead frame plus its mbtree stats
+        # (a 1080p yuv420 frame is ~3 MB), and on a long encode that reservation
+        # fails near the end — observed as "malloc of size 7088704 failed" after
+        # ~900 frames, which throws away the whole render. Short lookahead and
+        # an explicit thread cap keep the peak flat.
         ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
-         "-threads", "4", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+         "-threads", "4", "-x264-params", "rc-lookahead=10",
+         "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         # Last resort: two threads, no B-frames, no second moov pass.
         ["-c:v", "libx264", "-preset", "ultrafast", "-crf", str(crf + 3),
          "-pix_fmt", "yuv420p", "-threads", "2",
-         "-x264-params", "ref=1:bframes=0"],
+         "-x264-params", "ref=1:bframes=0:rc-lookahead=0"],
     ]
 
     last_error: Exception | None = None
