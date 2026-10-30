@@ -78,6 +78,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 "gangge.runtime" = ["profiles/*.yml", "bundles/*.yml"]
 "gangge.layer4_permission" = ["*.yml"]
+# 技能「效果」页签用的静态预览图，缺了面板会退化成一句说明
+"gangge.layer4_tools.storyboard" = ["previews/*.png"]
 
 [tool.ruff]
 line-length = 100

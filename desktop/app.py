@@ -67,6 +67,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -95,6 +96,12 @@ _SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+# desktop/ 自身也进 sys.path：同目录的 skill_preview 在 `python desktop/app.py`
+# 下本来就能 import，但 pytest 用 spec 加载本文件时不会，显式加一次两边都成立。
+_DESKTOP = str(Path(__file__).resolve().parent)
+if _DESKTOP not in sys.path:
+    sys.path.insert(0, _DESKTOP)
+
 from gangge.layer3_agent.loop import AgenticLoop, LoopConfig, ToolExecution
 from gangge.layer3_agent.prompts.system import build_system_prompt
 from gangge.layer3_agent.tools.registry import ToolRegistry
@@ -113,6 +120,7 @@ from gangge.layer4_tools.qoder_cli.config import (
     PERMISSIONS as QODER_PERMISSIONS,
     STRENGTHS as QODER_STRENGTHS,
 )
+from skill_preview import SkillEffectPanel
 
 # ── LLM Provider definitions ─────────────────────────────────────
 PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
@@ -6275,7 +6283,32 @@ class GanggeDesktop(QMainWindow):
             "QPushButton:hover{background:#30363d;color:#c9d1d9;}"
         )
         self._attach_btn.clicked.connect(self._pick_attachment)
-        input_lay.addWidget(self._attach_btn)
+
+        # 左侧竖排：附件在上、技能在下（技能 = 常用工作流，点一下把提示词填进输入框）
+        self._skill_btn = QToolButton()
+        self._skill_btn.setText("⚡ 技能")
+        self._skill_btn.setToolTip("选择常用工作流：视频出片 / 开发 / 通用")
+        self._skill_btn.setFixedSize(80, 26)
+        self._skill_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._skill_btn.setStyleSheet(
+            "QToolButton{background:#21262d;border:1px solid #30363d;border-radius:6px;"
+            "color:#8b949e;font-size:12px;}"
+            "QToolButton:hover{background:#30363d;color:#c9d1d9;}"
+            "QToolButton::menu-indicator{image:none;}"
+        )
+        self._skill_menu = QMenu(self)
+        self._skill_menu.setToolTipsVisible(True)
+        self._skill_menu.aboutToShow.connect(self._refresh_skill_menu)
+        self._skill_btn.setMenu(self._skill_menu)
+        self._refresh_skill_menu()
+
+        left_col = QVBoxLayout()
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(4)
+        left_col.addWidget(self._attach_btn)
+        left_col.addWidget(self._skill_btn)
+        left_col.addStretch(1)
+        input_lay.addLayout(left_col)
 
         self._task_input = QPlainTextEdit()
         self._task_input.setAcceptDrops(True)
@@ -6396,6 +6429,10 @@ class GanggeDesktop(QMainWindow):
 
         right_tabs.addTab(preview_tab, _t("tab_preview"))
 
+        # ── Skill effect tab（点了技能先看效果，再决定要不要改提示词） ──
+        self._skill_effect = SkillEffectPanel()
+        right_tabs.addTab(self._skill_effect, "✨ 效果")
+
         # ── Tool Calls tab ──
         tool_tab = QWidget()
         tool_lay = QVBoxLayout(tool_tab)
@@ -6413,6 +6450,7 @@ class GanggeDesktop(QMainWindow):
         self._experimental_panel = ExperimentalPanel()
         right_tabs.addTab(self._experimental_panel, "🔬 实验")
 
+        self._right_tabs = right_tabs
         right_lay.addWidget(right_tabs)
 
         # ── Assemble splitter ──
@@ -7159,6 +7197,72 @@ class GanggeDesktop(QMainWindow):
         # We already save incrementally in _append_output, so this is a no-op
         # But we update the session timestamp
         self._db.update_session(self._current_session_id, updated_at=datetime.now().isoformat())
+
+    # ── Skills (常用工作流下拉) ────────────────────────────────
+    def _refresh_skill_menu(self):
+        """重建技能菜单（工作区变了，自定义技能也会跟着变）。"""
+        from gangge.layer4_tools.skills import all_skills, grouped
+
+        self._skill_menu.clear()
+        workspace = self._ws_input.text().strip() if hasattr(self, "_ws_input") else ""
+        for index, (group, skills) in enumerate(grouped(all_skills(workspace))):
+            if index:
+                self._skill_menu.addSeparator()
+            header = self._skill_menu.addAction(group)
+            header.setEnabled(False)
+            for skill in skills:
+                action = self._skill_menu.addAction(skill.label)
+                if skill.hint:
+                    action.setToolTip(skill.hint)
+                    action.setStatusTip(skill.hint)
+                action.triggered.connect(
+                    lambda _checked=False, picked=skill: self._apply_skill(picked)
+                )
+                # 鼠标划到哪条就在右侧看到哪条的效果：不用点下去才知道长什么样
+                action.hovered.connect(
+                    lambda picked=skill: self._preview_skill(picked)
+                )
+
+        if not self._skill_menu.actions():
+            empty = self._skill_menu.addAction("（暂无可用技能）")
+            empty.setEnabled(False)
+
+    def _apply_skill(self, skill):
+        """把技能模板填进输入框，并选中第一个占位符方便直接覆盖。"""
+        text = skill.template.strip()
+        current = self._task_input.toPlainText().strip()
+        self._task_input.setPlainText(f"{current}\n\n{text}" if current else text)
+        self._select_focus_token(skill.focus)
+        self._task_input.setFocus()
+        self._preview_skill(skill, switch=True)
+
+    def _preview_skill(self, skill, switch: bool = False):
+        """把技能效果显示在右侧「效果」页签。
+
+        ``switch=True`` 时顺手切过去——点了技能却什么都没变，人会以为没生效。
+        测试壳里可能没有这两个控件，所以全程用 getattr 兜着。
+        """
+        panel = getattr(self, "_skill_effect", None)
+        if panel is None:
+            return
+        panel.show_skill(skill)
+        if not switch:
+            return
+        tabs = getattr(self, "_right_tabs", None)
+        if tabs is not None:
+            tabs.setCurrentWidget(panel)
+
+    def _select_focus_token(self, token: str):
+        if not token:
+            return
+        plain = self._task_input.toPlainText()
+        start = plain.find(token)
+        if start < 0:
+            return
+        cursor = self._task_input.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(start + len(token), QTextCursor.MoveMode.KeepAnchor)
+        self._task_input.setTextCursor(cursor)
 
     # ── Attachment handling ──────────────────────────────────
     def _pick_attachment(self):
