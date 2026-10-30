@@ -39,3 +39,6 @@ desktop/__pycache__/
 .pytest_cache/
 htmlcov/
 .coverage
+
+# Storyboard style previews (generated HTML + screenshots, ~18MB)
+_style_test/

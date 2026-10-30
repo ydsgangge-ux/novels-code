@@ -108,6 +108,11 @@ from gangge.layer5_llm.base import (
 from gangge.layer5_llm.registry import create_llm
 from gangge.layer4_permission.guard import PermissionDecision, PermissionGuard, PermissionRequest
 from gangge.i18n import get_language, set_language, t as _t
+from gangge.layer4_tools.qoder_cli.config import (
+    MODELS as QODER_MODELS,
+    PERMISSIONS as QODER_PERMISSIONS,
+    STRENGTHS as QODER_STRENGTHS,
+)
 
 # ── LLM Provider definitions ─────────────────────────────────────
 PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
@@ -6024,6 +6029,31 @@ class GanggeDesktop(QMainWindow):
         self._extra_prompt.setMaximumHeight(100)
         self._extra_prompt.hide()
 
+        # ── Qoder CLI 委派（综合型外部工具）──
+        self._qoder_enable_cb = QCheckBox("启用 Qoder CLI 委派", self)
+        self._qoder_enable_cb.setChecked(True)
+        self._qoder_enable_cb.hide()
+
+        self._qoder_exe_input = QLineEdit(self)
+        self._qoder_exe_input.setPlaceholderText("留空自动探测（qodercli / qoder）")
+        self._qoder_exe_input.hide()
+
+        self._qoder_model_combo = QComboBox(self)
+        self._qoder_model_combo.setEditable(True)  # 允许手填新模型名
+        for _name in QODER_MODELS:
+            self._qoder_model_combo.addItem(_name, _name)
+        self._qoder_model_combo.hide()
+
+        self._qoder_strength_combo = QComboBox(self)
+        for s_key, s_preset in QODER_STRENGTHS.items():
+            self._qoder_strength_combo.addItem(str(s_preset["label"]), s_key)
+        self._qoder_strength_combo.hide()
+
+        self._qoder_perm_combo = QComboBox(self)
+        for p_key, p_spec in QODER_PERMISSIONS.items():
+            self._qoder_perm_combo.addItem(str(p_spec["label"]), p_key)
+        self._qoder_perm_combo.hide()
+
     # ── UI ────────────────────────────────────────────────────
     def _setup_ui(self):
         # ── Init config widgets (needed before _load_settings) ──
@@ -6551,6 +6581,78 @@ class GanggeDesktop(QMainWindow):
 
         form.addWidget(mm_g)
 
+        # ── Qoder CLI 委派 ──
+        qd_g = QGroupBox("Qoder CLI 委派（外包整活给外部 CLI，省上下文）")
+        qd_g.setStyleSheet(llm_g.styleSheet())
+        qf = QFormLayout(qd_g)
+        qf.setSpacing(8)
+        qf.addRow(QLabel("一次调用 = 一个可验证闭环；模型/强度/权限决定它能做多深"))
+
+        _qd_enable = QCheckBox("启用 qoder_delegate 工具")
+        _qd_enable.setChecked(self._qoder_enable_cb.isChecked())
+        qf.addRow("", _qd_enable)
+
+        _qd_exe = QLineEdit()
+        _qd_exe.setPlaceholderText("留空自动探测 qodercli / qoder")
+        _qd_exe.setText(self._qoder_exe_input.text())
+        qf.addRow("可执行文件", _qd_exe)
+
+        _qd_model = QComboBox()
+        _qd_model.setEditable(True)  # 允许手填新模型名
+        for _i in range(self._qoder_model_combo.count()):
+            _qd_model.addItem(
+                self._qoder_model_combo.itemText(_i), self._qoder_model_combo.itemData(_i)
+            )
+        _qd_model.setCurrentText(self._qoder_model_combo.currentText())
+        qf.addRow("模型", _qd_model)
+
+        _qd_strength = QComboBox()
+        for _i in range(self._qoder_strength_combo.count()):
+            _qd_strength.addItem(
+                self._qoder_strength_combo.itemText(_i), self._qoder_strength_combo.itemData(_i)
+            )
+        _qd_strength.setCurrentIndex(
+            max(0, _qd_strength.findData(self._qoder_strength_combo.currentData()))
+        )
+        qf.addRow("强度", _qd_strength)
+
+        _qd_perm = QComboBox()
+        for _i in range(self._qoder_perm_combo.count()):
+            _qd_perm.addItem(
+                self._qoder_perm_combo.itemText(_i), self._qoder_perm_combo.itemData(_i)
+            )
+        _qd_perm.setCurrentIndex(max(0, _qd_perm.findData(self._qoder_perm_combo.currentData())))
+        qf.addRow("权限", _qd_perm)
+
+        _qd_detect = QPushButton("检测 CLI")
+        _qd_detect.setToolTip("运行 qodercli --version，确认已安装且可用")
+
+        def _on_qd_detect():
+            from gangge.layer4_tools.qoder_cli import list_models, probe_version
+
+            exe_path = _qd_exe.text().strip()
+            ok, detail = probe_version(exe_path, timeout_s=10)
+            if not ok:
+                QMessageBox.warning(dlg, "Qoder CLI", f"不可用：{detail}")
+                return
+            ok_models, models = list_models(exe_path, timeout_s=20)
+            if ok_models and isinstance(models, list):
+                QMessageBox.information(
+                    dlg, "Qoder CLI",
+                    f"可用：{detail}\n登录正常，可用模型 {len(models)} 个：\n"
+                    + "、".join(models),
+                )
+            else:
+                QMessageBox.warning(
+                    dlg, "Qoder CLI",
+                    f"CLI 可用（{detail}），但取模型列表失败：{models}",
+                )
+
+        _qd_detect.clicked.connect(_on_qd_detect)
+        qf.addRow("", _qd_detect)
+
+        form.addWidget(qd_g)
+
         # ── Advanced ──
         ad_g = QGroupBox(_t("settings_advanced"))
         ad_g.setStyleSheet(llm_g.styleSheet())
@@ -6700,6 +6802,26 @@ class GanggeDesktop(QMainWindow):
             self._settings.setValue("mm_api_key", _mm_api_key.text())
             self._settings.setValue("mm_model", _mm_model.currentText())
             self._settings.setValue("mm_base_url", _mm_base_url.text())
+            # Save Qoder CLI delegation settings
+            self._qoder_enable_cb.setChecked(_qd_enable.isChecked())
+            self._qoder_exe_input.setText(_qd_exe.text())
+            _qd_model_name = _qd_model.currentText().strip()
+            _qd_model_idx = self._qoder_model_combo.findText(_qd_model_name)
+            if _qd_model_idx >= 0:
+                self._qoder_model_combo.setCurrentIndex(_qd_model_idx)
+            else:
+                self._qoder_model_combo.setCurrentText(_qd_model_name)
+            self._qoder_strength_combo.setCurrentIndex(
+                max(0, self._qoder_strength_combo.findData(_qd_strength.currentData()))
+            )
+            self._qoder_perm_combo.setCurrentIndex(
+                max(0, self._qoder_perm_combo.findData(_qd_perm.currentData()))
+            )
+            self._settings.setValue("qoder_enable", _qd_enable.isChecked())
+            self._settings.setValue("qoder_exe", _qd_exe.text())
+            self._settings.setValue("qoder_model", _qd_model_name or "Auto")
+            self._settings.setValue("qoder_strength", _qd_strength.currentData())
+            self._settings.setValue("qoder_permission", _qd_perm.currentData())
             self._update_provider_fields()
             self._sync_env_file()
             # Apply language change
@@ -6754,6 +6876,15 @@ class GanggeDesktop(QMainWindow):
                     updates["MM_API_KEY"] = mm_key
                 if mm_url:
                     updates["MM_BASE_URL"] = mm_url
+
+        # ── Qoder CLI 委派（CLI 侧读 QODER_*）──
+        updates["QODER_ENABLED"] = "true" if self._qoder_enable_cb.isChecked() else "false"
+        updates["QODER_MODEL"] = self._qoder_model_combo.currentText().strip()
+        updates["QODER_STRENGTH"] = str(self._qoder_strength_combo.currentData() or "medium")
+        updates["QODER_PERMISSION"] = str(self._qoder_perm_combo.currentData() or "edit")
+        qd_exe = self._qoder_exe_input.text().strip()
+        if qd_exe:
+            updates["QODER_CLI_PATH"] = qd_exe
 
         # ── Thinking mode ──
         if self._thinking_mode_cb.isChecked():
@@ -8823,6 +8954,11 @@ class GanggeDesktop(QMainWindow):
         self._settings.setValue("auto_inject", self._auto_inject_cb.isChecked())
         self._settings.setValue("test_verify", self._test_verify_cb.isChecked())
         self._settings.setValue("git_commit", self._git_commit_cb.isChecked())
+        self._settings.setValue("qoder_enable", self._qoder_enable_cb.isChecked())
+        self._settings.setValue("qoder_exe", self._qoder_exe_input.text())
+        self._settings.setValue("qoder_model", self._qoder_model_combo.currentText())
+        self._settings.setValue("qoder_strength", self._qoder_strength_combo.currentData())
+        self._settings.setValue("qoder_permission", self._qoder_perm_combo.currentData())
         self._settings.setValue("extra_prompt", self._extra_prompt.toPlainText())
         self._settings.setValue("language", self._lang_combo.currentData())
         self._settings.setValue("window_geometry", self.saveGeometry())
@@ -8863,6 +8999,26 @@ class GanggeDesktop(QMainWindow):
         self._auto_inject_cb.setChecked(self._settings.value("auto_inject", "true") != "false")
         self._test_verify_cb.setChecked(self._settings.value("test_verify", "true") != "false")
         self._git_commit_cb.setChecked(self._settings.value("git_commit", "true") != "false")
+        # Restore Qoder CLI delegation settings
+        self._qoder_enable_cb.setChecked(self._settings.value("qoder_enable", "true") != "false")
+        qd_exe = self._settings.value("qoder_exe", "") or ""
+        if qd_exe:
+            self._qoder_exe_input.setText(str(qd_exe))
+        qd_model = str(self._settings.value("qoder_model", "") or "")
+        if qd_model:
+            qd_idx = self._qoder_model_combo.findText(qd_model)
+            if qd_idx >= 0:
+                self._qoder_model_combo.setCurrentIndex(qd_idx)
+            else:
+                self._qoder_model_combo.setCurrentText(qd_model)
+        qd_strength = str(self._settings.value("qoder_strength", "medium") or "medium")
+        qd_idx = self._qoder_strength_combo.findData(qd_strength)
+        if qd_idx >= 0:
+            self._qoder_strength_combo.setCurrentIndex(qd_idx)
+        qd_perm = str(self._settings.value("qoder_permission", "edit") or "edit")
+        qd_idx = self._qoder_perm_combo.findData(qd_perm)
+        if qd_idx >= 0:
+            self._qoder_perm_combo.setCurrentIndex(qd_idx)
         # Restore multimodal settings
         self._mm_enable_cb.setChecked(self._settings.value("mm_enable", "false") == "true")
         mm_p = self._settings.value("mm_provider", "qwen")

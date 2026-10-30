@@ -73,6 +73,7 @@ TOOL_PHASES: dict[str, int] = {
     "package_info":   PHASE_SPECIAL,  # 结构化 API 直连（GitHub/npm/PyPI）
     "generate_image": PHASE_SPECIAL,
     "demo_video":     PHASE_SPECIAL,  # storyboard → narrated mp4
+    "qoder_delegate": PHASE_SPECIAL,  # 外包一个可验证闭环给 Qoder CLI
     "browser":        PHASE_SPECIAL,
     "vision":         PHASE_EXPLORE,  # always visible — LLM needs it for image tasks
     # Novel tools — all phase 4
@@ -135,6 +136,8 @@ AGENT_PROFILES = {
             "generate_image",
             # Demo video (storyboard → mp4)
             "demo_video",
+            # 外包一个可验证闭环给 Qoder CLI（省上下文）
+            "qoder_delegate",
         },
     },
     "novel": {
@@ -258,6 +261,7 @@ PROFILE_CORE: dict[str, set[str]] = {
         "ask_user",
         "chat_log",
         "tool_search",
+        "qoder_delegate",
     },
     # Novel and research sessions are domain sessions: hiding their own domain
     # tools behind a search would only add a round to every single turn.
@@ -636,6 +640,15 @@ def create_tool_registry(
         logger.info("[Registry] demo_video registered — storyboard → mp4")
     except Exception as e:
         logger.warning("[Registry] demo_video skipped: %s", e)
+
+    # ── Qoder CLI 委派（综合型：一次调用跑完一个闭环，过程不进主上下文）──
+    try:
+        from gangge.layer3_agent.tools.qoder import QoderDelegateTool
+
+        registry.register(QoderDelegateTool(workspace=workspace))
+        logger.info("[Registry] qoder_delegate registered — 外包可验证闭环给 Qoder CLI")
+    except Exception as e:
+        logger.warning("[Registry] qoder_delegate skipped: %s", e)
 
     create_tool = CreateToolTool(workspace=workspace, registry=registry)
     registry.register(create_tool)
