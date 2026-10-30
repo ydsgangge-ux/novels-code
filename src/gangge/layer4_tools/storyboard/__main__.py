@@ -13,6 +13,8 @@ import json
 import sys
 from pathlib import Path
 
+from gangge.layer4_tools.storyboard.schema import DECOR_NAMES, STYLE_NAMES
+
 
 SAMPLE_STORYBOARD: dict = {
     "title": "演示视频示例",
@@ -60,6 +62,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--provider", help="LLM provider，覆盖 .env 的 LLM_PROVIDER")
     p.add_argument("--model", help="模型名，覆盖 provider 默认值")
     p.add_argument("--api-key", dest="api_key", help="API Key，仅本次生效")
+    p.add_argument("--style", choices=list(STYLE_NAMES), help="视觉风格预设")
+    p.add_argument("--decor", help="装饰层，逗号分隔：glow,grid,grain,particles,scanline")
     p.add_argument("--voice", default="zh-CN-XiaoxiaoNeural", help="edge-tts 音色")
     p.add_argument("--fps", type=int, help="帧率，默认沿用分镜（30）")
     p.add_argument("--no-narration", action="store_true", help="不配音，按字数估算时长")
@@ -119,6 +123,14 @@ async def _run(args: argparse.Namespace) -> int:
         storyboard.voice = args.voice
     if args.fps:
         storyboard.fps = max(10, min(60, args.fps))
+    if args.style:
+        storyboard.style = args.style
+    if args.decor is not None:
+        # An explicit empty string means "no ornaments at all", which differs
+        # from omitting the flag (style defaults apply).
+        storyboard.decor = [
+            d.strip() for d in args.decor.split(",") if d.strip() in DECOR_NAMES
+        ]
 
     out_dir = Path(args.out) if args.out else Path(".gangge") / "demo_videos" / _slug(label)
     print(f"分镜: {len(storyboard.scenes)} 个镜头，预计 {storyboard.total_duration:.1f}s")

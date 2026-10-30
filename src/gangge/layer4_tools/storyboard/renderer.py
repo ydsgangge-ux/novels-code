@@ -57,6 +57,8 @@ async def render_frames(
             # Without this, the first frames can be captured before the CJK
             # font resolves and the headline renders in a fallback face.
             await page.evaluate("() => (document.fonts ? document.fonts.ready : null)")
+            # The page ships with a preview player; it must not appear in a frame.
+            await page.evaluate("() => window.__hide_ui && window.__hide_ui()")
             await page.wait_for_timeout(60)
 
             for i in range(total):

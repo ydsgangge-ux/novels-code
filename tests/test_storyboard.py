@@ -19,7 +19,7 @@ from gangge.layer4_tools.storyboard import (
     render_page,
     write_preview,
 )
-from gangge.layer4_tools.storyboard import composer
+from gangge.layer4_tools.storyboard import composer, templates
 from gangge.layer4_tools.storyboard.schema import estimate_speech_seconds
 
 
@@ -126,6 +126,30 @@ def test_render_page_exposes_seek_and_templates():
     assert 'class="scene tpl-bullets"' in page
     assert 'data-anim="slide-right"' in page
     assert page.count('data-anim="') >= 4
+
+
+def test_stagger_entries_are_monotonic_and_inside_scene():
+    """Each item enters after the previous one and before the scene ends.
+
+    A scene can be far longer than its lead-in (voice-over decides the length),
+    so a frame grabbed late in the scene still has to show *all* items. If an
+    entry time ever exceeded the scene duration, that item would be invisible
+    for the whole scene — the classic "third bullet missing" screenshot.
+    """
+    for count, duration in ((2, 2.0), (3, 9.34), (6, 9.34), (8, 1.2)):
+        starts = templates._steps(count, duration)
+        assert len(starts) == count
+        assert starts == sorted(starts)
+        assert starts[0] >= 0.0
+        # 0.55 is the entry animation length; the last item must have landed by
+        # the cut. (The reserved ``hold`` is 0.5s, hence the small tolerance.)
+        assert starts[-1] + 0.55 <= duration + 1e-6
+
+
+def test_stagger_lead_in_stays_short_on_long_scenes():
+    """A long scene must not push the last item's entry out of the first seconds."""
+    for count in range(2, 9):
+        assert templates._steps(count, 10.0)[-1] <= 2.5
 
 
 def test_render_page_escapes_text():

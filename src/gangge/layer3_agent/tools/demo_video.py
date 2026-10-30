@@ -122,6 +122,22 @@ class DemoVideoTool(BaseTool):
                     "type": "string",
                     "description": "输出目录，默认 <workspace>/.gangge/demo_videos/<主题>-<时间>",
                 },
+                "style": {
+                    "type": "string",
+                    "enum": ["dark", "neon", "paper", "glass", "brutal"],
+                    "description": (
+                        "视觉风格：dark 克制深色 / neon 发光科技 / paper 纸张书卷 / "
+                        "glass 玻璃拟态 / brutal 撞色粗框。用户要「华丽」时用 neon 或玻璃"
+                    ),
+                },
+                "decor": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["glow", "grid", "grain", "particles", "scanline"],
+                    },
+                    "description": "背景装饰层，留空则用该风格的默认组合",
+                },
                 "voice": {
                     "type": "string",
                     "description": "edge-tts 音色，默认 zh-CN-XiaoxiaoNeural",
@@ -214,6 +230,12 @@ class DemoVideoTool(BaseTool):
 
         if kwargs.get("voice"):
             storyboard.voice = str(kwargs["voice"])
+        if kwargs.get("style"):
+            storyboard.style = str(kwargs["style"]).strip().lower()
+        if kwargs.get("decor"):
+            from gangge.layer4_tools.storyboard.schema import DECOR_NAMES
+
+            storyboard.decor = [str(d) for d in kwargs["decor"] if str(d) in DECOR_NAMES]
         # Name the folder after whatever the caller actually gave us: the topic
         # if there was one, else the storyboard title, else the first shot's.
         label = topic or storyboard.title or next(

@@ -17,6 +17,13 @@ from typing import Any
 # up front, rather than rendering a blank frame at t=14.2s with no explanation.
 TEMPLATE_NAMES: tuple[str, ...] = ("title", "bullets", "flow", "quote", "outro")
 
+# Visual presets. "Which look" is a config value, not generated code — that is
+# what lets one word ("华丽一点") change the whole video.
+STYLE_NAMES: tuple[str, ...] = ("dark", "neon", "paper", "glass", "brutal")
+
+# Background ornaments, all driven by t so frame capture stays deterministic.
+DECOR_NAMES: tuple[str, ...] = ("glow", "grid", "grain", "particles", "scanline")
+
 DEFAULT_THEME: dict[str, str] = {
     "bg": "#0b0f16",
     "fg": "#f0f4fa",
@@ -77,8 +84,12 @@ class Storyboard:
     width: int = 1920
     height: int = 1080
     voice: str = "zh-CN-XiaoxiaoNeural"
-    theme: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_THEME))
+    # Colour overrides applied on top of the style preset; empty means "use the
+    # preset as-is". Keeping it empty by default is what makes `style` work.
+    theme: dict[str, str] = field(default_factory=dict)
     gap: float = 0.25  # breathing room between shots
+    style: str = "dark"
+    decor: list[str] = field(default_factory=list)
 
     # ── construction ────────────────────────────────────────────
 
@@ -106,11 +117,20 @@ class Storyboard:
             scene = cls._parse_scene(raw, i)
             scenes.append(scene)
 
-        theme = dict(DEFAULT_THEME)
+        theme: dict[str, str] = {}
         if isinstance(data.get("theme"), dict):
             for key, value in data["theme"].items():
-                if key in theme and isinstance(value, str) and value.startswith("#"):
+                if key in DEFAULT_THEME and isinstance(value, str) and value.startswith("#"):
                     theme[key] = value
+
+        style = str(data.get("style") or "dark").strip().lower()
+        if style not in STYLE_NAMES:
+            raise StoryboardError(
+                f"style 无效: {style!r}；可用: {', '.join(STYLE_NAMES)}"
+            )
+        # Unknown decorations are dropped rather than rejected: they are garnish,
+        # and a typo should not cost the caller a whole retry.
+        decor = [d for d in _str_list(data.get("decor")) if d in DECOR_NAMES]
 
         fps = _clamp_int(data.get("fps", 30), 10, 60, 30)
         return cls(
@@ -122,6 +142,8 @@ class Storyboard:
             voice=str(data.get("voice") or "zh-CN-XiaoxiaoNeural"),
             theme=theme,
             gap=_clamp_float(data.get("gap", 0.25), 0.0, 2.0, 0.25),
+            style=style,
+            decor=decor,
         )
 
     @staticmethod
