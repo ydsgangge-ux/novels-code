@@ -21,6 +21,8 @@ from typing import Any, Sequence
 from gangge.layer4_tools.storyboard.schema import Scene, Storyboard
 
 BASE_W, BASE_H = 1920, 1080
+#: 竖屏按手机竖拍的 9:16 排版；字号用容器查询单位，换分辨率不用改 CSS。
+PORTRAIT_W, PORTRAIT_H = 1080, 1920
 
 
 # ── styles ──────────────────────────────────────────────────────
@@ -92,12 +94,63 @@ _STYLE_EXTRA: dict[str, str] = {
 
 # Ornaments that come with a style unless the storyboard says otherwise.
 _STYLE_DEFAULT_DECOR: dict[str, tuple[str, ...]] = {
-    "dark": ("glow",),
-    "neon": ("glow", "grid"),
-    "paper": ("grain",),
-    "glass": ("glow", "grain"),
-    "brutal": (),
+    "dark": ("glow", "particles"),
+    "neon": ("glow", "grid", "particles", "scanline"),
+    "paper": ("grain", "glow"),
+    "glass": ("glow", "grain", "particles"),
+    "brutal": ("glow", "grid"),
 }
+
+#: 竖屏版式：9:16 排版换一套单位，横屏那份 CSS 一个字都不用动。
+#: 手机竖屏的观看距离和握持方式决定了——字要大、一行要少、底部要留空。
+_PORTRAIT_CSS = """
+  body.portrait #stage { container-type: size; }
+  body.portrait .scene { padding: 11cqh 8cqw 15cqh; }
+  body.portrait h1 { font-size: 13.5cqw; line-height: 1.24; letter-spacing: -0.2cqw; }
+  body.portrait h2 { font-size: 8.6cqw; line-height: 1.3; margin-bottom: 6cqh; }
+  body.portrait .sub {
+    font-size: 5cqw; line-height: 1.55; margin-top: 4cqh; max-width: 84cqw;
+  }
+  body.portrait .rule { width: 26cqw; height: 0.7cqw; margin-top: 4.5cqh; }
+  body.portrait .col.center .rule { margin-left: auto; margin-right: auto; }
+
+  body.portrait .scene.tpl-bullets .col {
+    max-width: 88cqw; padding-left: 0; border-left: none;
+  }
+  body.portrait .bullets { gap: 4.2cqh; }
+  body.portrait .bullets li { gap: 3.4cqw; }
+  body.portrait .bullets .idx { font-size: 4.4cqw; min-width: 9cqw; }
+  body.portrait .bullets .txt { font-size: 7cqw; line-height: 1.42; }
+
+  /* 竖屏放不下横排三个节点，改成自上而下的流向 */
+  body.portrait .flow { flex-direction: column; gap: 2.4cqh; margin-top: 0; }
+  body.portrait .flow .node {
+    font-size: 6.2cqw; padding: 3cqh 8cqw; border-radius: 4cqw;
+  }
+  body.portrait .flow .arrow {
+    font-size: 5.2cqw; transform: rotate(90deg); line-height: 1;
+  }
+
+  body.portrait blockquote { font-size: 9.4cqw; line-height: 1.42; max-width: 88cqw; }
+  body.portrait cite { font-size: 4.2cqw; margin-top: 4cqh; }
+  body.portrait .cta {
+    margin-top: 6cqh; padding: 2.6cqh 9cqw; border-radius: 99cqw; font-size: 5cqw;
+  }
+
+  /* 背景在竖屏里要按画幅换算，否则 1100px 的渐变只盖住左上角 */
+  body.portrait .deco-glow {
+    background:
+      radial-gradient(72cqw 38cqh at 20% 14%, rgba(var(--accent-rgb), .26), transparent 64%),
+      radial-gradient(64cqw 32cqh at 84% 86%, rgba(var(--accent2-rgb), .20), transparent 62%);
+  }
+  body.portrait .deco-scan { height: 11cqh; }
+  body.portrait .particle { width: 0.9cqw; height: 0.9cqw; filter: blur(0.25cqw); }
+  body.portrait .deco-grid { background-size: 7cqw 7cqw; }
+
+  /* 手机录屏时控制条别压住内容 */
+  body.portrait #controls { bottom: 2.4cqh; }
+"""
+
 
 _PARTICLE_COUNT = 26
 
@@ -240,7 +293,11 @@ def resolve_decor(sb: Storyboard) -> tuple[str, ...]:
 def render_page(sb: Storyboard, slots: Sequence[tuple[Scene, float, float]]) -> str:
     """Build the full standalone HTML for ``slots`` (start/end in seconds)."""
     total = slots[-1][2] if slots else 0.0
-    scale = sb.width / BASE_W
+    # 画幅决定基准尺寸：竖屏按 1080×1920 排版，横屏还是 1920×1080，
+    # 最后统一 scale 到 sb.width，所以两种画幅共用同一套渲染出口。
+    portrait = sb.height > sb.width
+    stage_w, stage_h = (PORTRAIT_W, PORTRAIT_H) if portrait else (BASE_W, BASE_H)
+    scale = sb.width / stage_w
     sections = "\n".join(
         f'<section class="scene tpl-{scene.template}" '
         f'data-start="{start}" data-end="{end}">'
@@ -263,7 +320,11 @@ def render_page(sb: Storyboard, slots: Sequence[tuple[Scene, float, float]]) -> 
         accent2_rgb=_hex_to_rgb(palette["accent2"]),
         width=sb.width,
         height=sb.height,
+        stage_w=stage_w,
+        stage_h=stage_h,
         scale=f"{scale:.4f}",
+        layout_class="portrait" if portrait else "landscape",
+        layout_css=_PORTRAIT_CSS if portrait else "",
         total=f"{total:.3f}",
         sections=sections,
         decor=_decor_html(resolve_decor(sb)),
@@ -291,15 +352,22 @@ _PAGE = Template("""<!DOCTYPE html>
     color: var(--fg); -webkit-font-smoothing: antialiased;
   }
   #stage {
-    position: relative; width: 1920px; height: 1080px;
+    position: relative; width: ${stage_w}px; height: ${stage_h}px;
     transform: scale($scale); transform-origin: top left;
     background: var(--bg); overflow: hidden;
+  }
+  /* 镜头层：整段缓慢推近，让静止画面也有呼吸 */
+  #camera {
+    position: absolute; inset: 0; transform-origin: 50% 50%;
+    will-change: transform;
   }
 
   /* ── decoration ── */
   #decor { position: absolute; inset: 0; pointer-events: none; z-index: 0; }
   .deco { position: absolute; inset: 0; }
+  /* 外扩一圈，漂移时边缘不会露出底色 */
   .deco-glow {
+    inset: -18%; will-change: transform;
     background:
       radial-gradient(1100px 620px at 18% 12%, rgba(var(--accent-rgb), .22), transparent 62%),
       radial-gradient(900px 560px at 86% 88%, rgba(var(--accent2-rgb), .18), transparent 60%);
@@ -382,6 +450,8 @@ _PAGE = Template("""<!DOCTYPE html>
 
   $style_extra
 
+  $layout_css
+
   /* ── preview controls (never captured: hidden before a screenshot) ── */
   #controls {
     position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
@@ -403,10 +473,12 @@ _PAGE = Template("""<!DOCTYPE html>
   #clock { font-variant-numeric: tabular-nums; white-space: nowrap; }
 </style>
 </head>
-<body class="$style_class">
+<body class="$style_class $layout_class">
 <div id="stage">
-  <div id="decor">$decor</div>
-  $sections
+  <div id="camera">
+    <div id="decor">$decor</div>
+    $sections
+  </div>
 </div>
 <div id="controls">
   <button id="btn-play" title="播放 / 暂停（空格）">▶</button>
@@ -421,6 +493,8 @@ _PAGE = Template("""<!DOCTYPE html>
   var particles = Array.prototype.slice.call(document.querySelectorAll('.particle'));
   var grid = document.querySelector('.deco-grid');
   var scan = document.querySelector('.deco-scan');
+  var glow = document.querySelector('.deco-glow');
+  var camera = document.getElementById('camera');
   var bar = document.getElementById('seekbar');
   var clock = document.getElementById('clock');
   var btn = document.getElementById('btn-play');
@@ -442,8 +516,9 @@ _PAGE = Template("""<!DOCTYPE html>
       el.style.opacity = 1;
       el.style.transform = 'scaleX(' + e.toFixed(4) + ')';
     } else if (kind === 'fade') {
+      // 只改透明度：留空让样式表里的 transform（比如竖屏箭头转 90°）生效
       el.style.opacity = e;
-      el.style.transform = 'none';
+      el.style.transform = '';
     } else if (kind === 'slide-right') {
       el.style.opacity = e;
       el.style.transform = 'translateX(' + ((1 - e) * -46).toFixed(2) + 'px)';
@@ -468,6 +543,14 @@ _PAGE = Template("""<!DOCTYPE html>
     }
     if (grid) grid.style.backgroundPosition = (t * 7).toFixed(1) + 'px ' + (t * 7).toFixed(1) + 'px';
     if (scan) scan.style.top = (((t * 0.16) % 1) * 100).toFixed(2) + '%';
+    // 光斑缓慢漂移 + 呼吸，让背景不再是一张贴图
+    if (glow) {
+      var gx = Math.sin(t * 0.21) * 2.4;
+      var gy = Math.cos(t * 0.16) * 2.0;
+      var gs = 1 + 0.06 * Math.sin(t * 0.13);
+      glow.style.transform =
+        'translate3d(' + gx.toFixed(2) + '%,' + gy.toFixed(2) + '%,0) scale(' + gs.toFixed(3) + ')';
+    }
   }
 
   function syncBar(t) {
@@ -491,6 +574,11 @@ _PAGE = Template("""<!DOCTYPE html>
       for (var j = 0; j < els.length; j++) apply(els[j], local);
     }
     decor(t);
+    // 镜头推进：整段从 1.000 缓慢推到 1.035，切镜时归零，像机位在走
+    if (camera && total > 0) {
+      var k = Math.max(0, Math.min(1, t / total));
+      camera.style.transform = 'scale(' + (1 + 0.035 * k).toFixed(4) + ')';
+    }
     syncBar(t);
   };
 

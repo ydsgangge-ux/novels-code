@@ -43,6 +43,20 @@ def test_auto_style_skill_uses_some_preview():
     assert preview_image(skill) is not None
 
 
+def test_portrait_skill_ships_a_portrait_preview(qapp):
+    """竖屏技能的示例图必须是竖的，横图会让人以为是横屏片。"""
+    from PyQt6.QtGui import QPixmap
+
+    skill = find("video_portrait")
+    assert skill is not None
+    assert "aspect=9:16" in skill.template
+
+    path = preview_image(skill)
+    assert path is not None
+    pixmap = QPixmap(str(path))
+    assert pixmap.height() > pixmap.width(), "竖屏预览图不该是横的"
+
+
 def test_plain_skill_has_no_preview():
     skill = find("code_review")
     assert skill is not None
@@ -108,6 +122,17 @@ def test_animation_html_has_timeline_and_seek(tmp_path: Path, monkeypatch):
     assert html.count('class="scene') == 5, "示例片是五帧，少一帧预览就不完整"
     # 同一份缓存复用，不重复渲染
     assert skill_preview.animation_html(find("video_neon")) == path
+
+
+def test_portrait_skill_animates_in_9_by_16(tmp_path: Path, monkeypatch):
+    """竖屏技能的动画页也得是竖的，否则预览和成片不是一回事。"""
+    monkeypatch.setattr(skill_preview, "_ANIM_DIR", tmp_path / "anim")
+    path = skill_preview.animation_html(find("video_portrait"))
+
+    assert path is not None and path.is_file()
+    html = path.read_text(encoding="utf-8")
+    assert "portrait" in html
+    assert "container-type: size" in html
 
 
 def test_animation_html_rejects_unknown_style(tmp_path: Path, monkeypatch):

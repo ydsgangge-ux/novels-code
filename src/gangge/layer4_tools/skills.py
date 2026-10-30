@@ -112,6 +112,23 @@ def _video_templates() -> list[Skill]:
             ),
         )
     )
+    skills.append(
+        Skill(
+            id="video_portrait",
+            group="视频出片",
+            label="竖屏短视频 · 9:16",
+            hint="手机竖屏：字更大一行更少，一句一镜，直接发抖音/小红书",
+            focus="＜主题＞",
+            preview="portrait.png",
+            template=(
+                "用 demo_video 工具做一条 30 秒左右的竖屏短视频，aspect=9:16，style=neon。\n"
+                "主题：＜主题＞\n"
+                "口播：一镜一句，每句不超过 20 字，念出来要顺口；\n"
+                "画面：开场一句话点题，中段每屏最多 3 条，结尾给一句行动号召。\n"
+                "要求：5-6 个镜头；第一个是标题、最后一个是结尾；配音用默认音色。"
+            ),
+        )
+    )
     return skills
 
 

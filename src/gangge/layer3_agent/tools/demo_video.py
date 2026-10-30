@@ -138,6 +138,15 @@ class DemoVideoTool(BaseTool):
                     },
                     "description": "背景装饰层，留空则用该风格的默认组合",
                 },
+                "aspect": {
+                    "type": "string",
+                    "enum": ["16:9", "9:16"],
+                    "description": (
+                        "画幅：16:9 横屏（默认，演示/投屏）；"
+                        "9:16 竖屏（抖音小红书，字更大一行更少）"
+                    ),
+                    "default": "16:9",
+                },
                 "voice": {
                     "type": "string",
                     "description": "edge-tts 音色，默认 zh-CN-XiaoxiaoNeural",
@@ -236,6 +245,11 @@ class DemoVideoTool(BaseTool):
             from gangge.layer4_tools.storyboard.schema import DECOR_NAMES
 
             storyboard.decor = [str(d) for d in kwargs["decor"] if str(d) in DECOR_NAMES]
+        # 画幅决定排版基准：竖屏换一套字号与流向，横屏保持原样
+        if str(kwargs.get("aspect") or "").strip() == "9:16":
+            storyboard.width, storyboard.height = 1080, 1920
+        elif str(kwargs.get("aspect") or "").strip() == "16:9":
+            storyboard.width, storyboard.height = 1920, 1080
         # Name the folder after whatever the caller actually gave us: the topic
         # if there was one, else the storyboard title, else the first shot's.
         label = topic or storyboard.title or next(

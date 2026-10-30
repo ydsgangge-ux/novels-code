@@ -20,7 +20,7 @@ from gangge.layer4_tools.storyboard import (
     write_preview,
 )
 from gangge.layer4_tools.storyboard import composer, templates
-from gangge.layer4_tools.storyboard.schema import estimate_speech_seconds
+from gangge.layer4_tools.storyboard.schema import Scene, estimate_speech_seconds
 
 
 def _sb(**overrides) -> Storyboard:
@@ -157,6 +157,49 @@ def test_render_page_escapes_text():
     page = render_page(sb, sb.timeline())
     assert "<script>x</script>" not in page
     assert "&lt;script&gt;" in page
+
+
+def test_portrait_gets_its_own_layout():
+    """9:16 换一套版式：容器单位 + 纵向流向，横屏那份 CSS 不能跟过来。"""
+    sb = Storyboard(
+        scenes=[Scene(template="flow", nodes=["甲", "乙"])],
+        width=1080,
+        height=1920,
+    )
+    page = render_page(sb, sb.timeline())
+    assert "portrait" in page
+    assert "container-type: size" in page
+    assert "cqw" in page
+    # 竖屏的流向要竖着走，否则三个节点会挤出画面
+    assert "flex-direction: column" in page
+    assert "rotate(90deg)" in page, "竖屏箭头要朝下"
+
+
+def test_landscape_keeps_the_old_page():
+    sb = Storyboard(scenes=[Scene(template="title", title="横屏")], width=1920, height=1080)
+    page = render_page(sb, sb.timeline())
+    assert "landscape" in page
+    assert "container-type: size" not in page, "横屏不该吃到竖屏的容器查询"
+
+
+def test_camera_layer_wraps_every_scene():
+    """镜头推进靠 #camera 这层，内容漏在它外面就推不动。"""
+    sb = Storyboard(scenes=[Scene(template="title", title="标题")])
+    page = render_page(sb, sb.timeline())
+    assert 'id="camera"' in page
+    assert "camera.style.transform" in page
+    # 场景必须包在 camera 里
+    camera_at = page.index('id="camera"')
+    assert page.index('class="scene tpl-title"') > camera_at
+
+
+def test_background_layers_are_actually_emitted():
+    """装饰层以前只有 glow 被默认启用，粒子/扫描线写了却从没上过场。"""
+    neon = Storyboard(scenes=[Scene(template="title", title="标题")], style="neon")
+    page = render_page(neon, neon.timeline())
+    assert 'class="particle"' in page
+    assert "deco-grid" in page
+    assert "deco-scan" in page
 
 
 def test_write_preview_creates_file(tmp_path: Path):

@@ -93,12 +93,19 @@ def webengine_status() -> tuple[bool, str]:
 
 def animation_html(skill: Skill) -> Path | None:
     """把技能对应的示例 storyboard 落成 HTML（同一份缓存复用）。"""
-    style = Path(skill.preview).stem
+    stem = Path(skill.preview).stem
+    # 竖屏技能没有独立风格，用 neon 的配色 + 9:16 画幅
+    portrait = stem == "portrait"
+    style = "neon" if portrait else stem
     if style not in STYLE_NAMES:
         return None
-    path = _ANIM_DIR / f"{style}.html"
+
+    name = "portrait" if portrait else style
+    path = _ANIM_DIR / f"{name}.html"
     if not path.is_file():
         storyboard = demo_storyboard(style)
+        if portrait:
+            storyboard.width, storyboard.height = 1080, 1920
         _ANIM_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(render_page(storyboard, storyboard.timeline()), encoding="utf-8")
     return path
