@@ -54,11 +54,15 @@ _STYLES: dict[str, dict[str, str]] = {
 _STYLE_EXTRA: dict[str, str] = {
     "dark": "",
     "neon": """
-  h1, h2, blockquote { text-shadow: 0 0 30px rgba(var(--accent-rgb), .45),
-                                       0 0 70px rgba(var(--accent2-rgb), .25); }
+  /* 三层辉光：贴字的紧光晕负责锐利，外两层负责把颜色铺到背景上 */
+  h1, h2, blockquote { text-shadow: 0 0 16px rgba(var(--accent-rgb), .55),
+                                       0 0 52px rgba(var(--accent-rgb), .32),
+                                       0 0 116px rgba(var(--accent2-rgb), .30); }
   .flow .node { box-shadow: 0 0 34px rgba(var(--accent-rgb), .35),
-                           inset 0 0 18px rgba(var(--accent2-rgb), .18); }
-  .rule { box-shadow: 0 0 18px rgba(var(--accent-rgb), .8); }
+                          inset 0 0 18px rgba(var(--accent2-rgb), .18); }
+  .rule { width: 186px; height: 6px;
+          box-shadow: 0 0 20px rgba(var(--accent-rgb), .85),
+                      0 0 60px rgba(var(--accent2-rgb), .45); }
 """,
     "paper": """
   h1, h2, blockquote { font-family: "Songti SC", "SimSun", "Noto Serif CJK SC", serif; }
@@ -287,6 +291,12 @@ def resolve_decor(sb: Storyboard) -> tuple[str, ...]:
     return tuple(sb.decor) if sb.decor else _STYLE_DEFAULT_DECOR.get(sb.style, ())
 
 
+def style_palette(sb: Storyboard) -> dict[str, str]:
+    """实际用到的颜色：先取风格预设，再叠分镜里的 theme 覆盖。"""
+    preset = _STYLES.get(sb.style, _STYLES["dark"])
+    return {**preset, **{k: v for k, v in sb.theme.items() if v}}
+
+
 # ── page assembly ───────────────────────────────────────────────
 
 
@@ -305,8 +315,7 @@ def render_page(sb: Storyboard, slots: Sequence[tuple[Scene, float, float]]) -> 
         for scene, start, end in slots
     )
 
-    preset = _STYLES.get(sb.style, _STYLES["dark"])
-    palette = {**preset, **{k: v for k, v in sb.theme.items() if v}}
+    palette = style_palette(sb)
 
     return _PAGE.substitute(
         title=_esc(sb.title or "storyboard"),
@@ -356,10 +365,16 @@ _PAGE = Template("""<!DOCTYPE html>
     transform: scale($scale); transform-origin: top left;
     background: var(--bg); overflow: hidden;
   }
-  /* 镜头层：整段缓慢推近，让静止画面也有呼吸 */
+  /* 镜头层：每个版式一套机位，由 __seek 逐帧计算 */
   #camera {
     position: absolute; inset: 0; transform-origin: 50% 50%;
     will-change: transform;
+  }
+  /* 切镜的曝光闪，压在画面之上、控件之下 */
+  #flash {
+    position: absolute; inset: 0; pointer-events: none; opacity: 0; z-index: 5;
+    background: radial-gradient(circle at 50% 46%,
+                rgba(var(--accent-rgb), .85), transparent 72%);
   }
 
   /* ── decoration ── */
@@ -383,9 +398,14 @@ _PAGE = Template("""<!DOCTYPE html>
     opacity: .055;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   }
+  /* 镜头后拉时装饰层会整体缩小，满宽的光带会被裁成一条硬边方块，
+     所以左右各外扩一圈，并且用多档渐变让它没有可见的起止线 */
   .deco-scan {
-    inset: auto 0 auto 0; height: 200px;
-    background: linear-gradient(180deg, transparent, rgba(var(--accent-rgb), .10), transparent);
+    inset: auto -12% auto -12%; height: 200px;
+    background: linear-gradient(180deg,
+                transparent, rgba(var(--accent-rgb), .035) 32%,
+                rgba(var(--accent-rgb), .07) 50%,
+                rgba(var(--accent-rgb), .035) 68%, transparent);
   }
   .deco-particles { overflow: hidden; }
   .particle {
@@ -407,8 +427,11 @@ _PAGE = Template("""<!DOCTYPE html>
   .col.center { align-items: center; }
   .col.left { align-items: flex-start; }
 
-  h1 { font-size: 96px; line-height: 1.18; font-weight: 800; letter-spacing: -1px; }
-  h2 { font-size: 64px; line-height: 1.25; font-weight: 700; margin-bottom: 58px; }
+  /* balance: 中文标题宁可折成两行等长，也不要末行只剩两个字 */
+  h1 { font-size: 112px; line-height: 1.16; font-weight: 800; letter-spacing: -1.5px;
+       text-wrap: balance; }
+  h2 { font-size: 72px; line-height: 1.24; font-weight: 700; margin-bottom: 58px;
+       text-wrap: balance; }
   .sub { font-size: 44px; line-height: 1.5; color: var(--muted); margin-top: 36px; max-width: 1240px; }
   .rule {
     width: 132px; height: 5px; border-radius: 3px; margin-top: 38px;
@@ -438,7 +461,8 @@ _PAGE = Template("""<!DOCTYPE html>
   }
   .flow .arrow { font-size: 44px; color: var(--accent); opacity: .85; }
 
-  blockquote { font-size: 74px; line-height: 1.36; font-weight: 700; max-width: 1500px; }
+  blockquote { font-size: 74px; line-height: 1.36; font-weight: 700; max-width: 1500px;
+               text-wrap: balance; }
   cite { display: block; margin-top: 34px; font-size: 32px; color: var(--muted); font-style: normal; }
 
   .cta {
@@ -479,6 +503,7 @@ _PAGE = Template("""<!DOCTYPE html>
     <div id="decor">$decor</div>
     $sections
   </div>
+  <div id="flash"></div>
 </div>
 <div id="controls">
   <button id="btn-play" title="播放 / 暂停（空格）">▶</button>
@@ -495,6 +520,8 @@ _PAGE = Template("""<!DOCTYPE html>
   var scan = document.querySelector('.deco-scan');
   var glow = document.querySelector('.deco-glow');
   var camera = document.getElementById('camera');
+  var decorLayer = document.getElementById('decor');
+  var flashEl = document.getElementById('flash');
   var bar = document.getElementById('seekbar');
   var clock = document.getElementById('clock');
   var btn = document.getElementById('btn-play');
@@ -553,6 +580,38 @@ _PAGE = Template("""<!DOCTYPE html>
     }
   }
 
+  // 每个版式一种机位。PPT 感来自「固定机位 + 元素淡入」，所以这里给每一类
+  // 镜头安排自己的运动：开场拉远、要点推近、流程从局部拉到全貌、金句横移、
+  // 结尾后拉收住。数值是相对 stage 的比例，换画幅不用改。
+  var SHOTS = {
+    title:   { s0: 1.075, s1: 1.000, x0: 0.0, x1: 0.0, y0: 0.6, y1: 0.0 },
+    bullets: { s0: 1.000, s1: 1.055, x0: 0.0, x1: 0.0, y0: 0.0, y1: -0.5 },
+    flow:    { s0: 1.130, s1: 1.000, x0: 0.0, x1: 0.0, y0: 0.0, y1: 0.0 },
+    quote:   { s0: 1.050, s1: 1.010, x0: -0.9, x1: 0.9, y0: 0.0, y1: 0.0 },
+    outro:   { s0: 1.000, s1: 0.955, x0: 0.0, x1: 0.0, y0: 0.0, y1: 0.5 }
+  };
+
+  function shotOf(scene, local, dur) {
+    var cls = scene ? scene.className : '';
+    var key = 'title';
+    for (var k in SHOTS) { if (cls.indexOf('tpl-' + k) >= 0) { key = k; break; } }
+    var c = SHOTS[key];
+    var e = ease(Math.max(0, Math.min(1, local / Math.max(0.001, dur))));
+    return {
+      scale: c.s0 + (c.s1 - c.s0) * e,
+      x: c.x0 + (c.x1 - c.x0) * e,
+      y: c.y0 + (c.y1 - c.y0) * e
+    };
+  }
+
+  // 手持感：两三个不同周期的正弦叠加，幅度不到 0.2%，看不出抖，但画面是活的
+  function handheld(t) {
+    return {
+      x: Math.sin(t * 1.7) * 0.10 + Math.sin(t * 2.9) * 0.05,
+      y: Math.cos(t * 1.3) * 0.10 + Math.sin(t * 2.1) * 0.05
+    };
+  }
+
   function syncBar(t) {
     if (bar && total > 0) bar.value = String(Math.round((t / total) * 1000));
     if (clock) clock.textContent = t.toFixed(1) + ' / ' + total.toFixed(1) + 's';
@@ -562,6 +621,7 @@ _PAGE = Template("""<!DOCTYPE html>
   // produces the same video as a fast one.
   window.__seek = function (t) {
     currentT = t;
+    var active = null, local = 0, dur = 1;
     for (var i = 0; i < scenes.length; i++) {
       var s = scenes[i];
       var st = parseFloat(s.dataset.start);
@@ -569,15 +629,34 @@ _PAGE = Template("""<!DOCTYPE html>
       var on = t >= st && t < en;
       s.style.display = on ? 'flex' : 'none';
       if (!on) continue;
-      var local = t - st;
+      active = s;
+      local = t - st;
+      dur = en - st;
       var els = s.querySelectorAll('[data-anim]');
       for (var j = 0; j < els.length; j++) apply(els[j], local);
     }
     decor(t);
-    // 镜头推进：整段从 1.000 缓慢推到 1.035，切镜时归零，像机位在走
-    if (camera && total > 0) {
-      var k = Math.max(0, Math.min(1, t / total));
-      camera.style.transform = 'scale(' + (1 + 0.035 * k).toFixed(4) + ')';
+
+    // ── 机位 ──
+    var cam = active ? shotOf(active, local, dur) : { scale: 1, x: 0, y: 0 };
+    var wob = handheld(t);
+    if (camera) {
+      camera.style.transform =
+        'translate3d(' + (cam.x + wob.x).toFixed(3) + '%,' +
+        (cam.y + wob.y).toFixed(3) + '%,0) scale(' + cam.scale.toFixed(4) + ')';
+    }
+    // 视差：背景只走 45% 的位移，推拉幅度也减半，前后景就有了纵深
+    if (decorLayer) {
+      decorLayer.style.transform =
+        'translate3d(' + (cam.x * 0.45).toFixed(3) + '%,' +
+        (cam.y * 0.45).toFixed(3) + '%,0) scale(' +
+        (1 + (cam.scale - 1) * 0.5).toFixed(4) + ')';
+    }
+    // 切镜的曝光闪：进入镜头的前 0.18s 亮一下，像换了机位
+    if (flashEl) {
+      var flashDur = 0.18;
+      var lit = active && local < flashDur ? (1 - local / flashDur) * 0.42 : 0;
+      flashEl.style.opacity = lit.toFixed(3);
     }
     syncBar(t);
   };

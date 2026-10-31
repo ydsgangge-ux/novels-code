@@ -59,6 +59,9 @@ async def render_frames(
             await page.evaluate("() => (document.fonts ? document.fonts.ready : null)")
             # The page ships with a preview player; it must not appear in a frame.
             await page.evaluate("() => window.__hide_ui && window.__hide_ui()")
+            # 展示页里还嵌着一层 iframe（srcdoc），它没就绪就 __seek 会拍到空镜。
+            # 普通分镜页没有这个钩子，evaluate 立刻返回 true。
+            await page.evaluate("() => (window.__ready ? window.__ready : true)")
             await page.wait_for_timeout(60)
 
             for i in range(total):

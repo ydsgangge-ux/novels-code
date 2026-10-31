@@ -20,13 +20,16 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from gangge.layer4_tools.storyboard import composer, renderer, tts
-from gangge.layer4_tools.storyboard.schema import Storyboard
+from gangge.layer4_tools.storyboard.schema import Scene, Storyboard
 from gangge.layer4_tools.storyboard.templates import render_page
 
 logger = logging.getLogger(__name__)
+
+#: 能拍成视频的三种页面：朴素分镜页、3D 展示页、3D 展示页里装真实网站截图。
+PAGE_KINDS: tuple[str, ...] = ("storyboard", "showcase", "site")
 
 # A shot ends when the voice ends; this keeps the last syllable from being
 # clipped and gives the eye somewhere to rest before the cut.
@@ -79,12 +82,67 @@ async def _synthesize(
         return await tts.SilentTTS().synthesize(text, out_path)
 
 
+def write_page(
+    storyboard: Storyboard,
+    slots: Sequence[tuple[Scene, float, float]],
+    out_dir: Path | str,
+    *,
+    page: str = "storyboard",
+    source_url: str = "",
+    site_shot: object | None = None,
+) -> Path:
+    """写出要拍的那张页面，返回它的路径。
+
+    showcase / site 模式下仍然留一份朴素版 ``storyboard.html``——它最轻、最容易
+    对照，展示页拍坏了可以直接退回去。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plain = out_dir / "storyboard.html"
+    plain.write_text(render_page(storyboard, slots), encoding="utf-8")
+    if page == "storyboard":
+        return plain
+    # 到这里才导入：showcase 自己也带命令行入口，模块级导入会让
+    # ``python -m ...showcase`` 触发 runpy 的重复导入告警。
+    from gangge.layer4_tools.storyboard.showcase import (
+        CHAPTER_VH,
+        TAIL_VH,
+        render_showcase,
+    )
+
+    inner_html = None
+    scroll_vh = None
+    if page == "site":
+        if site_shot is None:
+            raise ValueError("page='site' 需要 site_shot：先用 site.capture_site 截图")
+        from gangge.layer4_tools.storyboard.site import SITE_SCREENS, shot_inner_page
+
+        total = round(slots[-1][2], 3) if slots else 0.0
+        # 整段视频就是一次从上到下的平移：t 从 0 走到 total，图走完全长
+        inner_html = shot_inner_page(site_shot, 0.0, max(0.2, total))
+        scroll_vh = SITE_SCREENS * CHAPTER_VH + TAIL_VH
+
+    html = render_showcase(
+        storyboard,
+        slots,
+        source_url=source_url,
+        inner_html=inner_html,
+        scroll_vh=scroll_vh,
+    )
+    fancy = out_dir / ("site.html" if page == "site" else "showcase.html")
+    fancy.write_text(html, encoding="utf-8")
+    return fancy
+
+
 async def build_video(
     storyboard: Storyboard,
     out_dir: Path | str,
     *,
     narration: bool = True,
     keep_frames: bool = False,
+    page: str = "storyboard",
+    source_url: str = "",
+    site_shot: Any = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> BuildResult:
     """Render ``storyboard`` into ``out_dir`` and report what was produced."""
@@ -120,8 +178,14 @@ async def build_video(
 
     # ── 3. page ─────────────────────────────────────────────────
     save_storyboard(storyboard, out_dir)
-    html_path = out_dir / "storyboard.html"
-    html_path.write_text(render_page(storyboard, slots), encoding="utf-8")
+    html_path = write_page(
+        storyboard,
+        slots,
+        out_dir,
+        page=page,
+        source_url=source_url,
+        site_shot=site_shot,
+    )
 
     # ── 4. audio bed + subtitles ────────────────────────────────
     audio_path: Path | None = None
@@ -201,14 +265,26 @@ def save_storyboard(storyboard: Storyboard, out_dir: Path | str) -> Path:
     return path
 
 
-def write_preview(storyboard: Storyboard, out_dir: Path | str) -> Path:
+def write_preview(
+    storyboard: Storyboard,
+    out_dir: Path | str,
+    *,
+    page: str = "storyboard",
+    source_url: str = "",
+    site_shot: Any = None,
+) -> Path:
     """Emit the HTML alone — opens in a browser, no encoder needed.
 
     Also writes ``storyboard.json``: the point of a preview is to decide what to
     change, and that means handing back something editable.
     """
     slots = storyboard.timeline()
-    html_path = Path(out_dir) / "storyboard.html"
     save_storyboard(storyboard, out_dir)
-    html_path.write_text(render_page(storyboard, slots), encoding="utf-8")
-    return html_path
+    return write_page(
+        storyboard,
+        slots,
+        out_dir,
+        page=page,
+        source_url=source_url,
+        site_shot=site_shot,
+    )

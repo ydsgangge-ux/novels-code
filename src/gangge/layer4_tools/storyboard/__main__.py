@@ -53,10 +53,20 @@ def _parser() -> argparse.ArgumentParser:
         prog="python -m gangge.layer4_tools.storyboard",
         description="分镜 → 带配音的演示视频（mp4），不进入 agent 会话。",
     )
-    src = p.add_mutually_exclusive_group(required=True)
+    src = p.add_mutually_exclusive_group()
     src.add_argument("-f", "--file", metavar="JSON", help="分镜 JSON 文件")
     src.add_argument("-t", "--topic", metavar="TEXT", help="主题，用主模型自动写分镜")
+    src.add_argument(
+        "-c", "--script", metavar="FILE", help="现成文案（txt/md）：按段切成镜头，原文照念"
+    )
     src.add_argument("-s", "--sample", action="store_true", help="使用内置示例分镜")
+    # 不在互斥组里：单独给 = 由页面自动写分镜；配合 -c = 展示页要截的那个站点
+    p.add_argument(
+        "-u",
+        "--url",
+        metavar="URL",
+        help="网址：单独给就当作分镜来源；配合 -c 就是展示页里要装的那个网站",
+    )
 
     p.add_argument("-o", "--out", metavar="DIR", help="输出目录，默认 .gangge/demo_videos/<slug>")
     p.add_argument("--provider", help="LLM provider，覆盖 .env 的 LLM_PROVIDER")
@@ -69,11 +79,54 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--no-narration", action="store_true", help="不配音，按字数估算时长")
     p.add_argument("--preview", action="store_true", help="只生成 HTML，不渲染视频")
     p.add_argument("--keep-frames", action="store_true", help="保留 PNG 帧序列")
+    p.add_argument(
+        "--page",
+        choices=("storyboard", "showcase", "site"),
+        default="storyboard",
+        help="拍哪种页面：朴素分镜页（默认）/ 3D 展示页 / 3D 展示页+真实网站截图（需 --url）",
+    )
     return p
+
+
+def _make_llm(args: argparse.Namespace) -> tuple[object | None, str]:
+    """按 .env / 命令行参数建主模型，失败时把原因交回去。"""
+    import os
+
+    from gangge.layer5_llm.registry import create_llm
+
+    try:
+        if args.api_key and args.provider:
+            os.environ[f"{args.provider.upper()}_API_KEY"] = args.api_key
+        llm = create_llm(args.provider)
+        if args.model:
+            llm.model = args.model
+        return llm, ""
+    except Exception as e:  # noqa: BLE001 - 配置问题，不是崩溃
+        return None, str(e)
+
+
+def _explain_llm_failure(reason: str) -> int:
+    env_path = Path(".env")
+    print(f"无法初始化主模型: {reason}", file=sys.stderr)
+    print(
+        f"检查 {env_path.resolve() if env_path.exists() else '.env（不存在）'}："
+        "需要 LLM_PROVIDER 和该 provider 的 *_API_KEY。",
+        file=sys.stderr,
+    )
+    print("也可以用 --sample 生成示例视频，不需要模型。", file=sys.stderr)
+    return 1
 
 
 async def _run(args: argparse.Namespace) -> int:
     from gangge.layer4_tools.storyboard import Storyboard, build_video, write_preview
+
+    given = [bool(args.file), bool(args.topic), bool(args.script), bool(args.sample)]
+    if sum(given) > 1:
+        print("分镜来源只能给一个：-f / -t / -c / -s", file=sys.stderr)
+        return 2
+    if not any(given) and not args.url:
+        print("需要分镜来源：-f / -t / -c / -s / -u 之一", file=sys.stderr)
+        return 2
 
     if args.file:
         path = Path(args.file)
@@ -85,30 +138,46 @@ async def _run(args: argparse.Namespace) -> int:
     elif args.sample:
         storyboard = Storyboard.from_dict(SAMPLE_STORYBOARD)
         label = "示例"
+    elif args.script:
+        from gangge.layer4_tools.storyboard.script import storyboard_from_script
+
+        path = Path(args.script)
+        if not path.exists():
+            print(f"文案文件不存在: {path}", file=sys.stderr)
+            return 2
+        try:
+            storyboard = storyboard_from_script(
+                path.read_text(encoding="utf-8-sig"), style=args.style or "dark"
+            )
+        except ValueError as e:
+            print(f"文案切分失败: {e}", file=sys.stderr)
+            return 2
+        label = storyboard.title
+        print(f"文案: {path.name} → {len(storyboard.scenes)} 个镜头")
+    elif args.url:
+        # Imported lazily: drafting needs a model, rendering does not, and this
+        # module must stay importable on a machine with no API key.
+        from gangge.layer4_tools.storyboard.sources import SourceError, draft_from_url
+
+        llm, reason = _make_llm(args)
+        if llm is None:
+            return _explain_llm_failure(reason)
+        try:
+            storyboard = await draft_from_url(args.url, llm)
+        except SourceError as e:
+            print(f"从网址写分镜失败: {e}", file=sys.stderr)
+            print("也可以手写 JSON 用 --file 传入，或 -t 直接给主题。", file=sys.stderr)
+            return 2
+        label = storyboard.title or args.url
+        print(f"来源: {args.url}")
     else:
         # Imported lazily: drafting needs a model, rendering does not, and this
         # module must stay importable on a machine with no API key.
-        import os
-
         from gangge.layer3_agent.tools.demo_video import DemoVideoTool
-        from gangge.layer5_llm.registry import create_llm
 
-        try:
-            if args.api_key and args.provider:
-                os.environ[f"{args.provider.upper()}_API_KEY"] = args.api_key
-            llm = create_llm(args.provider)
-            if args.model:
-                llm.model = args.model
-        except Exception as e:  # noqa: BLE001 - configuration problem, not a crash
-            env_path = Path(".env")
-            print(f"无法初始化主模型: {e}", file=sys.stderr)
-            print(
-                f"检查 {env_path.resolve() if env_path.exists() else '.env（不存在）'}："
-                "需要 LLM_PROVIDER 和该 provider 的 *_API_KEY。",
-                file=sys.stderr,
-            )
-            print("也可以用 --sample 生成示例视频，不需要模型。", file=sys.stderr)
-            return 1
+        llm, reason = _make_llm(args)
+        if llm is None:
+            return _explain_llm_failure(reason)
 
         tool = DemoVideoTool(workspace=".", llm=llm)
         try:
@@ -132,12 +201,50 @@ async def _run(args: argparse.Namespace) -> int:
             d.strip() for d in args.decor.split(",") if d.strip() in DECOR_NAMES
         ]
 
+    site_shot = None
+    if args.page == "site":
+        if not args.url:
+            print("--page site 需要 --url：框里要装的是那个网站的截图", file=sys.stderr)
+            return 2
+        from gangge.layer4_tools.storyboard.site import SiteError, capture_site
+
+        if not args.style:
+            storyboard.style = "neon"      # 展示页默认就是发光深色
+        print(f"截图: {args.url}")
+        try:
+            site_shot = await capture_site(
+                args.url,
+                color_scheme="dark"
+                if storyboard.style in ("dark", "neon", "glass")
+                else "light",
+            )
+        except SiteError as e:
+            print(f"截图失败: {e}", file=sys.stderr)
+            return 2
+        print(f"截图尺寸: {site_shot.size_note()}")
+        # 16:10：展示网页时多露一点内容，比 16:9 更像一块屏幕
+        storyboard.width, storyboard.height = 1920, 1200
+
     out_dir = Path(args.out) if args.out else Path(".gangge") / "demo_videos" / _slug(label)
+
     print(f"分镜: {len(storyboard.scenes)} 个镜头，预计 {storyboard.total_duration:.1f}s")
+    page_label = {
+        "storyboard": "分镜页",
+        "showcase": "3D 展示页",
+        "site": "3D 展示页 + 网站截图",
+    }[args.page]
+    print(f"页面: {page_label}")
     print(f"输出: {out_dir}")
+    source_url = args.url or ""
 
     if args.preview:
-        html = write_preview(storyboard, out_dir)
+        html = write_preview(
+            storyboard,
+            out_dir,
+            page=args.page,
+            source_url=source_url,
+            site_shot=site_shot,
+        )
         print(f"预览已生成: {html}")
         return 0
 
@@ -146,6 +253,9 @@ async def _run(args: argparse.Namespace) -> int:
         out_dir,
         narration=not args.no_narration,
         keep_frames=args.keep_frames,
+        page=args.page,
+        source_url=source_url,
+        site_shot=site_shot,
         on_progress=lambda msg: print(f"  · {msg}"),
     )
 
