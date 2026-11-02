@@ -2,7 +2,11 @@
 
 设计上只做"一次性 headless 调用"（``qodercli -p ... -o json``），因为项目没有
 worker 基础设施（``AgenticLoop`` 是单循环 + 线程池），硬造常驻协议层不划算。
-长任务靠 ``timeout_s`` 兜底，取消能力留到以后。
+
+超时按**沉默**判，不按总时长：大任务本来就断断续续跑很久，拿总时长一刀切会把
+正常任务砍掉。默认连续 10 分钟没有任何输出才终止（``QODER_IDLE_TIMEOUT_S``），
+总时长上限默认不限（``QODER_TIMEOUT_S``）。终止走进程树，避免 node 子进程
+继续改文件。
 
 结果**必须裁剪**：远端的过程输出动辄几万 token，主 agent 只该看到结论。完整
 输出落盘到 ``<workspace>/.gangge/logs/qoder/``，需要细节时按路径去读。
@@ -11,11 +15,14 @@ worker 基础设施（``AgenticLoop`` 是单循环 + 线程池），硬造常驻
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
 import re
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -227,6 +234,137 @@ def shell_argv(cmd: str) -> list[str]:
     return ["bash", "-c", cmd]
 
 
+#: 读线程只在内存里留尾部这么多字符：委派输出动辄几十 MB，全留着会把内存吃穿。
+MAX_LIVE_OUTPUT = 200_000
+
+
+@dataclass
+class ProcRun:
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = -1
+    #: "" 正常 / "idle" 太久没输出 / "hard" 撞到总时长上限
+    reason: str = ""
+    idle_s: float = 0.0
+    elapsed_s: float = 0.0
+
+
+def _kill_tree(proc: subprocess.Popen[str]) -> None:
+    """杀整棵进程树。
+
+    ``proc.kill()`` 只杀直接子进程；qodercli 是 node 程序，Windows 上杀了父进程，
+    子进程照样在改文件——"已终止"就成了谎话。
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+            )
+            return
+        except OSError:
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_process(
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    *,
+    idle_timeout_s: int = 0,
+    hard_timeout_s: int = 0,
+    poll_s: float = 0.25,
+) -> ProcRun:
+    """跑一个进程，**连续 ``idle_timeout_s`` 秒没有任何输出**才判它卡死。
+
+    ``hard_timeout_s`` 默认 0（不限）：大任务本来就要跑很久，用总时长一刀切会把
+    正常任务砍掉。真正该判死的是"沉默"——进程还活着却一个字都不吐。
+    """
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        # POSIX 上自成一个进程组，终止时才能连子孙一起带走
+        start_new_session=(os.name != "nt"),
+    )
+
+    lock = threading.Lock()
+    state = {"last": time.monotonic()}
+    buckets: dict[str, collections.deque[str]] = {
+        "out": collections.deque(),
+        "err": collections.deque(),
+    }
+    sizes = {"out": 0, "err": 0}
+
+    def pump(stream: Any, key: str) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                with lock:
+                    buckets[key].append(line)
+                    sizes[key] += len(line)
+                    while sizes[key] > MAX_LIVE_OUTPUT and len(buckets[key]) > 1:
+                        sizes[key] -= len(buckets[key].popleft())
+                    state["last"] = time.monotonic()
+        except (OSError, ValueError):
+            pass
+
+    readers = [
+        threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    started = time.monotonic()
+    reason = ""
+    try:
+        while proc.poll() is None:
+            with lock:
+                last = state["last"]
+            now = time.monotonic()
+            if idle_timeout_s and now - last > idle_timeout_s:
+                reason = "idle"
+                break
+            if hard_timeout_s and now - started > hard_timeout_s:
+                reason = "hard"
+                break
+            time.sleep(poll_s)
+    finally:
+        if reason:
+            _kill_tree(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # 杀不掉也得往下走，别把界面挂住
+            pass
+
+    elapsed = time.monotonic() - started
+    for reader in readers:
+        reader.join(timeout=2)
+    with lock:
+        out = "".join(buckets["out"])
+        err = "".join(buckets["err"])
+        idle = time.monotonic() - state["last"]
+
+    code = proc.returncode if proc.returncode is not None else -1
+    return ProcRun(out, err, code, reason, idle, elapsed)
+
+
 def _run_check(check: CheckSpec, cwd: Path) -> CheckOutcome:
     try:
         proc = subprocess.run(
@@ -428,25 +566,11 @@ def delegate_sync(
     # 跑之前拍一次快照：工作区本来就有的未提交改动不能算到这次委派头上
     pre = snapshot_worktree(ws)
 
+    idle_s = spec.idle_timeout_s or cfg.idle_timeout
+    hard_s = spec.timeout_s or cfg.timeout
     try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(ws),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=spec.timeout_s or cfg.timeout)
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-            timed_out = True
-        exit_code = proc.returncode
+        run = _run_process(argv, ws, env, idle_timeout_s=idle_s, hard_timeout_s=hard_s)
+        stdout, stderr, exit_code = run.stdout, run.stderr, run.exit_code
     except FileNotFoundError:
         return DelegationResult(
             status="failed",
@@ -464,9 +588,18 @@ def delegate_sync(
     result.workspace = str(ws)
     result.duration_s = time.monotonic() - started
 
-    if timed_out:
+    if run.reason:
         result.status = "failed"
-        result.error = f"[超时] 超过 {spec.timeout_s or cfg.timeout}s，已终止"
+        if run.reason == "idle":
+            result.error = (
+                f"[空闲超时] 连续 {int(run.idle_s)}s 没有任何输出，已终止；"
+                "改动保留在工作区，请 git diff 自查"
+            )
+        else:
+            result.error = (
+                f"[超时] 超过总时长上限 {hard_s}s，已终止；"
+                "改动保留在工作区，请 git diff 自查"
+            )
         result.summary = clip(strip_ansi((stdout or "")[-1000:]), SUMMARY_LIMIT)
 
     # 范围合规：改动越界比"没做完"更严重，优先判 violated。
@@ -503,7 +636,7 @@ def delegate_sync(
             if result.status == "done":
                 result.status = "failed"
                 result.error = result.error or f"远端自报失败（subtype={subtype or 'error'}）"
-    if not timed_out and exit_code != 0 and result.status == "done":
+    if not run.reason and exit_code != 0 and result.status == "done":
         result.status = "failed"
         result.error = _explain_failure(stderr or "", exit_code)
 

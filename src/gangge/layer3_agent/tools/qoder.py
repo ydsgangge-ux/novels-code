@@ -106,7 +106,17 @@ class QoderDelegateTool(BaseTool):
                 },
                 "timeout_s": {
                     "type": "integer",
-                    "description": "超时秒数，0 = 用设置默认（600）",
+                    "description": (
+                        "总时长上限（秒），0 = 不限。大任务不用设它：默认按"
+                        "「连续 10 分钟没有任何输出」判死，只要还在干活就不会被砍"
+                    ),
+                },
+                "idle_timeout_s": {
+                    "type": "integer",
+                    "description": (
+                        "连续多少秒没有任何输出就判死，0 = 用设置默认（600）。"
+                        "有阶段会长时间静默（如大规模重构）可以调大"
+                    ),
                 },
             },
             "required": ["goal"],
@@ -126,6 +136,7 @@ class QoderDelegateTool(BaseTool):
                     "notes": kwargs.get("notes") or "",
                     "max_turns": kwargs.get("max_turns") or 0,
                     "timeout_s": kwargs.get("timeout_s") or 0,
+                    "idle_timeout_s": kwargs.get("idle_timeout_s") or 0,
                 }
             )
         except (ValueError, TypeError) as exc:

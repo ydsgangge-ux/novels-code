@@ -25,7 +25,12 @@ logger = logging.getLogger(__name__)
 #: CN 版装出来的名字是 ``qoderclicn``，国际版是 ``qodercli``。
 EXE_CANDIDATES: tuple[str, ...] = ("qoderclicn", "qodercli", "qoder", "qoder-cn")
 
-DEFAULT_TIMEOUT_S = 600
+#: 空闲超时：连续这么久**没有任何输出**才判死。大任务是断断续续输出的，
+#: 用"总时长"一刀切会把正常的大任务砍掉——该判"卡住"的是沉默，不是耗时。
+DEFAULT_IDLE_TIMEOUT_S = 600
+
+#: 总时长上限，0 = 不限。只有确实想给整件事设个天花板时才设它。
+DEFAULT_HARD_TIMEOUT_S = 0
 DEFAULT_MODEL = "Auto"
 
 #: ``--list-models`` 实测结果（v1.1.80）。前端下拉可编辑，允许手填新模型名。
@@ -168,7 +173,8 @@ class QoderConfig:
     strength: str = "medium"
     permission: str = "edit"
     max_output_tokens: str = ""  # 空 = 跟随强度
-    timeout_s: int = 0  # 0 = DEFAULT_TIMEOUT_S
+    timeout_s: int = 0  # 总时长上限（秒），0 = 不限
+    idle_timeout_s: int = 0  # 无输出多久判死，0 = DEFAULT_IDLE_TIMEOUT_S
     #: 仅当 CLI 支持 ``--max-turns`` 时才下发（v1.1.80 不支持，靠 timeout 兜底）
     max_turns: int = 0
     workspace: Path = Path(".")
@@ -192,7 +198,13 @@ class QoderConfig:
 
     @property
     def timeout(self) -> int:
-        return self.timeout_s or DEFAULT_TIMEOUT_S
+        """总时长上限（秒）。0 = 不限，只靠空闲超时兜底。"""
+        return self.timeout_s or DEFAULT_HARD_TIMEOUT_S
+
+    @property
+    def idle_timeout(self) -> int:
+        """连续多少秒没有任何输出就判死。"""
+        return self.idle_timeout_s or DEFAULT_IDLE_TIMEOUT_S
 
     @property
     def permission_spec(self) -> dict[str, object]:
@@ -230,6 +242,7 @@ class QoderConfig:
             permission=permission if permission in PERMISSIONS else "edit",
             max_output_tokens=_env("QODER_MAX_OUTPUT_TOKENS"),
             timeout_s=_int("QODER_TIMEOUT_S"),
+            idle_timeout_s=_int("QODER_IDLE_TIMEOUT_S"),
             max_turns=_int("QODER_MAX_TURNS"),
             workspace=ws,
             enabled=enabled,

@@ -340,6 +340,15 @@ Three rules keep delegation from turning into a loss of control:
 `status`: `done` all green / `partial` changed but not green (inspect the checks yourself) /
 `violated` touched files outside scope (roll back) / `failed`.
 
+**Timeouts are measured by silence, not by total duration.** Ten minutes with no output at all
+is what gets it killed; as long as it keeps talking it keeps running (`QODER_IDLE_TIMEOUT_S`).
+There is no total cap unless you set `timeout_s` yourself. Termination kills the whole process
+tree (no orphaned node children), but **changes already made stay in the working tree**:
+
+```bash
+git diff --stat    # see how far it got before it stalled
+```
+
 Requires the Qoder CLI on your machine (`qoderclicn` for CN, `qodercli` for intl) — it is
 discovered on PATH and in the usual install locations.
 

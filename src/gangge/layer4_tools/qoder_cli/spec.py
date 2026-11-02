@@ -70,7 +70,10 @@ class DelegateSpec:
     current_state: dict[str, str] = field(default_factory=dict)
     notes: str = ""
     max_turns: int = 0
+    #: 总时长上限（秒），0 = 不限：大任务靠"多久没输出"判死，而不是靠总耗时。
     timeout_s: int = 0
+    #: 连续多少秒没有任何输出就判死，0 = 用设置里的默认（600）。
+    idle_timeout_s: int = 0
 
     # ── 校验 ────────────────────────────────────────────────
     def validate(self) -> list[str]:
@@ -84,8 +87,8 @@ class DelegateSpec:
             problems.append("edit/verify 模式必须给出 scope（允许改动的文件白名单）")
         if self.mode == "analyze" and any(c.cmd for c in self.dod):
             problems.append("analyze 模式不该带 dod（它不改东西，没东西可验）")
-        if self.max_turns < 0 or self.timeout_s < 0:
-            problems.append("max_turns / timeout_s 不能为负")
+        if self.max_turns < 0 or self.timeout_s < 0 or self.idle_timeout_s < 0:
+            problems.append("max_turns / timeout_s / idle_timeout_s 不能为负")
         return problems
 
     # ── 提示词 ──────────────────────────────────────────────
@@ -180,4 +183,5 @@ class DelegateSpec:
             notes=str(data.get("notes") or ""),
             max_turns=int(data.get("max_turns") or 0),
             timeout_s=int(data.get("timeout_s") or 0),
+            idle_timeout_s=int(data.get("idle_timeout_s") or 0),
         )

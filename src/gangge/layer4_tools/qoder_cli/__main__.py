@@ -51,7 +51,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--permission", default="edit", choices=list(PERMISSIONS))
     p.add_argument("--max-turns", type=int, default=0,
                    help="仅当 CLI 支持 --max-turns 时下发（v1.1.80 不支持）")
-    p.add_argument("--timeout", type=int, default=0, help="秒，0 = 默认 600")
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=0,
+        help="总时长上限（秒），0 = 不限：只要还在输出就一直跑",
+    )
+    p.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=0,
+        help="连续多少秒没有任何输出就判死，0 = 默认 600",
+    )
     p.add_argument("--workspace", "-w", default="")
     p.add_argument("--json", action="store_true", help="只输出紧凑 JSON")
     p.add_argument("--probe", action="store_true", help="探测 CLI 是否可用后退出")
@@ -82,6 +93,7 @@ async def _run(args: argparse.Namespace) -> int:
         dod=tuple(CheckSpec(cmd=c) for c in args.check),
         max_turns=args.max_turns,
         timeout_s=args.timeout,
+        idle_timeout_s=args.idle_timeout,
     )
     problems = spec.validate()
     if problems:

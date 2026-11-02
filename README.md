@@ -169,6 +169,14 @@ AI：▶ 委派中（scope: src/**　dod: pytest -q）
 
 `status` 四态：`done` 全绿 / `partial` 改了但没全绿（须自己看 checks）/ `violated` 改到白名单外（该回滚）/ `failed`。
 
+**超时按「沉默」算，不按总时长。** 连续 10 分钟没有任何输出才判死，只要它还在干活就一直跑
+（`QODER_IDLE_TIMEOUT_S` 可调）；总时长上限默认不限，确实想设天花板时给 `timeout_s`。
+终止会连进程树一起杀掉（node 子进程不会残留），但**已改的文件留在工作区**，需要自己核对：
+
+```bash
+git diff --stat    # 超时后先看清它改到哪一步
+```
+
 前置：本机装好 Qoder CLI（CN 版 `qoderclicn`、国际版 `qodercli`），程序会自动在 PATH 和常见安装目录里找。
 
 ## 💻 编程助手
