@@ -203,6 +203,10 @@ class Storyboard:
         """Round-trippable form, also used as the tool's return payload."""
         return {
             "title": self.title,
+            # style / decor 必须回灌：不然 storyboard.json 载入后风格和装饰全丢，
+            # 手工改完分镜再渲染，得到的和预览不是同一个东西。
+            "style": self.style,
+            "decor": list(self.decor),
             "fps": self.fps,
             "width": self.width,
             "height": self.height,

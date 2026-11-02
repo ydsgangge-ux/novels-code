@@ -153,6 +153,17 @@ def _page_templates() -> list[Skill]:
             ),
         ),
         Skill(
+            id="style_studio",
+            group="视频出片",
+            label="样式工作台 · 风格与装饰随手调",
+            hint="5 种风格 × 5 层装饰 × 横竖屏，自由组合看效果，选好再拍",
+            template=(
+                "运行 `python -m gangge.layer4_tools.storyboard.studio`，"
+                "再把生成的 `.gangge/style-studio.html` 用浏览器打开。"
+                "我要自己调风格、装饰和画幅——调好后按页面底部导出的配置拍片。"
+            ),
+        ),
+        Skill(
             id="site_tour",
             group="视频出片",
             label="网站展示视频 · 真站点截图",

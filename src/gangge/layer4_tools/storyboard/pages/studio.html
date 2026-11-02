@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>样式工作台 · Gangge Code</title>
+<style>
+  :root {
+    --bg: #080b12; --panel: #0e1420; --line: #1e2735; --fg: #e8eef8;
+    --muted: #8b9ab0; --accent: #5b8cff; --accent2: #7a5cff; --ok: #3fb950;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: radial-gradient(1200px 700px at 20% -10%, #14203a, transparent 60%), var(--bg);
+    color: var(--fg); font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+  header { padding: 18px 24px 10px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 17px; letter-spacing: .4px; }
+  header p { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  main { flex: 1; display: flex; gap: 18px; padding: 18px 24px 24px; align-items: flex-start; }
+  aside { width: 296px; flex: none; display: flex; flex-direction: column; gap: 16px; }
+  .group { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 12px 14px; }
+  .group > label { display: block; color: var(--muted); font-size: 11px; letter-spacing: .6px; margin-bottom: 9px; text-transform: uppercase; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    border: 1px solid var(--line); background: #131b28; color: var(--fg);
+    padding: 5px 11px; border-radius: 999px; cursor: pointer; font-size: 12px;
+  }
+  .chip:hover { border-color: #2f4059; }
+  .chip[aria-pressed="true"] {
+    background: linear-gradient(135deg, rgba(91,140,255,.28), rgba(122,92,255,.24));
+    border-color: var(--accent); color: #fff;
+  }
+  .checks { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 10px; }
+  .checks label { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--fg); cursor: pointer; }
+  .checks input { accent-color: var(--accent); }
+  .row { display: flex; align-items: center; gap: 10px; }
+  .row output { color: var(--muted); font-size: 12px; min-width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  button.act {
+    width: 100%; border: 1px solid var(--accent); border-radius: 8px; cursor: pointer;
+    background: linear-gradient(135deg, rgba(91,140,255,.22), rgba(122,92,255,.20));
+    color: #fff; padding: 9px 12px; font-size: 13px;
+  }
+  button.act:hover { background: linear-gradient(135deg, rgba(91,140,255,.34), rgba(122,92,255,.30)); }
+  #stage {
+    flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px;
+  }
+  #frame-box {
+    width: 100%; height: clamp(300px, 52vh, 580px); background: #04060b;
+    border: 1px solid var(--line); border-radius: 10px; overflow: hidden; position: relative;
+  }
+  /* 页面本身是 1920×1080 / 1080×1920 的固定画布，靠 transform 整体缩放，
+     不能直接铺满容器——那样只会露出左上角一块。 */
+  #frame {
+    position: absolute; left: 50%; top: 50%; border: 0; background: #04060b;
+    transform-origin: center center; transform: translate(-50%, -50%);
+  }
+  #meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+  #meta b { color: var(--fg); font-weight: 600; }
+  #out {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  #out h2 { font-size: 12px; color: var(--muted); letter-spacing: .6px; text-transform: uppercase; font-weight: 600; }
+  pre {
+    background: #070b12; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    font: 12px/1.7 "Cascadia Code", Consolas, monospace; color: #cfe1ff; overflow-x: auto;
+  }
+  .hint { color: var(--muted); font-size: 11px; }
+  #copied { color: var(--ok); font-size: 11px; opacity: 0; transition: opacity .2s; }
+  #copied.on { opacity: 1; }
+  @media (max-width: 860px) {
+    main { flex-direction: column; }
+    aside { width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>样式工作台</h1>
+  <p>风格 × 装饰 × 画幅 × 帧率，四个独立旋钮——调完把配置贴进 demo_video 就能拍。</p>
+</header>
+
+<main>
+  <aside>
+    <div class="group">
+      <label>风格</label>
+      <div class="chips" id="styles"></div>
+    </div>
+
+    <div class="group">
+      <label>画幅</label>
+      <div class="chips" id="aspects"></div>
+    </div>
+
+    <div class="group">
+      <label>背景装饰（可任意组合）</label>
+      <div class="checks" id="decors"></div>
+    </div>
+
+    <div class="group">
+      <label>帧率</label>
+      <div class="row">
+        <input type="range" id="fps" min="10" max="60" step="1" value="__FPS__">
+        <output id="fps-out">__FPS__ fps</output>
+      </div>
+    </div>
+
+    <div class="group">
+      <label>时间轴</label>
+      <div class="row">
+        <input type="range" id="time" min="0" max="1000" step="1" value="120">
+        <output id="time-out">0.0s</output>
+      </div>
+      <div class="row" style="margin-top:9px">
+        <button class="act" id="play">▶ 播放 / ⏸ 暂停</button>
+      </div>
+    </div>
+
+    <button class="act" id="copy">复制配置</button>
+    <span id="copied">已复制</span>
+  </aside>
+
+  <div id="stage">
+    <div id="frame-box" class="landscape">
+      <iframe id="frame" title="预览"></iframe>
+    </div>
+    <div id="meta">
+      <span>风格 <b id="m-style">-</b></span>
+      <span>画幅 <b id="m-aspect">-</b></span>
+      <span>装饰 <b id="m-decor">-</b></span>
+      <span>时长 <b id="m-total">-</b></span>
+      <span class="hint">预览是真实渲染结果，和成片同一套页面</span>
+    </div>
+
+    <div id="out">
+      <h2>导出配置</h2>
+      <pre id="json"></pre>
+      <h2>命令行</h2>
+      <pre id="cli"></pre>
+      <h2>对话里用 demo_video</h2>
+      <pre id="tool"></pre>
+    </div>
+  </div>
+</main>
+
+<script>
+var PAGES = __PAGES__;
+var STYLES = __STYLES__;
+var DECORS = __DECORS__;
+var DEFAULTS = __DEFAULTS__;
+
+var initialStyle = STYLES.indexOf('neon') >= 0 ? 'neon' : STYLES[0];
+var state = {
+  style: initialStyle,
+  aspect: '16:9',
+  decor: (DEFAULTS[initialStyle] || []).slice(),
+  fps: __FPS__
+};
+
+var frame = document.getElementById('frame');
+var box = document.getElementById('frame-box');
+var playing = false;
+
+function decode(b64) {
+  var bin = atob(b64);
+  var bytes = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+function key() {
+  return state.style + '|' + (state.aspect === '9:16' ? 'portrait' : 'landscape');
+}
+
+function totalSeconds() {
+  try {
+    var doc = frame.contentDocument;
+    var nodes = doc.querySelectorAll('.scene');
+    if (!nodes.length) return 0;
+    return parseFloat(nodes[nodes.length - 1].dataset.end) || 0;
+  } catch (e) { return 0; }
+}
+
+function applyDecor() {
+  var doc;
+  try { doc = frame.contentDocument; } catch (e) { return; }
+  if (!doc) return;
+  DECORS.forEach(function (name) {
+    var el = doc.querySelector('[data-decor="' + name + '"]');
+    if (el) el.style.display = state.decor.indexOf(name) >= 0 ? '' : 'none';
+  });
+}
+
+function seek(ratio) {
+  var total = totalSeconds();
+  var t = total * ratio;
+  try { frame.contentWindow.__seek(t); } catch (e) {}
+  document.getElementById('time-out').textContent = t.toFixed(1) + 's';
+  document.getElementById('m-total').textContent = total.toFixed(1) + 's';
+}
+
+function fit() {
+  var portrait = state.aspect === '9:16';
+  var W = portrait ? 1080 : 1920;
+  var H = portrait ? 1920 : 1080;
+  frame.style.width = W + 'px';
+  frame.style.height = H + 'px';
+  var scale = Math.min(box.clientWidth / W, box.clientHeight / H);
+  frame.style.transform = 'translate(-50%, -50%) scale(' + scale.toFixed(4) + ')';
+}
+
+function render() {
+  frame.srcdoc = decode(PAGES[key()]);
+  document.getElementById('m-style').textContent = state.style;
+  document.getElementById('m-aspect').textContent = state.aspect;
+  document.getElementById('m-decor').textContent = state.decor.length ? state.decor.join(' + ') : '无';
+  fit();
+  syncControls();
+  updateExport();
+}
+
+window.addEventListener('resize', fit);
+
+frame.addEventListener('load', function () {
+  fit();
+  applyDecor();
+  seek(document.getElementById('time').value / 1000);
+  playing = false;
+});
+
+function syncControls() {
+  Array.prototype.forEach.call(document.querySelectorAll('#styles .chip'), function (el) {
+    el.setAttribute('aria-pressed', el.dataset.value === state.style ? 'true' : 'false');
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('#aspects .chip'), function (el) {
+    el.setAttribute('aria-pressed', el.dataset.value === state.aspect ? 'true' : 'false');
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('#decors input'), function (el) {
+    el.checked = state.decor.indexOf(el.value) >= 0;
+  });
+}
+
+function updateExport() {
+  var cfg = { style: state.style, decor: state.decor.slice(), aspect: state.aspect, fps: state.fps };
+  document.getElementById('json').textContent = JSON.stringify(cfg);
+  document.getElementById('cli').textContent =
+    'python -m gangge.layer4_tools.storyboard -c 口播稿.txt --style ' + state.style +
+    (state.decor.length ? ' --decor ' + state.decor.join(',') : ' --decor ""') +
+    (state.aspect === '9:16' ? ' --aspect 9:16' : '') + ' --fps ' + state.fps;
+  document.getElementById('tool').textContent =
+    'demo_video(action="auto", topic="＜主题＞", style="' + state.style + '", decor=' +
+    JSON.stringify(state.decor) + ', aspect="' + state.aspect + '", fps=' + state.fps + ')';
+}
+
+// ── 控件 ─────────────────────────────────────────────────────
+STYLES.forEach(function (name) {
+  var el = document.createElement('button');
+  el.className = 'chip';
+  el.dataset.value = name;
+  el.textContent = name;
+  el.onclick = function () {
+    state.style = name;
+    state.decor = (DEFAULTS[name] || []).slice();
+    render();
+  };
+  document.getElementById('styles').appendChild(el);
+});
+
+['16:9', '9:16'].forEach(function (name) {
+  var el = document.createElement('button');
+  el.className = 'chip';
+  el.dataset.value = name;
+  el.textContent = name;
+  el.onclick = function () { state.aspect = name; render(); };
+  document.getElementById('aspects').appendChild(el);
+});
+
+DECORS.forEach(function (name) {
+  var wrap = document.createElement('label');
+  var input = document.createElement('input');
+  input.type = 'checkbox';
+  input.value = name;
+  input.onchange = function () {
+    var at = state.decor.indexOf(name);
+    if (input.checked && at < 0) state.decor.push(name);
+    if (!input.checked && at >= 0) state.decor.splice(at, 1);
+    applyDecor();
+    document.getElementById('m-decor').textContent =
+      state.decor.length ? state.decor.join(' + ') : '无';
+    updateExport();
+  };
+  wrap.appendChild(input);
+  wrap.appendChild(document.createTextNode(name));
+  document.getElementById('decors').appendChild(wrap);
+});
+
+document.getElementById('fps').oninput = function () {
+  state.fps = parseInt(this.value, 10);
+  document.getElementById('fps-out').textContent = state.fps + ' fps';
+  updateExport();
+};
+
+document.getElementById('time').oninput = function () {
+  seek(this.value / 1000);
+};
+
+document.getElementById('play').onclick = function () {
+  try {
+    var win = frame.contentWindow;
+    if (playing) { if (win.__pause) win.__pause(); }
+    else { if (win.__play) win.__play(); }
+    playing = !playing;
+  } catch (e) {}
+};
+
+document.getElementById('copy').onclick = function () {
+  var text = document.getElementById('json').textContent;
+  var done = function () {
+    var tip = document.getElementById('copied');
+    tip.className = 'on';
+    setTimeout(function () { tip.className = ''; }, 1400);
+  };
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, done);
+  else done();
+};
+
+render();
+</script>
+</body>
+</html>

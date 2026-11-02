@@ -296,6 +296,23 @@ Pages are **template files**, not Python strings: `src/gangge/layer4_tools/story
 `pages.py:TEMPLATES`. `page=site` needs playwright for the screenshot; the others
 are pure Python and work offline.
 
+**Not sure which look you want?** Open the style studio — three ways in:
+
+- Desktop app: the last item in the **⚡ Skills** menu (**🎛 Style studio**), generates and opens it
+- Double-click `打开样式工作台.bat` in the repo root
+- CLI: `python -m gangge.layer4_tools.storyboard.studio`
+
+```bash
+# single file, ~270 KB, double-click to open, works offline
+.gangge/style-studio.html
+```
+
+Style, decor, aspect and fps are four independent knobs — 5 styles × 2^5 decor layers ×
+2 aspects = 320 combinations, with a scrubbable timeline. The bottom of the page hands you
+the JSON / CLI / `demo_video(...)` call to paste back. Only 10 pages are pre-rendered
+(5 styles × 2 aspects); every decor layer is generated and toggled in the browser, which
+keeps the whole thing at 270 KB.
+
 ### Delegating to Qoder
 
 Long, mechanical chores — rename across a dozen files, backfill a batch of tests, upgrade a

@@ -7227,6 +7227,33 @@ class GanggeDesktop(QMainWindow):
             empty = self._skill_menu.addAction("（暂无可用技能）")
             empty.setEnabled(False)
 
+        # 样式工作台不是"提示词"，是本地工具：点了当场生成并打开，不经过模型。
+        # 放在技能菜单里，是因为用户找风格时第一反应就是翻这个菜单。
+        self._skill_menu.addSeparator()
+        studio = self._skill_menu.addAction("🎛 样式工作台 · 风格与装饰自由组合")
+        studio.setToolTip("生成一个单文件控制面板，用浏览器打开就能随便调")
+        studio.setStatusTip("不经过模型，点了直接打开")
+        # 延迟解析：菜单重建不该依赖方法一定存在（测试壳里就是简化的 self）
+        studio.triggered.connect(lambda _checked=False: self._open_style_studio())
+
+    def _open_style_studio(self):
+        """生成自包含的样式工作台并交给系统浏览器打开。"""
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        try:
+            from gangge.layer4_tools.storyboard.studio import build_studio
+
+            workspace = self._ws_input.text().strip() if hasattr(self, "_ws_input") else ""
+            base = Path(workspace) if workspace else Path.cwd()
+            out = build_studio(base / ".gangge" / "style-studio.html")
+        except Exception as e:  # noqa: BLE001 - 打不开就把原因说清楚，别静默失败
+            self._append_output(f"\n❌ 生成样式工作台失败: {e}\n", "error")
+            return
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
+        self._append_output(f"\n🎛 样式工作台: {out}\n", "system")
+
     def _apply_skill(self, skill):
         """把技能模板填进输入框，并选中第一个占位符方便直接覆盖。"""
         text = skill.template.strip()

@@ -75,6 +75,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--style", choices=list(STYLE_NAMES), help="视觉风格预设")
     p.add_argument("--decor", help="装饰层，逗号分隔：glow,grid,grain,particles,scanline")
     p.add_argument("--voice", default="zh-CN-XiaoxiaoNeural", help="edge-tts 音色")
+    p.add_argument(
+        "--aspect",
+        choices=("16:9", "9:16"),
+        help="画幅：16:9 横屏（默认）/ 9:16 竖屏（字更大、一行更少）",
+    )
     p.add_argument("--fps", type=int, help="帧率，默认沿用分镜（30）")
     p.add_argument("--no-narration", action="store_true", help="不配音，按字数估算时长")
     p.add_argument("--preview", action="store_true", help="只生成 HTML，不渲染视频")
@@ -208,6 +213,10 @@ async def _run(args: argparse.Namespace) -> int:
         storyboard.decor = [
             d.strip() for d in args.decor.split(",") if d.strip() in DECOR_NAMES
         ]
+    if args.aspect == "9:16":
+        storyboard.width, storyboard.height = 1080, 1920
+    elif args.aspect == "16:9":
+        storyboard.width, storyboard.height = 1920, 1080
 
     site_shot = None
     if args.page == "site":

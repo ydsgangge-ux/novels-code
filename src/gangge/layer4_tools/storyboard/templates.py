@@ -269,27 +269,38 @@ _RENDERERS: dict[str, Any] = {
 
 
 def _decor_html(decor: Sequence[str]) -> str:
-    """Ornament elements. Position is recomputed from t, never from CSS motion."""
+    """Ornament elements. Position is recomputed from t, never from CSS motion.
+
+    每层都带 ``data-decor="名字"``：样式工作台要在不重渲染的前提下一层层开关，
+    靠 class 猜名字（``deco-scan`` 对应 ``scanline``）太脆。
+    """
     layers: list[str] = []
     if "glow" in decor:
-        layers.append('<div class="deco deco-glow"></div>')
+        layers.append('<div class="deco deco-glow" data-decor="glow"></div>')
     if "grid" in decor:
-        layers.append('<div class="deco deco-grid"></div>')
+        layers.append('<div class="deco deco-grid" data-decor="grid"></div>')
     if "grain" in decor:
-        layers.append('<div class="deco deco-grain"></div>')
+        layers.append('<div class="deco deco-grain" data-decor="grain"></div>')
     if "scanline" in decor:
-        layers.append('<div class="deco deco-scan"></div>')
+        layers.append('<div class="deco deco-scan" data-decor="scanline"></div>')
     if "particles" in decor:
         dots = "".join(
             f'<i class="particle" data-seed="{i * 0.37 % 1:.4f}"></i>'
             for i in range(_PARTICLE_COUNT)
         )
-        layers.append(f'<div class="deco deco-particles">{dots}</div>')
+        layers.append(
+            f'<div class="deco deco-particles" data-decor="particles">{dots}</div>'
+        )
     return "".join(layers)
 
 
+def default_decor(style: str) -> tuple[str, ...]:
+    """该风格的默认装饰组合。工作台拿它当初始勾选，风格一换就跟着换。"""
+    return _STYLE_DEFAULT_DECOR.get(style, ())
+
+
 def resolve_decor(sb: Storyboard) -> tuple[str, ...]:
-    return tuple(sb.decor) if sb.decor else _STYLE_DEFAULT_DECOR.get(sb.style, ())
+    return tuple(sb.decor) if sb.decor else default_decor(sb.style)
 
 
 def style_palette(sb: Storyboard) -> dict[str, str]:

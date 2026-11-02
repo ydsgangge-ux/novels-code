@@ -26,11 +26,13 @@ from pathlib import Path
 PAGE_DIR = Path(__file__).resolve().parent / "pages"
 
 #: 页面类型 → 模板文件。``site`` 复用展示页外壳，内页换成长截图。
+#: ``studio`` 不是拍摄页面，而是样式工作台的外壳。
 TEMPLATES: dict[str, str] = {
     "storyboard": "storyboard.html",
     "showcase": "showcase.html",
     "site": "showcase.html",
     "site_inner": "site_inner.html",
+    "studio": "studio.html",
 }
 
 #: 能拍成视频的页面（``site_inner`` 是内页片段，不是整页）。

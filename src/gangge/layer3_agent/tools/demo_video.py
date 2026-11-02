@@ -26,7 +26,7 @@ def _draft_prompt(topic: str) -> str:
     return f"""你是短视频分镜师。把主题写成一条 20-45 秒的讲解短视频分镜，只输出 JSON。
 
 JSON 结构：
-{{"title": "视频标题", "scenes": [{{...}}, ...]}}
+{{"title": "视频标题", "style": "neon", "decor": ["glow"], "scenes": [{{...}}, ...]}}
 
 template 只能取以下五个值，字段含义如下：
 - "title"   标题卡：title（主标题 ≤14字）、text（副标题 ≤24字）
@@ -40,7 +40,12 @@ template 只能取以下五个值，字段含义如下：
 2. 每个镜头必须有 voiceover：口语化讲解，25-45 个汉字，承接上一镜头的语义，念出来要通顺。
 3. 不要写 duration 字段，镜头时长由配音决定。
 4. 文案要具体，避免「赋能」「抓手」这类空话。
-5. 只输出 JSON 本身，不要解释，不要 markdown 代码块。
+5. 另给两个可选字段，按主题气质自己挑：
+   - style：五选一 dark / neon / paper / glass / brutal。
+     技术产品、硬件、AI → neon；通用讲解、投屏 → dark；文化、历史、人物 → paper；
+     商业汇报、SaaS → glass；潮流、独立产品、活动 → brutal。
+   - decor：从 glow / grid / grain / particles / scanline 里选 0-3 个；没把握就给空数组。
+6. 只输出 JSON 本身，不要解释，不要 markdown 代码块。
 
 主题：{topic}"""
 
@@ -161,6 +166,13 @@ class DemoVideoTool(BaseTool):
                     ),
                     "default": "16:9",
                 },
+                "fps": {
+                    "type": "integer",
+                    "minimum": 10,
+                    "maximum": 60,
+                    "description": "帧率，默认 30；15 出片更快，60 更顺但渲染更久",
+                    "default": 30,
+                },
                 "page": {
                     "type": "string",
                     "enum": ["storyboard", "showcase", "site"],
@@ -245,7 +257,24 @@ class DemoVideoTool(BaseTool):
             raise ValueError("需要 topic、scenes 或 storyboard_file 之一")
         if not need_draft:
             raise ValueError("preview/render 需要 scenes 或 storyboard_file")
-        return Storyboard.from_dict(await self._draft(topic))
+        draft = await self._draft(topic)
+        if not isinstance(draft, dict):
+            raise ValueError("模型给的分镜不是 JSON 对象")
+
+        from gangge.layer4_tools.storyboard.schema import DECOR_NAMES, STYLE_NAMES
+
+        # 模型可能编个不存在的风格，而 from_dict 会因此拒掉整条分镜。
+        # 先清洗：非法值当没给——为一个风格名让整条片子失败不划算。
+        # 用户显式传的 style/decor 在 execute 里覆盖这里的值。
+        style = str(draft.get("style") or "").strip().lower()
+        if style in STYLE_NAMES:
+            draft["style"] = style
+        else:
+            draft.pop("style", None)
+        draft["decor"] = [
+            str(d) for d in (draft.get("decor") or []) if str(d) in DECOR_NAMES
+        ]
+        return Storyboard.from_dict(draft)
 
     def _out_dir(self, kwargs: dict[str, Any], topic: str) -> Path:
         explicit = str(kwargs.get("output_dir") or "").strip()
@@ -289,6 +318,11 @@ class DemoVideoTool(BaseTool):
             storyboard.width, storyboard.height = 1080, 1920
         elif str(kwargs.get("aspect") or "").strip() == "16:9":
             storyboard.width, storyboard.height = 1920, 1080
+        if kwargs.get("fps"):
+            try:
+                storyboard.fps = max(10, min(60, int(kwargs["fps"])))
+            except (TypeError, ValueError):
+                pass  # 非法帧率沿用分镜默认值，不值得为它中断整条流水线
 
         # 页面决定后半程：展示页要外壳配色和（可选）一张网站截图
         page = str(kwargs.get("page") or "storyboard").strip().lower()

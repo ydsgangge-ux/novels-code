@@ -67,6 +67,15 @@ def test_focus_token_always_appears_in_template():
             assert skill.focus in skill.template, f"{skill.id} 的占位符不在模板里"
 
 
+def test_style_studio_skill_points_at_the_real_command():
+    """工作台技能必须给出真实命令，否则模型照着念却打不开东西。"""
+    skill = find("style_studio")
+    assert skill is not None, "缺少样式工作台入口"
+    assert "storyboard.studio" in skill.template
+    assert "style-studio.html" in skill.template
+    assert skill.group == "视频出片"
+
+
 def test_page_skills_are_offered_next_to_the_styles():
     """展示页/网站页要像五种风格一样，点一下就填好 page=... 的提示词。"""
     for skill_id, token in (("showcase_3d", "page=showcase"), ("site_tour", "page=site")):
@@ -152,6 +161,9 @@ def test_menu_has_groups_and_style_hints(gui_module, qapp, tmp_path: Path):
     assert neon.toolTip(), "菜单项没有适用场景提示，用户还是不知道怎么选"
     headers = [a for a in actions if not a.isEnabled()]
     assert headers, "分组标题应当不可点击"
+
+    # 工作台是本地工具，不是提示词：必须能在同一个菜单里直接点到
+    assert any("样式工作台" in t for t in texts), "菜单里找不到样式工作台入口"
 
 
 def _stub(gui_module, edit):

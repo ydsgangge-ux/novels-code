@@ -267,6 +267,14 @@
     再让抓图绕过解析：
       ... --page site -u https://github.com/... --resolve github.com=140.82.112.4
 
+  【挑风格：样式工作台】
+
+    python -m gangge.layer4_tools.storyboard.studio
+    → .gangge/style-studio.html，用浏览器打开
+
+    风格 5 选 1、装饰 5 层随便勾、横竖屏切换、时间轴拖到任意一帧，
+    底部给出 JSON / 命令行 / demo_video 三种配置，复制走就能拍。
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 七、常见问题
