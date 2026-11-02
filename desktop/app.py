@@ -6062,6 +6062,23 @@ class GanggeDesktop(QMainWindow):
             self._qoder_perm_combo.addItem(str(p_spec["label"]), p_key)
         self._qoder_perm_combo.hide()
 
+        # ── 联网搜索：Key 与主模型解耦，换成 Claude / Ollama 也不用重新配 ──
+        self._web_key_input = QLineEdit(self)
+        self._web_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._web_key_input.setText(os.environ.get("WEB_SEARCH_API_KEY", ""))
+        self._web_key_input.setPlaceholderText("留空 = 复用 DEEPSEEK_API_KEY")
+        self._web_key_input.hide()
+
+        self._web_backend_combo = QComboBox(self)
+        self._web_backend_combo.addItem("自动（有 Key 就走官方接口）", "auto")
+        self._web_backend_combo.addItem("只用官方接口", "deepseek")
+        self._web_backend_combo.addItem("只用免费通道", "free")
+        _web_backend_now = (os.environ.get("WEB_SEARCH_BACKEND") or "auto").strip().lower()
+        self._web_backend_combo.setCurrentIndex(
+            max(0, self._web_backend_combo.findData(_web_backend_now))
+        )
+        self._web_backend_combo.hide()
+
     # ── UI ────────────────────────────────────────────────────
     def _setup_ui(self):
         # ── Init config widgets (needed before _load_settings) ──
@@ -6691,6 +6708,72 @@ class GanggeDesktop(QMainWindow):
 
         form.addWidget(qd_g)
 
+        # ── 联网搜索 ──
+        web_g = QGroupBox("联网搜索（web_search / web_fetch）")
+        web_g.setStyleSheet(llm_g.styleSheet())
+        wf = QFormLayout(web_g)
+        wf.setSpacing(8)
+        wf.addRow(QLabel("主模型用 DeepSeek 时无需填写，会自动复用它的 Key"))
+
+        _web_key = QLineEdit()
+        _web_key.setEchoMode(QLineEdit.EchoMode.Password)
+        _web_key.setPlaceholderText("留空 = 复用 DEEPSEEK_API_KEY；都没有则走免费通道")
+        _web_key.setText(self._web_key_input.text())
+        wf.addRow("搜索 Key", _web_key)
+
+        _web_backend = QComboBox()
+        for _i in range(self._web_backend_combo.count()):
+            _web_backend.addItem(
+                self._web_backend_combo.itemText(_i),
+                self._web_backend_combo.itemData(_i),
+            )
+        _web_backend.setCurrentIndex(
+            max(0, _web_backend.findData(self._web_backend_combo.currentData()))
+        )
+        wf.addRow("通道", _web_backend)
+
+        _web_test = QPushButton("测试 Key")
+
+        def _on_web_test():
+            key = (_web_key.text().strip() or os.environ.get("DEEPSEEK_API_KEY", "")).strip()
+            if not key:
+                QMessageBox.warning(
+                    dlg, "联网搜索",
+                    "还没有 Key：填一个，或者把主模型切到 DeepSeek（会自动复用）。",
+                )
+                return
+            try:
+                import json as _json
+                import urllib.error
+                import urllib.request
+
+                req = urllib.request.Request(
+                    "https://api.deepseek.com/v1/tools/search",
+                    data=_json.dumps({"query": "test", "count": 1}).encode(),
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = _json.loads(resp.read().decode())
+                QMessageBox.information(
+                    dlg, "联网搜索",
+                    f"连接正常，返回 {len(data.get('results') or [])} 条结果。",
+                )
+            except urllib.error.HTTPError as e:
+                QMessageBox.warning(
+                    dlg, "联网搜索",
+                    f"Key 已送到，但接口返回 HTTP {e.code}。\n401 = Key 无效，402 = 余额不足。",
+                )
+            except Exception as e:  # noqa: BLE001 - 测不通就把原因说清楚
+                QMessageBox.warning(dlg, "联网搜索", f"连不上：{e}")
+
+        _web_test.clicked.connect(_on_web_test)
+        wf.addRow("", _web_test)
+        form.addWidget(web_g)
+
         # ── Advanced ──
         ad_g = QGroupBox(_t("settings_advanced"))
         ad_g.setStyleSheet(llm_g.styleSheet())
@@ -6860,6 +6943,13 @@ class GanggeDesktop(QMainWindow):
             self._settings.setValue("qoder_model", _qd_model_name or "Auto")
             self._settings.setValue("qoder_strength", _qd_strength.currentData())
             self._settings.setValue("qoder_permission", _qd_perm.currentData())
+            # Save web search settings（Key 独立于主模型，换模型不用重配）
+            self._web_key_input.setText(_web_key.text().strip())
+            self._web_backend_combo.setCurrentIndex(
+                max(0, self._web_backend_combo.findData(_web_backend.currentData()))
+            )
+            self._settings.setValue("web_search_key", self._web_key_input.text())
+            self._settings.setValue("web_search_backend", _web_backend.currentData())
             self._update_provider_fields()
             self._sync_env_file()
             # Apply language change
@@ -6923,6 +7013,15 @@ class GanggeDesktop(QMainWindow):
         qd_exe = self._qoder_exe_input.text().strip()
         if qd_exe:
             updates["QODER_CLI_PATH"] = qd_exe
+
+        # ── 联网搜索（与主模型无关，换 provider 不该让搜索失效）──
+        web_key = self._web_key_input.text().strip()
+        if web_key:
+            updates["WEB_SEARCH_API_KEY"] = web_key
+            os.environ["WEB_SEARCH_API_KEY"] = web_key
+        web_backend = str(self._web_backend_combo.currentData() or "auto")
+        updates["WEB_SEARCH_BACKEND"] = web_backend
+        os.environ["WEB_SEARCH_BACKEND"] = web_backend
 
         # ── Thinking mode ──
         if self._thinking_mode_cb.isChecked():
@@ -9110,6 +9209,17 @@ class GanggeDesktop(QMainWindow):
         base_url = self._settings.value(f"base_url_{p}", "")
         if base_url:
             self._base_url_input.setText(base_url)
+
+        # 联网搜索 Key：环境变量优先（.env 里写了就以它为准），否则用上次保存在本机的那份
+        if not os.environ.get("WEB_SEARCH_API_KEY"):
+            saved_web_key = self._settings.value("web_search_key", "")
+            if saved_web_key:
+                self._web_key_input.setText(saved_web_key)
+        saved_backend = self._settings.value("web_search_backend", "")
+        if saved_backend and not os.environ.get("WEB_SEARCH_BACKEND"):
+            web_idx = self._web_backend_combo.findData(saved_backend)
+            if web_idx >= 0:
+                self._web_backend_combo.setCurrentIndex(web_idx)
         ws = self._settings.value("workspace", "")
         if ws:
             self._ws_input.setText(ws)

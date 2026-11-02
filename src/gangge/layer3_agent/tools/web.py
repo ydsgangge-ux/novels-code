@@ -9,6 +9,8 @@ import time
 import logging
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlparse
+
+from gangge.layer4_tools import deepseek_web
 from html import unescape as html_unescape
 
 import aiohttp
@@ -215,6 +217,36 @@ class WebFetchTool(BaseTool):
         if not ok:
             return ToolResult(output=msg, is_error=True)
 
+        # 0. 官方 Fetch：服务端抓取并转 Markdown。SPA、反爬站点也能拿到正文，
+        #    比本地 urllib 抓 HTML 再猜正文稳得多。没配 Key 就静默跳过。
+        note = ""
+        if deepseek_web.available():
+            try:
+                page = await deepseek_web.fetch(url)
+                content = (page.get("content") or "").strip()
+                if content:
+                    clipped = content[:max_length]
+                    if len(content) > max_length:
+                        clipped += f"\n\n... (内容已截断，原始共 {len(content)} 字符)"
+                    title = f"[{page['title']}]\n" if page.get("title") else ""
+                    return ToolResult(
+                        output=(
+                            f"[来源: {url} | via DeepSeek Fetch]\n{title}{clipped}\n"
+                            f"[{self._usage.usage_summary()}]"
+                        )
+                    )
+                note = "[官方 Fetch 没返回正文；已改用本地抓取]\n"
+            except deepseek_web.WebApiError as e:
+                note = f"[官方 Fetch 不可用：{e}；已改用本地抓取]\n"
+            except Exception as e:  # noqa: BLE001 - 抓不到就退化，别让整次抓取失败
+                note = f"[官方 Fetch 异常：{type(e).__name__}；已改用本地抓取]\n"
+
+        result = await self._local_fetch(url, max_length)
+        if note:
+            result.output = note + result.output
+        return result
+
+    async def _local_fetch(self, url: str, max_length: int) -> ToolResult:
         try:
             async with aiohttp.ClientSession() as session:
                 # 1. 优先尝试 llms.txt（为 LLM 准备的精简文档）
@@ -290,8 +322,9 @@ class WebSearchTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "搜索互联网获取最新信息。返回结果包含标题、摘要和链接。"
-            "优先 DuckDuckGo，失败自动切换 Bing。"
+            "搜索互联网获取最新信息。返回结果包含标题、摘要、链接，"
+            "配了搜索 Key 时还带站点、发布时间和权威分。"
+            "支持 site / lang / since / until 精确限定（site:github.com 这类语法）。"
             "用于查找技术文档、解决方案、最新资讯等需要联网搜索的场景。"
             "⚠️ 先搜再取: web_search 找到链接后，用 web_fetch 获取详细内容。"
             "⚠️ 搜索短语要精确、具体，避免过于宽泛的查询。"
@@ -311,6 +344,22 @@ class WebSearchTool(BaseTool):
                     "description": "最大结果数，默认 5，最大 10",
                     "default": 5,
                 },
+                "site": {
+                    "type": "string",
+                    "description": "只搜这些站点，逗号分隔。例如 github.com,huggingface.co",
+                },
+                "lang": {
+                    "type": "string",
+                    "description": "限定语言，例如 zh 或 zh,en",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "只看这之后发布的，例如 2025 或 2025-01-01",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "只看这之前发布的，例如 2026-06-01",
+                },
             },
             "required": ["query"],
         }
@@ -329,7 +378,35 @@ class WebSearchTool(BaseTool):
         if not ok:
             return ToolResult(output=msg, is_error=True)
 
+        # site / lang / since / until 拼成搜索语法，两家引擎都认
+        query = _apply_search_syntax(query, kwargs)
+
         errors: list[str] = []
+
+        # 0. 官方 Search：一次拿走摘要、权威分、发布时间，模型才判断得出该信哪条。
+        #    没有 Key（主模型不是 DeepSeek）就静默回退到免费通道。
+        if deepseek_web.available():
+            try:
+                hits = await deepseek_web.search(
+                    query,
+                    count=max_results,
+                    ori_question=str(kwargs.get("ori_question") or ""),
+                )
+                if hits:
+                    return self._format_deepseek(query, hits)
+                errors.append("DeepSeek: 无结果")
+            except deepseek_web.WebApiError as e:
+                errors.append(f"DeepSeek: {e}")
+            except Exception as e:  # noqa: BLE001 - 接口异常不该让搜索整体失败
+                errors.append(f"DeepSeek: {type(e).__name__}: {e}")
+
+        return await self._free_search(query, max_results, errors)
+
+    async def _free_search(
+        self, query: str, max_results: int, errors: list[str] | None = None
+    ) -> ToolResult:
+        """免费通道：DDG API → DDG HTML → Bing，三层全挂才算失败。"""
+        errors = list(errors or [])
 
         async with aiohttp.ClientSession() as session:
             # ── 第 1 层: DuckDuckGo Instant Answer API ──
@@ -410,11 +487,13 @@ class WebSearchTool(BaseTool):
                 errors.append(f"Bing: {e}")
 
         # 三层全部失败
+        hint = "" if deepseek_web.available() else "\n" + deepseek_web.missing_key_hint()
         return ToolResult(
             output=(
                 f"搜索失败，三层引擎均不可用: {query}\n"
                 f"尝试: {'; '.join(errors)}\n"
                 f"建议: 1. 检查网络 2. 换英文关键词 3. 用 web_fetch 直接访问目标网页"
+                f"{hint}"
             ),
             is_error=True,
         )
@@ -466,6 +545,55 @@ class WebSearchTool(BaseTool):
             lines.append("")
         lines.append(f"[{self._usage.usage_summary()}]")
         return ToolResult(output="\n".join(lines))
+
+    def _format_deepseek(self, query: str, hits: list[dict[str, Any]]) -> ToolResult:
+        """官方结果多带站点、时间、权威分——这几个字段决定了模型信不信它。"""
+        lines = [f"搜索结果 ({len(hits)} 条 | via DeepSeek Search): {query}\n"]
+        for i, hit in enumerate(hits, 1):
+            title = str(hit.get("title") or "(无标题)")
+            lines.append(f"{i}. [{title}]({hit.get('url')})")
+            meta: list[str] = []
+            if hit.get("site_name"):
+                meta.append(str(hit["site_name"]))
+            if hit.get("date"):
+                meta.append(str(hit["date"])[:10])
+            score = hit.get("rerank_score")
+            if isinstance(score, (int, float)):
+                meta.append(f"相关度 {score:.1f}")
+            authority = hit.get("authority")
+            if isinstance(authority, int) and authority >= 3:
+                meta.append("高权威")
+            if meta:
+                lines.append("   " + " · ".join(meta))
+            body = str(hit.get("summary") or hit.get("snippet") or "")
+            if body:
+                lines.append(f"   {body[:400]}")
+            lines.append("")
+        lines.append(f"[{self._usage.usage_summary()}]")
+        return ToolResult(output="\n".join(lines), metadata={"engine": "deepseek"})
+
+
+def _apply_search_syntax(query: str, kwargs: dict[str, Any]) -> str:
+    """把 site / lang / since / until 拼成搜索语法，官方和免费通道都认。
+
+    这几个是"能不能精确找"的分水岭：``site:github.com`` 比在结果里翻链接快得多。
+    """
+    parts: list[str] = []
+    site = str(kwargs.get("site") or "").strip()
+    if site:
+        sites = [s.strip() for s in site.replace(";", ",").split(",") if s.strip()]
+        if sites:
+            parts.append(" OR ".join(f"site:{s}" for s in sites))
+    lang = str(kwargs.get("lang") or "").strip()
+    if lang:
+        parts.append(f"lang:{lang}")
+    since = str(kwargs.get("since") or "").strip()
+    if since:
+        parts.append(f"after:{since}")
+    until = str(kwargs.get("until") or "").strip()
+    if until:
+        parts.append(f"before:{until}")
+    return f"{query} {' '.join(parts)}".strip() if parts else query
 
 
 def _parse_ddg_results(html: str, max_results: int) -> list[dict[str, str]]:

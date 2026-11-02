@@ -206,6 +206,9 @@ AI：📋 任务清单 (0/4) → 建结构 → User 模型 → 注册/登录 API
 - **只读就收手**：连续 3 轮只看不改 → 自动结束，不空转烧钱
 - **会自己造工具**：`create_tool` 在运行时新建工具，存进 `.gangge/plugins/`，下次自动加载
 - **能接 MCP**：stdio / SSE 两种传输，`.gangge/mcp_servers.json` 里的服务自动注册成工具
+- **联网搜索可升级**：填一个 DeepSeek Key，`web_search` 换成官方 Search（带摘要、发布时间、权威分），
+  `web_fetch` 换成官方 Fetch（直接给 Markdown）；没填就自动退回 DuckDuckGo / Bing，不影响使用。
+  Key 独立于主模型，桌面端「设置 → 联网搜索」填一次即可（主模型是 DeepSeek 时无需填，自动复用）
 - **跨会话记忆**：Memory Bank 记进度和踩过的坑；`.ganggerules` 定项目规范
 
 ## ⚙️ 配置
