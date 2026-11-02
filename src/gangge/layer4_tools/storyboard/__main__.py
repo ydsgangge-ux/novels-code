@@ -85,6 +85,14 @@ def _parser() -> argparse.ArgumentParser:
         default="storyboard",
         help="拍哪种页面：朴素分镜页（默认）/ 3D 展示页 / 3D 展示页+真实网站截图（需 --url）",
     )
+    p.add_argument(
+        "--resolve",
+        metavar="HOST=IP",
+        help=(
+            "给域名钉死 IP，逗号分隔，如 github.com=140.82.112.4。"
+            "DNS 被污染时（解析出来是黑洞 IP）抓图会一直超时，用它绕过解析"
+        ),
+    )
     return p
 
 
@@ -206,10 +214,19 @@ async def _run(args: argparse.Namespace) -> int:
         if not args.url:
             print("--page site 需要 --url：框里要装的是那个网站的截图", file=sys.stderr)
             return 2
-        from gangge.layer4_tools.storyboard.site import SiteError, capture_site
+        from gangge.layer4_tools.storyboard.site import (
+            SiteError,
+            capture_site,
+            parse_host_map,
+        )
 
         if not args.style:
             storyboard.style = "neon"      # 展示页默认就是发光深色
+        try:
+            host_map = parse_host_map(args.resolve or "")
+        except ValueError as e:
+            print(f"--resolve 格式不对: {e}", file=sys.stderr)
+            return 2
         print(f"截图: {args.url}")
         try:
             site_shot = await capture_site(
@@ -217,6 +234,7 @@ async def _run(args: argparse.Namespace) -> int:
                 color_scheme="dark"
                 if storyboard.style in ("dark", "neon", "glass")
                 else "light",
+                host_map=host_map or None,
             )
         except SiteError as e:
             print(f"截图失败: {e}", file=sys.stderr)

@@ -12,11 +12,27 @@ from gangge.layer4_tools.storyboard.site import (
     SiteShot,
     _headline,
     build_site_page,
+    parse_host_map,
     shot_inner_page,
 )
 
 # 一个最小的"JPEG"：内容无所谓，这里只校验它被内联进页面
 FAKE_JPEG = b"\xff\xd8\xff\xe0fake-jpeg-payload"
+
+
+def test_parse_host_map_takes_comma_or_semicolon():
+    """DNS 被污染时靠它把域名钉到能通的 IP，格式要宽松但不猜。"""
+    assert parse_host_map("") == {}
+    assert parse_host_map("github.com=140.82.112.4") == {"github.com": "140.82.112.4"}
+    assert parse_host_map("a=1.1.1.1, b=2.2.2.2") == {"a": "1.1.1.1", "b": "2.2.2.2"}
+    assert parse_host_map("a=1.1.1.1;b=2.2.2.2") == {"a": "1.1.1.1", "b": "2.2.2.2"}
+
+
+def test_parse_host_map_rejects_garbage():
+    with pytest.raises(ValueError, match="HOST=IP"):
+        parse_host_map("github.com")
+    with pytest.raises(ValueError, match="HOST=IP"):
+        parse_host_map("=1.1.1.1")
 
 
 def _shot(title: str = "owner/repo: 一句话介绍", desc: str = "摘要") -> SiteShot:

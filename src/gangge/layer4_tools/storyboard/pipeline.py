@@ -23,13 +23,14 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from gangge.layer4_tools.storyboard import composer, renderer, tts
+from gangge.layer4_tools.storyboard.pages import PAGE_KINDS
 from gangge.layer4_tools.storyboard.schema import Scene, Storyboard
 from gangge.layer4_tools.storyboard.templates import render_page
 
 logger = logging.getLogger(__name__)
 
 #: 能拍成视频的三种页面：朴素分镜页、3D 展示页、3D 展示页里装真实网站截图。
-PAGE_KINDS: tuple[str, ...] = ("storyboard", "showcase", "site")
+#: 清单从 :mod:`~.pages` 来，新增页面只改那一处。
 
 # A shot ends when the voice ends; this keeps the last syllable from being
 # clipped and gives the eye somewhere to rest before the cut.
@@ -98,6 +99,8 @@ def write_page(
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if page not in PAGE_KINDS:
+        raise ValueError(f"未知页面类型: {page!r}，可选: {', '.join(PAGE_KINDS)}")
     plain = out_dir / "storyboard.html"
     plain.write_text(render_page(storyboard, slots), encoding="utf-8")
     if page == "storyboard":

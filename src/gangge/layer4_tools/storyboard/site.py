@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 
+from gangge.layer4_tools.storyboard.pages import read_page
 from gangge.layer4_tools.storyboard.schema import Scene, Storyboard
 from gangge.layer4_tools.storyboard.showcase import CHAPTER_VH, TAIL_VH, render_showcase
 from gangge.layer4_tools.storyboard.sources import _pretty_github_title, normalize_url
@@ -61,6 +62,24 @@ class SiteShot:
         return f"{self.width}×{self.height}  {len(self.image) // 1024} KB"
 
 
+def parse_host_map(text: str) -> dict[str, str]:
+    """``github.com=140.82.112.4,example.com=1.2.3.4`` → ``{host: ip}``。
+
+    DNS 被污染时（解析出来的是黑洞 IP，TCP 永远连不上），用 IP 直连绕过解析。
+    只映射域名，不改 TLS 的 SNI，所以证书校验照常。
+    """
+    hosts: dict[str, str] = {}
+    for item in (text or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        host, sep, ip = item.partition("=")
+        if not sep or not host.strip() or not ip.strip():
+            raise ValueError(f"host 映射要写成 HOST=IP：{item!r}")
+        hosts[host.strip()] = ip.strip()
+    return hosts
+
+
 async def capture_site(
     url: str,
     *,
@@ -70,11 +89,15 @@ async def capture_site(
     quality: int = QUALITY,
     color_scheme: str | None = "dark",
     timeout: float = 30.0,
+    host_map: dict[str, str] | None = None,
 ) -> SiteShot:
     """用无头浏览器截一张整页图（JPEG）。
 
     ``color_scheme`` 默认 dark：展示框本身是深色的，里面塞一张纯白页面反差太大；
     站点支持 ``prefers-color-scheme`` 时跟着变暗，整页才像同一个作品。
+
+    ``host_map`` 给域名钉死 IP（``{"github.com": "140.82.112.4"}``）：本机 DNS 被
+    污染时，浏览器会先连到黑洞 IP 再超时——钉住一个能通的 IP 就正常了。
     """
     target = normalize_url(url)
     try:
@@ -84,8 +107,13 @@ async def capture_site(
             "需要 playwright 才能整页截图：pip install playwright && playwright install chromium"
         ) from e
 
+    args = ["--hide-scrollbars"]
+    if host_map:
+        rules = ", ".join(f"MAP {host} {ip}" for host, ip in host_map.items())
+        args.append(f"--host-resolver-rules={rules}")
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=["--hide-scrollbars"])
+        browser = await pw.chromium.launch(args=args)
         try:
             page = await browser.new_page(
                 viewport={"width": width, "height": height},
@@ -93,9 +121,17 @@ async def capture_site(
                 color_scheme=color_scheme,
             )
             try:
-                await page.goto(target, wait_until="load", timeout=timeout * 1000)
+                # 等 load 会被第三方字体/CDN 拖死（GitHub 页面就有几十个外链，
+                # 少一个加载不出来，load 永远不触发）。先拿 DOM，再尽力等网络空闲。
+                await page.goto(
+                    target, wait_until="domcontentloaded", timeout=timeout * 1000
+                )
             except Exception as e:  # noqa: BLE001 - 站点超时/拒连都算抓不到
                 raise SiteError(f"打开页面失败：{e}") from e
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:  # noqa: BLE001 - 有资源卡住也照样截，别把整次抓图搭进去
+                pass
             await page.evaluate("() => (document.fonts ? document.fonts.ready : null)")
             # 先滚一遍把懒加载的图都触发出来，再回到顶部截图，否则长图后段是空的
             await page.evaluate(
@@ -223,44 +259,7 @@ def _html(text: str) -> str:
     return _mod.escape(str(text), quote=True)
 
 
-_INNER = Template("""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<style>
-  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0b0f16; }
-  #shot {
-    display: block; width: 100%; height: auto;
-    will-change: transform; transform: translate3d(0, 0, 0);
-    -webkit-user-drag: none; user-select: none;
-  }
-</style>
-</head>
-<body>
-<img id="shot" alt="$alt" src="$img">
-<script>
-(function () {
-  var T0 = $t0, T1 = $t1;
-  var shot = document.getElementById('shot');
-
-  function easeInOut(p) { return p < .5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2; }
-
-  window.__hide_ui = function () {};
-
-  // t 是外层的"这一段时间轴"，这里只把它换成 0..1 的平移进度
-  window.__seek = function (t) {
-    var span = Math.max(0.001, T1 - T0);
-    var k = Math.max(0, Math.min(1, (t - T0) / span));
-    var pan = Math.max(0, shot.offsetHeight - window.innerHeight);
-    shot.style.transform = 'translate3d(0,' + (-pan * easeInOut(k)).toFixed(2) + 'px,0)';
-  };
-
-  window.__seek(T0);
-})();
-</script>
-</body>
-</html>
-""")
+_INNER = Template(read_page("site_inner"))
 
 
 def main() -> int:

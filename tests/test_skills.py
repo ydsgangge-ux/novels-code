@@ -24,6 +24,7 @@ from gangge.layer4_tools.skills import (
     find,
     grouped,
     load_user_skills,
+    preview_image,
 )
 
 APP_PATH = Path(__file__).resolve().parent.parent / "desktop" / "app.py"
@@ -64,6 +65,18 @@ def test_focus_token_always_appears_in_template():
     for skill in BUILTIN_SKILLS:
         if skill.focus:
             assert skill.focus in skill.template, f"{skill.id} 的占位符不在模板里"
+
+
+def test_page_skills_are_offered_next_to_the_styles():
+    """展示页/网站页要像五种风格一样，点一下就填好 page=... 的提示词。"""
+    for skill_id, token in (("showcase_3d", "page=showcase"), ("site_tour", "page=site")):
+        skill = find(skill_id)
+        assert skill is not None, f"缺少 {skill_id}"
+        assert token in skill.template, f"{skill_id} 没告诉模型用哪种页面"
+        assert skill.group == "视频出片"
+        assert skill.hint, f"{skill_id} 没有适用场景说明"
+        assert skill.focus and skill.focus in skill.template
+        assert preview_image(skill) is not None, f"{skill_id} 没有效果图"
 
 
 # ── 用户自定义 ──────────────────────────────────────────────────

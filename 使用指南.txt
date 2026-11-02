@@ -233,6 +233,42 @@
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+六、短视频与展示页
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  【三种页面】
+
+    storyboard   朴素分镜页（默认，最快最轻）
+    showcase     3D 展示页：分镜装进浏览器框，滚动就是推镜头
+    site         3D 展示页 + 真实网站整页截图当内页（需要网址）
+
+  【桌面端】
+
+    ⚡ 技能 → 视频出片 → 「3D 展示页视频」/「网站展示视频」
+    右侧「效果」页签有预览图和动画，点一下就把提示词填好。
+
+  【命令行】
+
+    python -m gangge.layer4_tools.storyboard -c 口播稿.txt --page showcase
+    python -m gangge.layer4_tools.storyboard -c 口播稿.txt --page site -u https://example.com
+    python -m gangge.layer4_tools.storyboard -s --page showcase --preview
+
+  【模板在哪】
+
+    src/gangge/layer4_tools/storyboard/pages/*.html
+    改版式直接改 HTML，不用碰 Python；pages.py 的 TEMPLATES 按名取用。
+    site 页面要先抓图，需要 playwright：
+      pip install playwright && playwright install chromium
+
+  【抓图一直超时？】
+    多半是 DNS 被污染（域名解析到黑洞 IP，浏览器连不上）。
+    先用 curl 试出能通的 IP：
+      curl --resolve github.com:443:140.82.112.4 https://github.com/
+    再让抓图绕过解析：
+      ... --page site -u https://github.com/... --resolve github.com=140.82.112.4
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 七、常见问题
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

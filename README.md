@@ -2,7 +2,7 @@
 
 # ⚡ Gangge Code
 
-**AI 编程助手 · 通用 Agent 框架 — 写代码、写小说、做研究，一个引擎全搞定**
+**会写小说的 AI 编程助手 —— 一句话写一章，一段文案出一条片**
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-blue?logo=python" />
@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/LLM-DeepSeek%20%7C%20Claude%20%7C%20OpenAI%20%7C%20Ollama-orange" />
 </p>
 
-**💻 AI 编程助手 · 📖 小说创作 · 🔍 联网研究 · 🧩 可扩展**
+📖 小说引擎 · 🎬 视频出片 · 🤝 任务外包 · 💻 编程助手
 
 [English](./README_EN.md) | 中文
 
@@ -18,320 +18,167 @@
 
 ---
 
-## ✨ 特色对比
+![桌面端](docs/screenshots/1.png)
 
-| | Gangge Code | Claude Code | ChatGPT / Copilot |
-|--|--|--|--|
-| **Agentic Loop + 工具调用** | ✅ 自动规划→执行→验证 | ✅ | ❌ 仅输出代码 |
-| **多 LLM 支持** | ✅ DeepSeek / Claude / OpenAI / Ollama | ❌ 仅 Claude | ❌ 仅 OpenAI |
-| **本地运行** | ✅ 全本地部署 | ❌ 需订阅 | ❌ 云端依赖 |
-| **桌面 GUI** | ✅ PyQt6 | ❌ CLI only | ❌ |
-| **Shadow Git 回滚** | ✅ | ✅ | ❌ |
-| **Memory Bank 跨会话** | ✅ | ✅ | ❌ |
-| **LSP 语法检查** | ✅ | ❌ | ❌ |
-| **AI 自建工具** | ✅ 运行时创建新工具 | ❌ | ❌ |
-| **MCP 协议接入** | ✅ 标准的 MCP 客户端 | ✅ | ❌ |
-| **Agent Profile 场景化** | ✅ 编程/小说/研究自动切换 | ❌ 全部工具暴露 | ❌ |
-| **小说创作引擎** | ✅ Dramatica-Flow 五层流水线 | ❌ | ❌ |
-| **完全开源可改** | ✅ | ❌ | ❌ |
-| **性价比（DeepSeek）** | ✅ 成本低 10x | ❌ | ❌ |
+## 四件事，都是「给一句话，出一份成品」
 
----
+| 你给 | 它出 | 怎么做到的 |
+|---|---|---|
+| 「把第三章写出来」 | 一章正文 + 审计报告 | 五层流水线：规划 → 撰写 → 校验 → 审计 → 修订，自动跑完 |
+| 一段口播稿 | 带配音、字幕的 mp4 | 五种视觉风格 + 竖屏 + 3D 展示页，技能里点一下就开始 |
+| 一个网址 | 3D 展示页 / 网站展示视频 | 整页截图装进浏览器框，滚一下镜头就往前推 |
+| 一块能验证的活 | 结论 + 验收结果 + 日志 | 外包给 Qoder 独立进程，主对话只收一段结论 |
 
-## 🚀 快速开始
+这四件事在同一个桌面应用里，共用一套工具、权限和回滚机制——不是四个脚本书钉在一起。
 
-### 1. 安装
+## 🚀 三分钟跑起来
 
 ```bash
 git clone https://github.com/ydsgangge-ux/gangge-code.git
 cd gangge-code
-pip install -e ".[gui]"   # 带桌面 GUI（推荐）
-# pip install -e .         # 最小安装（CLI only）
+
+pip install -e ".[gui]"          # 桌面端（推荐）
+# 要视频出片就换成：pip install -e ".[gui,video]"（playwright + edge-tts）
+playwright install chromium      # 只有 page=site 抓网页截图时才需要
+
+cp .env.example .env             # 填一个 API Key 即可
 ```
 
-### 2. 配置
-
-```bash
-cp .env.example .env
-# 编辑 .env，填入 API Key
-```
-
-最小配置（DeepSeek）：
 ```ini
 LLM_PROVIDER=deepseek
 DEEPSEEK_API_KEY=sk-xxx
 ```
 
-### 3. 使用
-
 ```bash
-# 桌面 GUI（推荐）
-python desktop/app.py
-
-# 单次任务
-gangge "创建一个带用户认证的 FastAPI 项目"
-
-# 交互式 REPL
-gangge
+python desktop/app.py                        # 桌面端
+gangge "创建一个带用户认证的 FastAPI 项目"     # 单次任务
+gangge                                       # 交互式 REPL
 ```
 
----
+不想给任何 API Key 也能跑：`LLM_PROVIDER=ollama` 指向本机模型。
 
-## 💻 AI 编程助手
+## 📖 写小说：从设定一路写到导出
 
-### 核心能力
+内置 **Dramatica-Flow**，一句话就能推进，不用记命令：
 
-在聊天窗口用自然语言描述需求，AI 自动理解意图、规划步骤、调用工具完成。
+```
+你：加一个和主角从小一起长大的朋友，性格要怂但关键时刻靠谱
+AI：✓ 已写入角色档案（第 7 号角色 · 关系：发小）
+你：第三章太平了，加点悬念
+AI：✓ 已调整第三章大纲：埋 2 处伏笔，结尾留钩子
+你：写下一章
+AI：▶ Architect 规划 → Writer 撰写 → 审计 2 处逻辑问题 → 修订 → 完成
+```
+
+**五层流水线**（每章都走一遍，不满意可以只重跑某一层）：
+
+1. **Architect** — 读大纲、世界观、前文摘要，产出本章蓝图
+2. **Writer** — 按蓝图写正文，保持文风与人物口吻一致
+3. **写后校验** — 抽因果链、生成摘要、更新世界状态
+4. **Auditor** — 查逻辑漏洞、伏笔是否收、人物行为是否合理
+5. **Reviser** — 按审计意见改，循环到过审
+
+**16 个专用工具**：`novel_init` 建书 · `novel_setup` 设定 · `novel_outline` 大纲 ·
+`novel_chapter_outlines` 拆章 · `novel_write_chapter` 写章 · `novel_audit` 审计 ·
+`novel_revise` 修订 · `novel_edit` 改任何元素（角色/关系/伏笔/大纲/正文）· `novel_status` 进度 ·
+`novel_import` 导入 · `novel_export` 导出 TXT/EPUB · `novel_consistency_check` 全书一致性 ·
+`novel_graph_query` / `novel_graph_rebuild` 叙事图谱 · `novel_navigate` 跳转 · `novel_list_books` 书单
+
+**仿写**：导入几十万字的 TXT，多段采样分析文风、全文抽取人物、拆情节弧线与情绪曲线，
+写作时按进度动态对齐参考文本——长篇会自动分块，不会一上来就撑爆上下文。
+
+**叙事图谱**：人物、事件、关系存成图，因果链和伏笔是否闭环可查询，续写不靠猜。
+
+**专业面板**：仪表盘 / 角色 / 大纲 / 章节 / 世界观 / 追踪 / 词库。
+
+## 🎬 视频一键输出
+
+一段文案进去，一条带配音和字幕的 mp4 出来。`page` 决定拍哪张页面：
+
+| page | 页面 | 适合 |
+|---|---|---|
+| `storyboard` | 朴素分镜页（默认） | 最快最轻，纯信息 |
+| `showcase` | 3D 展示页：分镜装进浏览器框，滚动即推镜头 | 产品 / 项目介绍 |
+| `site` | 3D 展示页 + 真实网站整页截图当内页 | 介绍自己的站点（给 `url`） |
+
+![3D 展示页](src/gangge/layer4_tools/storyboard/previews/showcase.png)
+
+![网站展示](src/gangge/layer4_tools/storyboard/previews/site.png)
+
+桌面端「⚡ 技能 → 视频出片」里有 9 条现成入口（五种风格 + 自动选风格 + 竖屏 + 3D 展示页 + 网站展示），
+点一下就把提示词填好，不用记参数。命令行等价写法：
+
+```bash
+# 现成文案 → 分镜 → 配音 → 成片
+python -m gangge.layer4_tools.storyboard -c 口播稿.txt --page showcase --style neon
+
+# 一个网址 → 整页截图 → 3D 展示视频
+python -m gangge.layer4_tools.storyboard -c 口播稿.txt --page site -u https://example.com
+
+# 只想先看页面，不渲染视频
+python -m gangge.layer4_tools.storyboard -s --page showcase --preview
+```
+
+页面是**模板文件**（`storyboard/pages/*.html`），改版式直接改 HTML，不用碰 Python；
+新增一种页面只需放文件 + 在 `pages.py` 的 `TEMPLATES` 里登记一行。
+
+> 抓网页截图一直超时，但 `curl --resolve 域名:443:IP` 能通？那是 DNS 被污染。
+> 加 `--resolve github.com=140.82.112.4` 让浏览器绕过解析即可。
+
+## 🤝 把活外包给 Qoder
+
+有些活又长又机械：改十几个文件、重命名、补一批测试、升级依赖后跑全量验证。
+这类任务最耗上下文——读的每一行都留在主对话里，最后只为了一个「改完了」。
+
+`qoder_delegate` 把它丢给 Qoder CLI 的**独立进程**，主对话只收一段结论：
+
+```
+你：把项目里 old_name 批量改成 new_name，范围限 src/
+AI：▶ 委派中（scope: src/**　dod: pytest -q）
+    ✓ status=done | 改动 14 个文件 | 全量测试通过 | 日志 .gangge/qoder/xxx.log
+    结论：命名已统一，另有 2 处文档未在 scope 内，需要你确认是否一起改。
+```
+
+三条硬规矩，让「外包」不等于「失控」：
+
+| 规矩 | 作用 |
+|---|---|
+| `scope` 必填 | 允许改的文件白名单（支持 glob），越界会被判定 `violated` |
+| `dod` 必填 | 完成定义是一组**机器能判定**的验收命令，不绿不算完 |
+| 结论有上限 | 回传摘要 ≤1400 字符 + 验收结果 + 日志路径，探索过程留在对面 |
+
+`status` 四态：`done` 全绿 / `partial` 改了但没全绿（须自己看 checks）/ `violated` 改到白名单外（该回滚）/ `failed`。
+
+前置：本机装好 Qoder CLI（CN 版 `qoderclicn`、国际版 `qodercli`），程序会自动在 PATH 和常见安装目录里找。
+
+## 💻 编程助手
+
+同一个引擎，去掉小说和视频就是一个能自己干活、也会自己收手的编程助手。
 
 ```
 你：帮我创建一个 FastAPI 项目，带用户注册登录功能
-
-AI：好的，我来规划一下：
-     📋 任务清单 (0/4)
-     1. [ ] 创建项目结构
-     2. [ ] 实现用户模型 (User)
-     3. [ ] 实现注册/登录 API
-     4. [ ] 添加 JWT 认证中间件
-
-     ▶ 开始执行...
-     ✓ 已创建 app/models/user.py (42 行)
-     ✓ 已创建 app/routes/auth.py (83 行)
-     ✓ pytest 全部通过
-     ✅ 所有任务完成
+AI：📋 任务清单 (0/4) → 建结构 → User 模型 → 注册/登录 API → JWT 中间件
+    ✓ 已创建 app/models/user.py (42 行)
+    ✓ 已创建 app/routes/auth.py (83 行)
+    ✓ pytest 全部通过
 ```
 
-### 内置工具（按场景动态暴露）
-
-系统会根据任务类型自动切换 Agent Profile，只暴露相关工具：
+按场景自动切 Profile，只暴露相关工具，不让模型在 25 个工具里瞎挑：
 
 | Profile | 工具数 | 触发场景 |
-|---------|--------|----------|
-| **Coding** | 13 个 | 创建/写/修改/实现/开发/fix/build |
-| **Novel** | 25 个 | 小说/写作/章节/角色/大纲 |
-| **Research** | 10 个 | 搜索/查找/调研/联网 |
-
-通用工具（全部 Profile 可用）：`read_file` · `write_file` · `edit_file` · `bash` · `grep` · `glob` · `list_dir` · `web_fetch` · `ask_user` · `lint_check` · `find_symbol` · `find_references` · `TodoWrite`
-
-### 关键机制
-
-- **Runtime 自动推进 Todo**：系统自动跟踪任务进度，无需模型手动更新
-- **连续只读自动退出**：模型连续 3 轮只读不写 → 自动结束，避免无谓消耗
-- **上下文 Token 压缩**：使用率 > 92% 时自动压缩历史，保持上下文窗口可控
-- **429 限流重试**：指数退避 + 随机抖动，API 限流时自动重试
-- **AI 自建工具**：`create_tool` 在运行时创建新工具，4 重安全门检测
-- **Memory Bank**：跨会话记录项目进度 + 决策日志，防止重复犯错
-- **Shadow Git Checkpoint**：AI 修改前自动创建 Git 检查点，一键回滚
-- **LSP 语法检查**：写完代码自动运行 pyright/ruff，错误即时修复
-- **`.ganggerules` 项目规则**：项目根目录定义编码规范、测试要求、架构约定
-
----
-
-## 🔌 可扩展性
-
-### MCP 协议支持
-完整的 MCP 客户端管理器，支持 stdio 和 SSE 两种传输方式：
-
-```json
-// .gangge/mcp_servers.json
-{
-  "mcpServers": {
-    "database": { "command": "node", "args": ["db-mcp-server.js"] }
-  }
-}
-```
-
-### 插件系统
-- AI 自建工具自动保存到 `.gangge/plugins/`，下次启动自动加载
-- `.ganggerules` 定义项目级编码规范、测试要求、架构约定
-
----
-
-## 📖 小说创作引擎
-
-系统内置 Dramatica-Flow 完整小说创作系统（可选功能，不影响编程）：
-
-- **聊天式创作**：说「加个角色」「写下一章」，AI 自动调用对应工具
-- **五层写作流水线**：Architect 规划 → Writer 撰写 → Audit 检查 → Revise 修订
-- **16 个专用小说工具**：角色管理、大纲生成、章节写作、审计修订、导出等
-- **叙事知识图谱**：因果链追踪、伏笔管理、情感弧线
-- **仿写模式**：导入 TXT 小说，自动分析风格并仿写
-- **专业 UI 面板**：仪表盘、角色、大纲、章节、世界观、追踪、词库
-
----
-
-## 📐 架构
-
-```
-用户界面层 (Layer 1)
-  CLI / REPL / TUI / PyQt6 桌面 GUI
-        │
-  Agentic Loop 核心引擎 (Layer 3)
-        │
-  ├─ 工具执行层 (Layer 3 tools)
-  │    Coding 工具 · Novel 工具 · MCP 工具 · 插件工具
-  │    └── Agent Profile 动态暴露（按场景自动切换）
-  │
-  ├─ 会话管理层 (Layer 2)
-  │    持久化 · Memory Bank · 上下文压缩 · Todo 状态管理
-  │
-  ├─ 权限安全层 (Layer 4)
-  │    规则引擎 · 危险检测 · Shadow Git 回滚
-  │
-  └─ LLM 适配层 (Layer 5)
-       DeepSeek · OpenAI · Claude · Ollama
-```
-
-### 运行时组合（`gangge/runtime/`）
-
-五个 layer 提供**实现**，`runtime` 决定**装哪些**。启动不再是"从头 new 一遍对象"，而是
-把一棵插件树按 profile 组装起来：
-
-```
-profile（具名组装）
-  └─ bundles（有序 patch 文档）  →  profile patch  →  home patch  →  --patch
-```
-
-- **一切皆插件**：`llm` / `tools` / `permission` / `session` / `telemetry` / `memory-bank`
-  都是插件，各自占一个 `ctx.<key>`。没有需要打补丁的特权内核。
-- **能力 seam**：接口声明（`runtime/seams.py`）→ 实现（`runtime/plugins/*`）→ 消费方。
-  换实现不改消费方。
-- **`inject` 声明依赖**：依赖未就绪的插件自动挂起，服务一出现就激活 —— 加载顺序由依赖
-  表达，不靠手写启动序列。
-- **注册是可逆副作用**：`ctx.effect()` / `ctx.on()` / `ctx.provide()` 返回 disposer，
-  卸载时逆序撤销。
-- **事件是扩展点**：`turn/start`、`step/start`、`tools/pre-execute`、`permission/check`
-  等 22 个事件，各有唯一分发模式（`emit` / `waterfall` / `serial` / `parallel` / `bail`）。
-
-查看当前实际组装出的树（静态，不挂载、不需要 API Key）：
-
-```bash
-gangge --list-profiles          # 可用 profile
-gangge --dump-config            # 每一条行的来源层与最终配置
-gangge --show-events            # 事件及其分发模式
-gangge --show-seams             # 能力 seam 与内置实现
-gangge -P minimal               # 用极简 profile 启动
-gangge --set tools.profile=novel --dump-config   # 临时覆盖某一行
-```
-
-三个内置 profile：
-
-| profile | 说明 |
-|---|---|
-| `standard` | base + full-tools + memory-bank，全能力 |
-| `minimal` | 只要 base，不装树外插件、不开浏览器、不落遥测 |
-| `novel` | 工具面收敛到小说 profile，关掉浏览器 |
-
-自己加一个：在 `.gangge/profiles/demo.yml` 写 `bundles: [base]`，再用
-`.gangge/cordis.patch.yml` 覆盖任意行即可，**不需要改一行 Python**。
-
-### 弱模型护栏（`guardrails` bundle）
-
-免费/小模型（GLM-4.7-Flash、Qwen 7B、本地 8B）失败的原因基本不是"想不明白"，而是
-**手脚不稳**：参数名拼错、类型写成字符串、把文件内容包进代码围栏、同一个调用反复发、
-被 ANSI 颜色码带偏。这些都发生在工具边界上，所以修在工具边界：
-
-| 插件 | 挂钩 | 作用 |
 |---|---|---|
-| `schema-guard` | `tools/pre-execute` | 先**修**再**说**。`file_path`→`path`、`"5"`→`5`、去 ``` 围栏、丢弃多余字段；工具名拼错（`read` / `readfile`）时用 difflib 提示最近的真实工具名并给出可抄示例；修不动的返回「必填字段 + 全部参数 + 你实际传的 + 正确示例」 |
-| `result-pruner` | `tools/post-execute` | 去 ANSI/CR 进度条、压缩空行、头尾截断（保留结尾，报错在结尾）。**只改模型看到的文本，`metadata['value']` 保留完整真值** |
-| `repeat-guard` | `tools/pre+post` | 同一 `(工具, 参数)` 第 3 次起，在结果尾部追加「换参数 / 换工具 / 直接用已有结果」 |
-| `next-step` | `tools/post-execute` | 每种工具**每回合只提示一次**、一行以内：read 完该 edit、改完该 verify、报错该怎么改 |
-| `stop-guard` | `agent/turn-stopping` | 拒绝**提前收工**：只读不写、改了没验证，都不让结束回合（每条件最多拦 2 次） |
+| **Coding** | 13 个 | 创建 / 修改 / 实现 / 修复 / 构建 |
+| **Novel** | 25 个 | 小说 / 写作 / 章节 / 角色 / 大纲 |
+| **Research** | 10 个 | 搜索 / 查找 / 调研 / 联网 |
 
-效果：
-- 参数传错**不再浪费一轮**，多数直接被改对；改不动的拿到的是一段能照着抄的说明，而不是 `TypeError: unexpected keyword argument`。
-- 工具名幻觉不再死循环，而是「你是不是想用 `read_file`？示例：`read_file({"path": "src/main.py"})`」。
-- 模型"说完了"但一个文件都没改 → 被推回去动手；改了没跑 → 被推去验证。
+几个真正省事的设计：
 
-`stop-guard` 挂在合成事件 `agent/turn-stopping` 上，`AgenticLoop` 在准备接受停止时咨询它：
-
-```python
-directive = await ctx.serial("agent/turn-stopping", state)   # loop 内部
-# state = {round, text, user_task, has_modified_files,
-#          verified_after_write, tool_history, files_touched, todo_pending}
-```
-
-返回 `TurnDirective.keep_going(msg)` 就再跑一轮；返回 `None` 交回 loop 原有规则。
-`turn/start`、`turn/end`、`turn/aborted` 现在由 `run()` 统一括起来，所有退出路径
-（正常结束 / 达到上限 / 抛异常）都恰好发一次。
-
-用强模型想关掉：
-
-```bash
-gangge --set repeat-guard.limit=99                 # 关掉重复熔断
-gangge --set stop-guard.require_verification=false # 允许改完不验证就收工
-gangge --set next-step.on_error_only=true          # 只在报错时给提示
-gangge --set schema-guard.coerce=false             # 只校验不修复
-```
-
-不 boot profile 的宿主（PyQt 桌面端）可以只挂流水线：
-
-```python
-from gangge.runtime.pipeline import tool_pipeline
-
-service, ctx = tool_pipeline(registry, workspace=ws, repeat_limit=3)
-loop = AgenticLoop(..., tool_service=service, context=ctx)
-```
-
-### 请求级钩子（`llm/request` · `llm/response`）
-
-`AgenticLoop` 的每一次模型调用（主循环、压缩摘要、问答短路）都经过 `runtime.llm.chat()`，
-在真正发出去之前给你一次改写机会：
-
-```python
-def cheaper_for_summaries(request, next):
-    last = request["messages"][-1].get_text()
-    if "压缩以下对话" in last:
-        request["model"] = "glm-4.7-flash"      # 摘要不值得用贵模型
-    return next(request)
-
-ctx.on("llm/request", cheaper_for_summaries)
-```
-
-请求 dict 的字段：`messages` / `tools` / `system` / `model`。可以改的：
-
-| 想做的事 | 写法 |
-|---|---|
-| 按任务分层用模型 | `request["model"] = "..."`（**只影响本次调用**，事后自动还原） |
-| 出网前打码密钥 | 遍历 `request["messages"]` 改 `block.text` |
-| 临时关闭工具 | `request["tools"] = []` |
-| 请求前裁上下文 | `request["messages"] = request["messages"][-10:]` |
-
-`llm/response` 带两个参数 `(response, meta)`，`meta` 含 `latency_ms` / `model` / `adapters`，
-适合记账。`runtime.llm.stats` 也有累计计数。
-
-> 调用方传入的 adapter 会被**钉住**（`adapter=self.llm`），工厂默认实例绝不会悄悄替换它；
-> `model` 覆盖是 try/finally 作用域内的临时修改，失败也会还原。
-
-### step 生命周期
-
-主循环每轮发一次 `step/start`，请求返回后发 `step/end`：
-
-```python
-ctx.on("step/end", lambda s: print(s["round"], s["latency_ms"], s["stop_reason"],
-                                   s["tool_calls"], s["error"]))
-```
-
-本项目的 **step = 一次模型请求**；随后的工具执行由 `tool/call` → `tool/result` 单独计时。
-超时和异常路径也会发 `step/end`（`error="timeout"` 等），保证 start/end 配对。
-
-### 中断消息链修复
-
-工具执行到一半被取消（Ctrl+C / 停止按钮 / `task.cancel()`）时，历史里会留下
-"assistant 请求了 N 个工具，却只有 M 个结果"。下一次请求会直接被供应商拒绝
-（`tool_use ids were found without tool_result blocks`）。
-
-`run()` 在异常和正常退出两条路径上都会调用 `_repair_message_chain()`：给未配对的
-`tool_use` 补一条 `is_error=True` 的合成结果
-
-```
-[中断] 工具 `bash` 的调用被取消，结果未知。
-如果它是只读或幂等操作，可以重试；否则请先确认是否已经生效，避免重复执行造成副作用。
-```
-
-已配对的结果原样保留；重复调用是幂等的（已完整时直接返回 0，不发事件）。
-
----
+- **改前打检查点**：Shadow Git 自动存档，改坏了 `git revert` 一条命令回去
+- **写完自检**：LSP 跑 pyright/ruff，语法错误当场修，不等到你发现
+- **只读就收手**：连续 3 轮只看不改 → 自动结束，不空转烧钱
+- **会自己造工具**：`create_tool` 在运行时新建工具，存进 `.gangge/plugins/`，下次自动加载
+- **能接 MCP**：stdio / SSE 两种传输，`.gangge/mcp_servers.json` 里的服务自动注册成工具
+- **跨会话记忆**：Memory Bank 记进度和踩过的坑；`.ganggerules` 定项目规范
 
 ## ⚙️ 配置
 
@@ -342,28 +189,24 @@ MAX_ROUNDS=30                  # 最大工具调用轮数
 LLM_TIMEOUT=300                # LLM 响应超时（秒）
 ```
 
----
+架构与扩展点（运行时组合、护栏、请求级 hook）见 [`docs/architecture.md`](docs/architecture.md)。
 
 ## 🗺️ Roadmap
 
 - [x] Agentic Loop + TodoWrite 自动状态管理
 - [x] Agent Profile 场景化工具动态暴露
-- [x] Runtime 上下文压缩（Token 阈值触发）
-- [x] 429 限流指数退避重试
-- [x] Memory Bank + Decision Log
 - [x] Shadow Git Checkpoint / 回滚
-- [x] LSP 语法检查（pyright/ruff/pylint）
+- [x] LSP 语法检查（pyright / ruff / pylint）
+- [x] Memory Bank + Decision Log
 - [x] AI 自建工具 + 插件系统
 - [x] MCP 协议支持（stdio + SSE）
 - [x] Dramatica-Flow 小说创作引擎
+- [x] 视频出片（五种风格 / 竖屏 / 3D 展示页 / 网站展示）
+- [x] Qoder 委派（scope + dod + 四态结果）
 - [x] PyQt6 桌面 GUI
-- [x] 多种 LLM 支持（DeepSeek / Claude / OpenAI / Ollama）
 - [ ] Web UI（远程访问）
-- [ ] 向量索引 (RAG) 局部上下文
-- [ ] 国际化 (i18n) 英语语言包
+- [ ] 向量索引（RAG）局部上下文
 - [ ] 协作模式（多人共享会话）
-
----
 
 ## 📜 License
 

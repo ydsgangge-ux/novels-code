@@ -2,7 +2,7 @@
 
 # ⚡ Gangge Code
 
-**AI Novel Writing Engine · Local Coding Assistant — Write Novels, Write Code, One Tool Does It All**
+**The AI coding assistant that writes novels — one line to a chapter, one script to a video**
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-blue?logo=python" />
@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/LLM-DeepSeek%20%7C%20Claude%20%7C%20OpenAI%20%7C%20Ollama-orange" />
 </p>
 
-**📖 Novel Writing (Dramatica-Flow) · 💻 AI Coding Assistant · Desktop GUI**
+**📖 Novel engine · 🎬 Video output · 🤝 Delegation · 💻 Coding assistant**
 
 English | [中文](./README.md)
 
@@ -91,25 +91,14 @@ Talk directly in the main chat window, AI understands intent and acts:
 
 ---
 
-## ✨ Feature Comparison
+## Four things, each one sentence in and one finished artifact out
 
-| | Gangge Code | ChatGPT / Copilot | Claude Code | Specialized Writers |
-|--|--|--|--|--|
-| **AI Novel Writing** | ✅ Dramatica-Flow | ❌ | ❌ | ❌ No Agent capability |
-| **Chat-based novels** | ✅ Natural language driven | ❌ | ❌ | ❌ Fixed workflow |
-| **5-layer pipeline** | ✅ Plan→Write→Audit→Revise | ❌ | ❌ | ❌ Single layer output |
-| **Import & imitate** | ✅ Huge TXT support | ❌ | ❌ | ❌ Small file limit |
-| **Narrative graph** | ✅ Causal+hook tracking | ❌ | ❌ | ❌ |
-| Autonomous tool use | ✅ | ❌ Code only | ✅ | ❌ |
-| Runs 100% locally | ✅ | ❌ | ❌ Subscription | ❌ Cloud dependent |
-| DeepSeek native | ✅ 10x cheaper | ❌ | ❌ | ❌ |
-| Desktop GUI | ✅ PyQt6 | ❌ | ❌ | Partial |
-| Shadow Git rollback | ✅ | ❌ | ✅ | ❌ |
-| Memory Bank | ✅ | ❌ | ✅ | ❌ |
-| LSP syntax check | ✅ | ❌ | ❌ | ❌ |
-| Batch task queue | ✅ | ❌ | ❌ | ❌ |
-| MCP integration | ✅ | ❌ | ✅ | ❌ |
-| Fully open source | ✅ | ❌ | ❌ | ❌ |
+| You give | You get | How it works |
+|---|---|---|
+| "Write chapter 3" | A chapter plus an audit report | Five-layer pipeline: plan → write → validate → audit → revise |
+| A script | An mp4 with narration and subtitles | Five visual styles, portrait, or a 3D showcase page |
+| A URL | A 3D showcase page / showcase video | Full-page screenshot inside a browser frame, camera pushes as you scroll |
+| A verifiable chore | Result + checks + log path | Delegated to the Qoder CLI in its own process; only a short summary comes back |
 
 ---
 
@@ -285,6 +274,58 @@ Tech stack: FastAPI + SQLAlchemy + SQLite
 - **Diff rollback** — View diffs and roll back to pre-modification state
 - **Internationalization** — Built-in Chinese/English language packs, auto-switches by system language
 
+### Video & 3D Showcase Pages
+`demo_video` turns a script or topic into a narrated mp4; `page` picks the page it is filmed on:
+
+| page | page kind | best for |
+|------|-----------|----------|
+| `storyboard` | plain storyboard (default) | fastest, information-only |
+| `showcase` | 3D showcase: storyboard inside a browser frame, scroll pushes the camera | product / project intro |
+| `site` | showcase with a real full-page site screenshot as the inner page | introducing your own site (`url` required) |
+
+All three are one click away in the desktop app under **Skills → Video** (the prompt
+already carries `page=...`). CLI equivalent:
+
+```bash
+python -m gangge.layer4_tools.storyboard -c script.txt --page showcase --style neon
+python -m gangge.layer4_tools.storyboard -c script.txt --page site -u https://example.com
+```
+
+Pages are **template files**, not Python strings: `src/gangge/layer4_tools/storyboard/pages/`
+(`storyboard.html`, `showcase.html`, `site_inner.html`), resolved by name through
+`pages.py:TEMPLATES`. `page=site` needs playwright for the screenshot; the others
+are pure Python and work offline.
+
+### Delegating to Qoder
+
+Long, mechanical chores — rename across a dozen files, backfill a batch of tests, upgrade a
+dependency then run the suite — are what burn context: every line read stays in the main
+conversation, all to end with "done".
+
+`qoder_delegate` hands the whole closed loop to the Qoder CLI **in its own process**. The main
+conversation only receives a short conclusion:
+
+```
+you: rename old_name to new_name across src/
+ai:  ▶ delegating (scope: src/**  dod: pytest -q)
+     ✓ status=done | 14 files changed | tests green | log .gangge/qoder/xxx.log
+     summary: names unified; 2 docs outside scope still mention the old name.
+```
+
+Three rules keep delegation from turning into a loss of control:
+
+| Rule | Why |
+|---|---|
+| `scope` is required | whitelist of files it may touch (glob ok); anything else is reported as `violated` |
+| `dod` is required | completion is a list of **machine-checkable** commands; not green means not done |
+| bounded summary | ≤1400 chars + checks + log path; the exploration stays on the other side |
+
+`status`: `done` all green / `partial` changed but not green (inspect the checks yourself) /
+`violated` touched files outside scope (roll back) / `failed`.
+
+Requires the Qoder CLI on your machine (`qoderclicn` for CN, `qodercli` for intl) — it is
+discovered on PATH and in the usual install locations.
+
 ### Extensibility
 - **`.ganggerules`** — Define coding standards, test requirements, architecture conventions per project
 - **MCP Protocol** — Full MCP client manager supporting stdio and SSE transports
@@ -396,7 +437,9 @@ gangge-code/
 │   ├── layer4_tools/       # Infrastructure tools
 │   │   ├── shadow_git.py   #   Git checkpoint / rollback
 │   │   ├── mcp_client.py   #   MCP client (stdio + SSE)
+│   │   ├── qoder_cli/      #   Delegation runner (scope + dod)
 │   │   ├── repo_index.py   #   Repo symbol index
+│   │   ├── storyboard/     #   Video & 3D showcase (pages/*.html templates)
 │   │   └── plugin_loader.py    # Plugin loader
 │   └── layer5_llm/         # LLM adapters (4 providers)
 │       ├── base.py         #   Base class + ToolDefinition

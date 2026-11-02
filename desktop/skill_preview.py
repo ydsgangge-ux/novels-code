@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 from gangge.layer4_tools.skills import Skill, preview_image
 from gangge.layer4_tools.storyboard.demo import demo_storyboard
 from gangge.layer4_tools.storyboard.schema import STYLE_NAMES
+from gangge.layer4_tools.storyboard.showcase import render_showcase
 from gangge.layer4_tools.storyboard.templates import render_page
 
 _IDLE = "点左侧「⚡ 技能」挑一条，这里会显示它的效果图。"
@@ -45,6 +46,27 @@ _ANIM_IDLE = "点「▶ 播放动画」在这里真播一遍（需要 PyQt6-WebE
 MIN_FREE_COMMIT_MB = 1024
 
 _ANIM_DIR = Path(tempfile.gettempdir()) / "gangge-skill-anim"
+
+#: 展示页样例里的假地址栏；和 previews 的 ``site.png`` 用的是同一个。
+_DEMO_URL = "https://github.com/ydsgangge-ux/gangge-code"
+#: 这两条技能的样例不是"某一套配色"，而是另一种页面外壳。
+_PAGE_STEMS = {"showcase", "site"}
+
+#: 没有 ``__play`` 的页面（展示页靠滚动驱动）：让它自己从上滚到下，当作播放。
+_SCROLL_PLAY = """
+(function () {
+  if (window.__play) { window.__play(); return; }
+  var start = performance.now();
+  var max = Math.max(0, document.body.scrollHeight - window.innerHeight);
+  function step(now) {
+    var p = Math.min(1, (now - start) / 11000);
+    window.scrollTo(0, max * p);
+    if (p < 1) requestAnimationFrame(step);
+  }
+  window.scrollTo(0, 0);
+  requestAnimationFrame(step);
+})();
+"""
 
 
 # ── 环境探测（都不 import WebEngine，探测本身零成本） ──────────────
@@ -91,9 +113,31 @@ def webengine_status() -> tuple[bool, str]:
     return True, ""
 
 
+def _page_demo(stem: str) -> str:
+    """展示页 / 网站页的样例 HTML：外壳一样，装的东西不同。"""
+    storyboard = demo_storyboard("neon")
+    if stem != "site":
+        return render_showcase(storyboard, source_url=_DEMO_URL)
+    storyboard.width, storyboard.height = 1920, 1200
+    inner = demo_storyboard("neon")
+    return render_showcase(
+        storyboard,
+        source_url=_DEMO_URL,
+        inner_html=render_page(inner, inner.timeline()),
+        scroll_vh=4.55,
+    )
+
+
 def animation_html(skill: Skill) -> Path | None:
     """把技能对应的示例 storyboard 落成 HTML（同一份缓存复用）。"""
     stem = Path(skill.preview).stem
+    if stem in _PAGE_STEMS:
+        path = _ANIM_DIR / f"{stem}.html"
+        if not path.is_file():
+            _ANIM_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(_page_demo(stem), encoding="utf-8")
+        return path
+
     # 竖屏技能没有独立风格，用 neon 的配色 + 9:16 画幅
     portrait = stem == "portrait"
     style = "neon" if portrait else stem
@@ -353,7 +397,7 @@ class SkillEffectPanel(QWidget):
 
         view.show()
         view.setUrl(QUrl.fromLocalFile(str(html)))
-        view.page().runJavaScript("window.__play && window.__play()")
+        view.page().runJavaScript(_SCROLL_PLAY)
         self._set_status(f"正在播放：{html.name}", "ok")
 
     def _open_in_browser(self) -> None:

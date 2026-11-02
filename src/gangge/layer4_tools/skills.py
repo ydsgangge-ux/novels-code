@@ -132,8 +132,46 @@ def _video_templates() -> list[Skill]:
     return skills
 
 
+def _page_templates() -> list[Skill]:
+    """另外两种「页面」：3D 展示页、展示页里装真站点。
+
+    和上面五种风格并列放在「视频出片」里——用户看到的都是"出一片"，只是拍法不同。
+    关键词分别是 ``page=showcase`` / ``page=site``，模型照着抄就能命中工具的枚举。
+    """
+    return [
+        Skill(
+            id="showcase_3d",
+            group="视频出片",
+            label="3D 展示页视频 · 产品/项目介绍",
+            hint="分镜装进浏览器框里，滑动就是推镜头；单个 HTML 发给别人也能看",
+            focus="＜主题＞",
+            preview="showcase.png",
+            template=(
+                "用 demo_video 工具做一条 30 秒左右的 3D 展示页视频，page=showcase，style=neon。\n"
+                "主题：＜主题＞\n"
+                f"{_VIDEO_TAIL}"
+            ),
+        ),
+        Skill(
+            id="site_tour",
+            group="视频出片",
+            label="网站展示视频 · 真站点截图",
+            hint="截目标网站整页，在 3D 框里从上往下推一遍；介绍自己的项目最直观",
+            focus="＜网址＞",
+            preview="site.png",
+            template=(
+                "用 demo_video 工具做一条展示网站的视频，page=site，style=neon。\n"
+                "网址：＜网址＞\n"
+                "要求：3-4 个镜头；开场一句话说清这个站点解决什么问题，"
+                "结尾给一句行动号召；口播口语化，不用「赋能」「抓手」这类空话。"
+            ),
+        ),
+    ]
+
+
 BUILTIN_SKILLS: tuple[Skill, ...] = (
     *_video_templates(),
+    *_page_templates(),
     Skill(
         id="code_review",
         group="开发",

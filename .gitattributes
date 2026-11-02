@@ -1,0 +1,4 @@
+# 页面模板直接参与渲染输出：换行必须钉死成 LF。
+# 否则 Windows 上 checkout 回来的是 CRLF，同一份模板在不同平台会产出不同字节，
+# 预览图、快照对比都会跟着飘。
+src/gangge/layer4_tools/storyboard/pages/*.html text eol=lf

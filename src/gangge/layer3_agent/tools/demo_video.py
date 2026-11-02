@@ -88,12 +88,26 @@ class DemoVideoTool(BaseTool):
             "action: write(只写分镜) / preview(生成可在浏览器播放的 HTML) / "
             "render(渲染完整视频) / auto(写分镜并渲染，默认)。"
             "给 topic 会自动写分镜；也可以直接传 scenes 数组自行控制每一帧。"
+            "page 决定拍哪种页面：storyboard 朴素分镜页 / showcase 3D 展示页 / "
+            "site 3D 展示页里装真实网站截图（需要 url）。"
             "渲染耗时约每 10 秒成片 30-60 秒。"
         )
 
     @property
     def tags(self) -> tuple[str, ...]:
-        return ("video", "视频", "动画", "配音", "tts", "短视频", "demo", "宣传片")
+        return (
+            "video",
+            "视频",
+            "动画",
+            "配音",
+            "tts",
+            "短视频",
+            "demo",
+            "宣传片",
+            "展示页",
+            "网页",
+            "网站",
+        )
 
     @property
     def input_schema(self) -> dict[str, Any]:
@@ -146,6 +160,30 @@ class DemoVideoTool(BaseTool):
                         "9:16 竖屏（抖音小红书，字更大一行更少）"
                     ),
                     "default": "16:9",
+                },
+                "page": {
+                    "type": "string",
+                    "enum": ["storyboard", "showcase", "site"],
+                    "description": (
+                        "拍哪种页面：storyboard 朴素分镜页（默认、最轻）/ "
+                        "showcase 3D 展示页（分镜装进浏览器框，滚动推镜头）/ "
+                        "site 3D 展示页里装真实网站截图（要同时给 url）"
+                    ),
+                    "default": "storyboard",
+                },
+                "url": {
+                    "type": "string",
+                    "description": (
+                        "网址：page=site 时是框里要装的那个站点（会整页截图）；"
+                        "page=showcase 时只显示在假地址栏里"
+                    ),
+                },
+                "resolve": {
+                    "type": "string",
+                    "description": (
+                        "可选：给域名钉死 IP，逗号分隔，如 github.com=140.82.112.4。"
+                        "DNS 被污染导致截图一直超时时用它"
+                    ),
                 },
                 "voice": {
                     "type": "string",
@@ -220,6 +258,7 @@ class DemoVideoTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         from gangge.layer4_tools.storyboard import (
+            PAGE_KINDS,
             build_video,
             save_storyboard,
             write_preview,
@@ -250,6 +289,45 @@ class DemoVideoTool(BaseTool):
             storyboard.width, storyboard.height = 1080, 1920
         elif str(kwargs.get("aspect") or "").strip() == "16:9":
             storyboard.width, storyboard.height = 1920, 1080
+
+        # 页面决定后半程：展示页要外壳配色和（可选）一张网站截图
+        page = str(kwargs.get("page") or "storyboard").strip().lower()
+        if page not in PAGE_KINDS:
+            return ToolResult(
+                output=f"❌ 未知 page: {page}（可选 {' / '.join(PAGE_KINDS)}）",
+                is_error=True,
+            )
+        url = str(kwargs.get("url") or "").strip()
+        site_shot = None
+        if page == "site":
+            if not url:
+                return ToolResult(
+                    output="❌ page=site 需要 url：框里装的就是那个网站的整页截图",
+                    is_error=True,
+                )
+            from gangge.layer4_tools.storyboard.site import (
+                SiteError,
+                capture_site,
+                parse_host_map,
+            )
+
+            try:
+                host_map = parse_host_map(str(kwargs.get("resolve") or ""))
+            except ValueError as e:
+                return ToolResult(output=f"❌ resolve 格式不对：{e}", is_error=True)
+            if not kwargs.get("style"):
+                storyboard.style = "neon"  # 展示页默认发光深色，和 CLI 一致
+            scheme = (
+                "dark" if storyboard.style in ("dark", "neon", "glass") else "light"
+            )
+            try:
+                site_shot = await capture_site(
+                    url, color_scheme=scheme, host_map=host_map or None
+                )
+            except SiteError as e:
+                return ToolResult(output=f"❌ 网站截图失败：{e}", is_error=True)
+            # 16:10：展示网页时多露一点内容，比 16:9 更像一块屏幕
+            storyboard.width, storyboard.height = 1920, 1200
         # Name the folder after whatever the caller actually gave us: the topic
         # if there was one, else the storyboard title, else the first shot's.
         label = topic or storyboard.title or next(
@@ -277,16 +355,22 @@ class DemoVideoTool(BaseTool):
 
         if action == "preview":
             try:
-                html = write_preview(storyboard, out_dir)
+                html = write_preview(
+                    storyboard, out_dir, page=page, source_url=url, site_shot=site_shot
+                )
             except OSError as e:
                 return ToolResult(output=f"❌ 生成预览失败: {e}", is_error=True)
             return ToolResult(
                 output=(
-                    f"✅ 预览页面已生成\n- HTML: {html}\n"
+                    f"✅ 预览页面已生成（{page}）\n- HTML: {html}\n"
                     f"- 预计时长: {storyboard.total_duration:.1f}s（未配音，按文字估算）\n"
                     f"用浏览器打开即可逐帧查看；确认无误后 action=render 出片。"
                 ),
-                metadata={"html": str(html), "storyboard": storyboard.to_dict()},
+                metadata={
+                    "html": str(html),
+                    "page": page,
+                    "storyboard": storyboard.to_dict(),
+                },
             )
 
         result = await build_video(
@@ -294,8 +378,12 @@ class DemoVideoTool(BaseTool):
             out_dir,
             narration=bool(kwargs.get("narration", True)),
             keep_frames=bool(kwargs.get("keep_frames", False)),
+            page=page,
+            source_url=url,
+            site_shot=site_shot,
         )
         data = result.to_dict()
+        data["page"] = page
 
         if result.video is None:
             lines = ["⚠️ 视频未生成，但产物已保留："]
@@ -313,6 +401,7 @@ class DemoVideoTool(BaseTool):
             "✅ 演示视频已生成",
             f"- 文件: {result.video}",
             f"- 时长: {result.duration:.1f}s | {result.fps}fps | {result.scenes} 个镜头",
+            f"- 页面: {page}",
             f"- 配音: {result.tts_engine}",
         ]
         if result.srt:

@@ -141,6 +141,29 @@ def test_animation_html_rejects_unknown_style(tmp_path: Path, monkeypatch):
     assert skill_preview.animation_html(odd) is None
 
 
+def test_showcase_skill_plays_the_3d_shell(tmp_path: Path, monkeypatch):
+    """展示页不是某套配色，而是另一种外壳：动画页签也要认它。"""
+    monkeypatch.setattr(skill_preview, "_ANIM_DIR", tmp_path / "anim")
+    path = skill_preview.animation_html(find("showcase_3d"))
+
+    assert path is not None and path.is_file()
+    html = path.read_text(encoding="utf-8")
+    assert "iframe" in html, "展示页的浏览器框没了"
+    assert "window.__seek" in html and "window.__ready" in html
+    assert path == skill_preview.animation_html(find("showcase_3d"))
+
+
+def test_site_skill_previews_a_screen_shaped_page(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(skill_preview, "_ANIM_DIR", tmp_path / "anim")
+    path = skill_preview.animation_html(find("site_tour"))
+
+    assert path is not None and path.is_file()
+    html = path.read_text(encoding="utf-8")
+    # 16:10 更像一块屏幕；1920/1200 = 1.6，横屏 16:9 是 1.7778
+    assert "1.6000" in html
+    assert skill_preview._DEMO_URL in html
+
+
 def test_panel_offers_both_layers(app_module, qapp):
     panel = app_module.SkillEffectPanel()
     titles = [panel._views.tabText(i) for i in range(panel._views.count())]

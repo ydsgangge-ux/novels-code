@@ -194,6 +194,8 @@ AGENT_PROFILES = {
         "detect_keywords": [
             "视频", "短视频", "动画", "配音", "宣传片", "演示视频",
             "分镜", "字幕", "口播", "demo_video", "tts",
+            # 3D 展示页 / 网站展示：点了技能就该把 demo_video 挂上
+            "展示页", "网站展示", "网页展示", "showcase",
             "video", "animation", "narration",
         ],
         "tools": {
