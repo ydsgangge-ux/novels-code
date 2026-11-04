@@ -59,6 +59,12 @@ class Scene:
     # 0 means "derive it from the narration length"; the pipeline fills this in.
     duration: float = 0.0
     voiceover: str = ""
+    # ── 人物页（page="person"）专用，别的版式不读它们 ──
+    #: 时代标签，如 "1964"。留空就不显示年份，只显示标题。
+    year: str = ""
+    #: 这个节点配的照片：绝对路径或相对输出目录的路径，一个节点可放多张。
+    #: 用户不想给图就留空，页面画占位框——没图也能出片。
+    photos: list[str] = field(default_factory=list)
 
     def spoken_text(self) -> str:
         """The narration for this shot, or ``""`` when it should stay silent."""
@@ -80,6 +86,8 @@ class Storyboard:
 
     scenes: list[Scene]
     title: str = ""
+    #: 人物页的副标题（"一粒种子的一生"）。别的版式当它不存在。
+    subtitle: str = ""
     fps: int = 30
     width: int = 1920
     height: int = 1080
@@ -136,6 +144,7 @@ class Storyboard:
         return cls(
             scenes=scenes,
             title=str(data.get("title") or ""),
+            subtitle=str(data.get("subtitle") or ""),
             fps=fps,
             width=_clamp_int(data.get("width", 1920), 640, 3840, 1920),
             height=_clamp_int(data.get("height", 1080), 360, 2160, 1080),
@@ -170,6 +179,9 @@ class Storyboard:
             nodes=nodes,
             duration=max(0.0, _clamp_float(raw.get("duration", 0.0), 0.0, 60.0, 0.0)),
             voiceover=str(raw.get("voiceover") or ""),
+            year=str(raw.get("year") or "").strip(),
+            # 只认字符串路径；多了就丢，别让一个目录名把整条分镜顶掉
+            photos=_str_list(raw.get("photos")),
         )
 
     # ── derived ─────────────────────────────────────────────────
@@ -203,6 +215,7 @@ class Storyboard:
         """Round-trippable form, also used as the tool's return payload."""
         return {
             "title": self.title,
+            "subtitle": self.subtitle,
             # style / decor 必须回灌：不然 storyboard.json 载入后风格和装饰全丢，
             # 手工改完分镜再渲染，得到的和预览不是同一个东西。
             "style": self.style,
@@ -222,6 +235,8 @@ class Storyboard:
                     "nodes": list(s.nodes),
                     "duration": s.duration,
                     "voiceover": s.voiceover,
+                    "year": s.year,
+                    "photos": list(s.photos),
                 }
                 for s in self.scenes
             ],

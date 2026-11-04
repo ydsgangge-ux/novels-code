@@ -236,27 +236,60 @@
 六、短视频与展示页
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  【三种页面】
+  【四种页面】
 
     storyboard   朴素分镜页（默认，最快最轻）
     showcase     3D 展示页：分镜装进浏览器框，滚动就是推镜头
     site         3D 展示页 + 真实网站整页截图当内页（需要网址）
+    person       人物光线纪录片：一条光路穿过一个人的一生（照片可选）
+
+  【人物纪录片（--page person）】
+
+    给它一个人和他的故事，出来一条"浮生光线"短片：光点沿路径行进，
+    停在一个年份上讲一段，讲完继续走，结尾收在一句总结上。
+
+    分镜怎么写（就是普通分镜 JSON）：
+      第一个 title 镜头  → 开场名牌（title=人名，text=一句话概括）
+      中间每个镜头       → 一个人生节点（year=年份，title=这一站，text=发生了什么）
+      最后一个 outro 镜头 → 结语（text=一句总结）
+
+    照片可以不给：给了就按讲解进度轮播，没给就画占位框，照样出片。
+    命令行给一个目录就行，按文件名排序轮流发给各节点：
+
+      python -m gangge.layer4_tools.storyboard -f 人物.json --page person --photos 照片目录
+      python -m gangge.layer4_tools.storyboard -f 人物.json --page person --preview
+
+    现成示例分镜：examples/person.json（仓库根目录，可直接跑）
 
   【桌面端】
 
-    ⚡ 技能 → 视频出片 → 「3D 展示页视频」/「网站展示视频」
+    ⚡ 技能 → 视频出片 → 「3D 展示页视频」/「网站展示视频」/「人物纪录片」
     右侧「效果」页签有预览图和动画，点一下就把提示词填好。
+
+  【人物纪录片：不用写 JSON】
+
+    点「人物纪录片 · 一个人一生一条光路」，右侧会翻到「✍ 填写」页：
+
+      人名 / 副标题 / 结语 / 画幅 / 配音 → 填一遍
+      人生节点 → 一行一个：年份、标题（正文在下方单独编辑）、照片
+      每行都可以 ＋ / ↑ / ↓ / 🗑，照片按行选，想给哪年配哪张就给哪张
+
+    填完点「▶ 预览这一版」，浏览器里直接放一遍，不用等出片。
+    内容随时存草稿（.gangge/person-draft.json），关掉软件再打开接着填。
 
   【命令行】
 
     python -m gangge.layer4_tools.storyboard -c 口播稿.txt --page showcase
     python -m gangge.layer4_tools.storyboard -c 口播稿.txt --page site -u https://example.com
     python -m gangge.layer4_tools.storyboard -s --page showcase --preview
+    python -m gangge.layer4_tools.storyboard -f 人物.json --page person --photos 照片目录
 
   【模板在哪】
 
     src/gangge/layer4_tools/storyboard/pages/*.html
     改版式直接改 HTML，不用碰 Python；pages.py 的 TEMPLATES 按名取用。
+    人物页的分镜怎么翻译成时间线写在 person.py，改节奏（讲解占多少、
+    什么时候动身）改 pages/person.html 里的 HOLD。
     site 页面要先抓图，需要 playwright：
       pip install playwright && playwright install chromium
 

@@ -32,9 +32,12 @@ from PyQt6.QtWidgets import (
 
 from gangge.layer4_tools.skills import Skill, preview_image
 from gangge.layer4_tools.storyboard.demo import demo_storyboard
-from gangge.layer4_tools.storyboard.schema import STYLE_NAMES
+from gangge.layer4_tools.storyboard.person import render_person
+from gangge.layer4_tools.storyboard.schema import STYLE_NAMES, Storyboard
 from gangge.layer4_tools.storyboard.showcase import render_showcase
 from gangge.layer4_tools.storyboard.templates import render_page
+
+from person_form import PersonFormWidget
 
 _IDLE = "点左侧「⚡ 技能」挑一条，这里会显示它的效果图。"
 _NO_IMAGE = "这条技能是直接对话型的，没有视觉预览。"
@@ -113,6 +116,45 @@ def webengine_status() -> tuple[bool, str]:
     return True, ""
 
 
+def _person_demo() -> Storyboard:
+    """人物页的示例分镜：四个节点够看出"停一站、讲一段、再走"的节奏。
+
+    内容写得很中性——这条只是让人看清效果，不是文案范本。
+    """
+    return Storyboard.from_dict(
+        {
+            "title": "人物生平",
+            "subtitle": "一条光路穿过一生",
+            "scenes": [
+                {"template": "title", "title": "人物生平", "text": "一条光路穿过一生"},
+                {
+                    "template": "quote",
+                    "year": "1930",
+                    "title": "从这里开始",
+                    "text": "第一站。光点停在年份上，讲完这一段再继续往前走。",
+                },
+                {
+                    "template": "quote",
+                    "year": "1964",
+                    "title": "一个转折",
+                    "text": "每一站对应一行内容：年份、一句标题、一段正文，照片可选。",
+                },
+                {
+                    "template": "quote",
+                    "year": "1980",
+                    "title": "被记住的部分",
+                    "text": "节点可以随时增删、上下移动，改完点预览就能看这一版。",
+                },
+                {
+                    "template": "outro",
+                    "title": "",
+                    "text": "结尾留一句总结。",
+                },
+            ],
+        }
+    )
+
+
 def _page_demo(stem: str) -> str:
     """展示页 / 网站页的样例 HTML：外壳一样，装的东西不同。"""
     storyboard = demo_storyboard("neon")
@@ -131,6 +173,15 @@ def _page_demo(stem: str) -> str:
 def animation_html(skill: Skill) -> Path | None:
     """把技能对应的示例 storyboard 落成 HTML（同一份缓存复用）。"""
     stem = Path(skill.preview).stem
+    if stem == "person":
+        path = _ANIM_DIR / "person.html"
+        if not path.is_file():
+            demo = _person_demo()
+            _ANIM_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                render_person(demo, demo.timeline()), encoding="utf-8"
+            )
+        return path
     if stem in _PAGE_STEMS:
         path = _ANIM_DIR / f"{stem}.html"
         if not path.is_file():
@@ -160,8 +211,14 @@ def animation_html(skill: Skill) -> Path | None:
 class SkillEffectPanel(QWidget):
     """右侧「效果」页签：图片（人人可看）+ 动画（有环境才播）。"""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        draft_path: str | Path | None = None,
+    ) -> None:
         super().__init__(parent)
+        #: 人物页的草稿落点；测试用它指到 tmp，免得往仓库里写文件。
+        self._draft_path = draft_path
         self._pixmap = QPixmap()
         self._fitted_width = -1
         self._skill: Skill | None = None
@@ -194,8 +251,12 @@ class SkillEffectPanel(QWidget):
             "padding:5px 12px;font-size:11px;}"
             "QTabBar::tab:selected{color:#f0f6fc;border-bottom:2px solid #f78166;}"
         )
-        self._views.addTab(self._build_image_tab(), "🖼 图片")
+        self._image_tab = self._build_image_tab()
+        self._views.addTab(self._image_tab, "🖼 图片")
         self._views.addTab(self._build_anim_tab(), "🎬 动画")
+        # 只有人物纪录片用得上填写页；别的技能点进来仍然停在图片页
+        self._form = PersonFormWidget(draft_path=self._draft_path)
+        self._views.addTab(self._form, "✍ 填写")
         lay.addWidget(self._views, 1)
 
         self._footer = QLabel(_FOOTER)
@@ -284,6 +345,11 @@ class SkillEffectPanel(QWidget):
         self._hint.setText(skill.hint)
         self._hint.show()
         self._reset_animation()
+        # 人物纪录片的内容得人来填，所以点它就翻到填写页；
+        # 别的技能一律停在图片页——不能因为多了个页签就打乱原来的手感。
+        self._views.setCurrentWidget(
+            self._form if skill.id == "person_doc" else self._image_tab
+        )
 
         path = preview_image(skill)
         if path is None:
@@ -313,6 +379,7 @@ class SkillEffectPanel(QWidget):
         self._hint.setText(_IDLE)
         self._set_placeholder(_IDLE)
         self._reset_animation()
+        self._views.setCurrentWidget(self._image_tab)
 
     @property
     def current_pixmap(self) -> QPixmap:

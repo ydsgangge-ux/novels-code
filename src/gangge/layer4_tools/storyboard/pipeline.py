@@ -15,6 +15,7 @@ tells you what is missing beats a stack trace after two minutes of TTS.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
@@ -67,6 +68,11 @@ class BuildResult:
         }
 
 
+#: 在线 TTS 的 503 是偶发的（同一句话隔一秒再发就通），为它丢掉整段配音不值当。
+TTS_ATTEMPTS = 2
+TTS_RETRY_WAIT = 1.2
+
+
 async def _synthesize(
     engine: tts.BaseTTS,
     text: str,
@@ -75,12 +81,20 @@ async def _synthesize(
 ) -> tts.Clip:
     if not text.strip():
         return tts.Clip(duration=1.6, engine=engine.name, note="该镜头无台词")
-    try:
-        return await engine.synthesize(text, out_path)
-    except Exception as e:  # noqa: BLE001 - network/engine failures are expected
-        logger.warning("[storyboard] TTS failed: %s", e)
-        notes.append(f"配音失败，已降级为静音 + 估算时长：{e}")
-        return await tts.SilentTTS().synthesize(text, out_path)
+
+    last: Exception | None = None
+    for attempt in range(TTS_ATTEMPTS):
+        try:
+            return await engine.synthesize(text, out_path)
+        except Exception as e:  # noqa: BLE001 - network/engine failures are expected
+            last = e
+            if attempt + 1 < TTS_ATTEMPTS:
+                logger.warning("[storyboard] TTS failed (retrying): %s", e)
+                await asyncio.sleep(TTS_RETRY_WAIT)
+
+    logger.warning("[storyboard] TTS failed: %s", last)
+    notes.append(f"配音失败，已降级为静音 + 估算时长：{last}")
+    return await tts.SilentTTS().synthesize(text, out_path)
 
 
 def write_page(
@@ -105,6 +119,16 @@ def write_page(
     plain.write_text(render_page(storyboard, slots), encoding="utf-8")
     if page == "storyboard":
         return plain
+    # 人物页是连续镜头，不是切镜：它自己把 slots 解释成"浮生节点"，
+    # 所以不走 showcase 那套外壳，直接用 person.html。
+    if page == "person":
+        from gangge.layer4_tools.storyboard.person import render_person
+
+        person = out_dir / "person.html"
+        person.write_text(
+            render_person(storyboard, slots, base_dir=out_dir), encoding="utf-8"
+        )
+        return person
     # 到这里才导入：showcase 自己也带命令行入口，模块级导入会让
     # ``python -m ...showcase`` 触发 runpy 的重复导入告警。
     from gangge.layer4_tools.storyboard.showcase import (

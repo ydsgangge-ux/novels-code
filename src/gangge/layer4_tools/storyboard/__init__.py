@@ -14,6 +14,7 @@ output predictable and the cost of a re-render near zero.
 from __future__ import annotations
 
 from gangge.layer4_tools.storyboard.pages import PAGE_KINDS, read_page, template_path
+from gangge.layer4_tools.storyboard.person import PersonPageError, render_person
 from gangge.layer4_tools.storyboard.pipeline import (
     BuildResult,
     build_video,
@@ -41,6 +42,7 @@ __all__ = [
     "TEMPLATE_NAMES",
     "BuildResult",
     "Clip",
+    "PersonPageError",
     "Scene",
     "SiteShot",
     "Storyboard",
@@ -53,6 +55,7 @@ __all__ = [
     "estimate_speech_seconds",
     "read_page",
     "render_page",
+    "render_person",
     "render_showcase",
     "save_storyboard",
     "storyboard_from_script",

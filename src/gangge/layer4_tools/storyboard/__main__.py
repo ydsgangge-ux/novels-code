@@ -86,9 +86,20 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-frames", action="store_true", help="保留 PNG 帧序列")
     p.add_argument(
         "--page",
-        choices=("storyboard", "showcase", "site"),
+        choices=("storyboard", "showcase", "site", "person"),
         default="storyboard",
-        help="拍哪种页面：朴素分镜页（默认）/ 3D 展示页 / 3D 展示页+真实网站截图（需 --url）",
+        help=(
+            "拍哪种页面：朴素分镜页（默认）/ 3D 展示页 / 3D 展示页+真实网站截图（需 --url）"
+            " / 人物光线纪录片（一个人 → 一条光路穿过一生）"
+        ),
+    )
+    p.add_argument(
+        "--photos",
+        metavar="DIR",
+        help=(
+            "照片目录，只对 --page person 生效：按文件名顺序轮流发给每个人生节点；"
+            "不给就画占位框，没图也能出片"
+        ),
     )
     p.add_argument(
         "--resolve",
@@ -218,6 +229,20 @@ async def _run(args: argparse.Namespace) -> int:
     elif args.aspect == "16:9":
         storyboard.width, storyboard.height = 1920, 1080
 
+    # 人物页的照片是可选输入：给了就轮流发到各节点，没给就画占位框。
+    if args.photos:
+        if args.page != "person":
+            print("提示：--photos 只对 --page person 生效，已忽略", file=sys.stderr)
+        else:
+            from gangge.layer4_tools.storyboard.person import PersonPageError, assign_photos
+
+            try:
+                for note in assign_photos(storyboard, args.photos):
+                    print(f"照片: {note}")
+            except PersonPageError as e:
+                print(f"照片目录有问题: {e}", file=sys.stderr)
+                return 2
+
     site_shot = None
     if args.page == "site":
         if not args.url:
@@ -259,6 +284,7 @@ async def _run(args: argparse.Namespace) -> int:
         "storyboard": "分镜页",
         "showcase": "3D 展示页",
         "site": "3D 展示页 + 网站截图",
+        "person": "人物光线纪录片",
     }[args.page]
     print(f"页面: {page_label}")
     print(f"输出: {out_dir}")

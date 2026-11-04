@@ -7354,7 +7354,21 @@ class GanggeDesktop(QMainWindow):
         self._append_output(f"\n🎛 样式工作台: {out}\n", "system")
 
     def _apply_skill(self, skill):
-        """把技能模板填进输入框，并选中第一个占位符方便直接覆盖。"""
+        """把技能模板填进输入框，并选中第一个占位符方便直接覆盖。
+
+        人物纪录片是例外：它的输入是一张表，不是一段提示词。点它只把右侧切到
+        「填写」页——往输入框里塞一段"请用 demo_video 做…"，会让人以为还得
+        再点一次执行，而他要填的东西其实在右边。
+        """
+        if getattr(skill, "id", "") == "person_doc":
+            self._preview_skill(skill, switch=True)
+            form = getattr(getattr(self, "_skill_effect", None), "_form", None)
+            if form is not None:
+                # 不重新读草稿：表单构造时已经读过一次，再读一次会把刚敲进去、
+                # 还没到防抖时间的内容冲掉。
+                form._name.setFocus()
+            return
+
         text = skill.template.strip()
         current = self._task_input.toPlainText().strip()
         self._task_input.setPlainText(f"{current}\n\n{text}" if current else text)

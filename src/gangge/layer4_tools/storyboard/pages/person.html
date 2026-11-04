@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+  :root {
+    --bg: __BG__; --bg2: __BG2__; --fg: __FG__; --fg-rgb: __FG_RGB__;
+    --muted: __MUTED__; --accent: __ACCENT__; --accent-rgb: __ACCENT_RGB__;
+    --glow: __GLOW__;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden; background: var(--bg);
+    color: var(--fg); color-scheme: dark; -webkit-font-smoothing: antialiased;
+    font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB",
+                 "Segoe UI", system-ui, sans-serif;
+  }
+  /* 画布固定基准尺寸，最后整块 scale 到目标分辨率——换画幅只改三个数字 */
+  #stage {
+    position: relative; width: __STAGE_W__px; height: __STAGE_H__px;
+    transform: scale(__SCALE__); transform-origin: top left;
+    background:
+      radial-gradient(120% 90% at 50% -10%, var(--bg2), transparent 62%),
+      var(--bg);
+    overflow: hidden;
+  }
+
+  /* ── 世界层：光线地图。相机 = 对它的 translate + scale ── */
+  #world {
+    position: absolute; left: 0; top: 0;
+    transform-origin: 0 0; will-change: transform;
+  }
+  #map { display: block; overflow: visible; }
+  #spine {
+    fill: none; stroke: rgba(var(--accent-rgb), .17); stroke-width: 3;
+    stroke-linecap: round;
+  }
+  #trail {
+    fill: none; stroke: var(--accent); stroke-width: 3.5; stroke-linecap: round;
+    filter: drop-shadow(0 0 7px rgba(var(--accent-rgb), .95))
+            drop-shadow(0 0 26px rgba(var(--accent-rgb), .5));
+  }
+  #head { fill: var(--glow); filter: drop-shadow(0 0 12px var(--accent)); }
+
+  /* 节点标记。未点亮是灰点，点亮后是带环的光点 */
+  .mk circle.dot {
+    fill: var(--bg); stroke: rgba(var(--fg-rgb), .30); stroke-width: 2.5;
+  }
+  .mk circle.ring { fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0; }
+  .mk.on circle.dot { fill: var(--accent); stroke: var(--glow); stroke-width: 3; }
+  .mk text {
+    fill: var(--muted); font-family: inherit; text-anchor: middle;
+    font-size: 25px; font-weight: 700; opacity: .55;
+    letter-spacing: .5px; transition: fill .35s, opacity .35s;
+  }
+  .mk text.mshort { font-size: 21px; font-weight: 500; opacity: .42; }
+  .mk.on text { fill: var(--glow); opacity: 1; }
+  .mk.on text.mshort { fill: var(--accent); opacity: .9; }
+
+  /* ── 暗角：把视线收到画面中间，别让大块空白发灰 ── */
+  #vig {
+    position: absolute; inset: 0; pointer-events: none; z-index: 2;
+    background: radial-gradient(78% 68% at 50% 46%,
+                transparent 40%, rgba(0, 0, 0, .55) 100%);
+  }
+
+  /* ── 开场名牌 ── */
+  #nameplate {
+    position: absolute; inset: 0; z-index: 3; pointer-events: none;
+    display: flex; flex-direction: column; justify-content: center;
+    align-items: center; text-align: center; opacity: 0;
+    padding: 0 8%;
+  }
+  body.landscape #nameplate { align-items: flex-start; text-align: left; padding-left: 11%; }
+  #nm-title {
+    font-family: "Songti SC", "SimSun", "Noto Serif CJK SC", serif;
+    font-size: 150px; line-height: 1.1; font-weight: 700; letter-spacing: 6px;
+    color: var(--fg);
+    text-shadow: 0 0 60px rgba(var(--accent-rgb), .35);
+  }
+  body.portrait #nm-title { font-size: 116px; letter-spacing: 4px; }
+  #nm-rule {
+    width: 168px; height: 4px; margin: 34px 0 26px; border-radius: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    transform-origin: left center;
+  }
+  body.landscape #nm-rule { background: linear-gradient(90deg, var(--accent), transparent); }
+  #nm-sub {
+    font-size: 40px; line-height: 1.5; color: var(--muted); letter-spacing: 2px;
+  }
+  body.portrait #nm-sub { font-size: 34px; }
+
+  /* ── 讲解卡片 ──
+     做成一块玻璃片：光路从背后穿过时会被糊掉，正文才读得清。
+     用统一底色而不是左浓右淡的渐变——渐变收口处会出现一条看得见的竖边。 */
+  #card {
+    position: absolute; z-index: 4; opacity: 0;
+    left: 6.5%; top: 50%; transform: translateY(-50%);
+    width: 600px; padding: 36px 44px 30px;
+    border-radius: 20px;
+    border: 1px solid rgba(var(--accent-rgb), .16);
+    border-left: 3px solid rgba(var(--accent-rgb), .55);
+    background: rgba(8, 18, 14, .80);
+    box-shadow: 0 26px 80px rgba(0, 0, 0, .45);
+    backdrop-filter: blur(14px) saturate(110%);
+  }
+  body.portrait #card {
+    left: 5.5%; right: 5.5%; top: auto; bottom: 8%; width: auto;
+    transform: none; padding: 30px 34px 26px;
+  }
+  #c-yr {
+    font-family: "Songti SC", "SimSun", "Noto Serif CJK SC", serif;
+    font-size: 44px; font-weight: 700; color: var(--accent);
+    letter-spacing: 3px; font-variant-numeric: tabular-nums;
+    min-height: 52px;
+  }
+  #c-ti {
+    font-family: "Songti SC", "SimSun", "Noto Serif CJK SC", serif;
+    font-size: 58px; line-height: 1.2; font-weight: 700; margin-top: 6px;
+    text-wrap: balance;
+  }
+  body.portrait #c-ti { font-size: 52px; }
+  /* 手机竖屏观看距离更近但屏窄，正文反而要比横屏大一号 */
+  #c-tx {
+    font-size: 27px; line-height: 1.72; color: var(--muted); margin-top: 20px;
+    max-height: 190px; overflow: hidden;
+  }
+  body.portrait #c-tx { font-size: 27px; line-height: 1.66; margin-top: 16px; max-height: 230px; }
+  body.portrait #c-yr { font-size: 48px; min-height: 56px; }
+
+  /* 照片：多张按讲解进度轮播，Ken Burns 缓慢推近 */
+  #c-ph {
+    position: relative; margin-top: 26px; height: 270px;
+    border: 1px solid rgba(var(--fg-rgb), .14); border-radius: 14px;
+    overflow: hidden; background: rgba(var(--fg-rgb), .04);
+  }
+  body.portrait #c-ph { height: 330px; margin-top: 20px; }
+  /* 没图时别留一块 270px 的空白：收窄成一条占位带，卡片就紧凑了 */
+  #c-ph.empty { border-style: dashed; height: 150px; }
+  body.portrait #c-ph.empty { height: 200px; }
+  #c-ph.empty::after {
+    content: "此处放照片"; position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px; color: rgba(var(--fg-rgb), .3); letter-spacing: 4px;
+  }
+  #c-ph figure { position: absolute; inset: 0; opacity: 0; margin: 0; }
+  #c-ph figure.on { opacity: 1; }
+  #c-ph img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    transform-origin: 50% 42%; will-change: transform;
+  }
+
+  #c-bar {
+    margin-top: 22px; height: 3px; border-radius: 2px;
+    background: rgba(var(--fg-rgb), .14); overflow: hidden;
+  }
+  #c-bar i {
+    display: block; width: 0; height: 100%; border-radius: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--glow));
+  }
+  #c-idx {
+    margin-top: 12px; font-size: 18px; letter-spacing: 3px;
+    color: rgba(var(--fg-rgb), .35); font-variant-numeric: tabular-nums;
+  }
+
+  /* ── 结语 ── */
+  #ending {
+    position: absolute; inset: 0; z-index: 3; pointer-events: none; opacity: 0;
+    display: flex; flex-direction: column; justify-content: center;
+    align-items: center; text-align: center; padding: 0 14%;
+  }
+  #e-tx {
+    font-family: "Songti SC", "SimSun", "Noto Serif CJK SC", serif;
+    font-size: 62px; line-height: 1.55; font-weight: 700; text-wrap: balance;
+    text-shadow: 0 0 50px rgba(var(--accent-rgb), .3);
+  }
+  body.portrait #e-tx { font-size: 46px; }
+  #e-sub { margin-top: 36px; font-size: 24px; letter-spacing: 6px; color: var(--muted); }
+
+  /* ── 预览控件：截图前由 __hide_ui 摘掉，不会进画面 ── */
+  #controls {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 14px; padding: 12px 20px;
+    border-radius: 999px; background: rgba(8, 16, 12, .82);
+    border: 1px solid rgba(255, 255, 255, .14);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .5); backdrop-filter: blur(10px);
+    z-index: 999; font-size: 13px; color: #dfe6f2;
+    opacity: 0; transition: opacity .18s;
+  }
+  body:hover #controls { opacity: 1; }
+  #controls button {
+    width: 34px; height: 34px; border-radius: 50%; cursor: pointer;
+    border: 1px solid rgba(255, 255, 255, .2); background: rgba(255, 255, 255, .1);
+    color: #fff; font-size: 14px; line-height: 1;
+  }
+  #controls button:hover { background: rgba(255, 255, 255, .22); }
+  #seekbar { width: 320px; accent-color: __ACCENT__; cursor: pointer; }
+  #clock { font-variant-numeric: tabular-nums; white-space: nowrap; }
+</style>
+</head>
+<body class="__LAYOUT__">
+<div id="stage">
+  <div id="world">
+    <svg id="map">
+      <path id="spine"></path>
+      <path id="trail"></path>
+      <g id="marks"></g>
+      <circle id="head" r="7"></circle>
+    </svg>
+  </div>
+  <div id="vig"></div>
+
+  <div id="nameplate">
+    <div id="nm-title"></div>
+    <div id="nm-rule"></div>
+    <div id="nm-sub"></div>
+  </div>
+
+  <div id="card">
+    <div id="c-yr"></div>
+    <div id="c-ti"></div>
+    <div id="c-tx"></div>
+    <div id="c-ph"></div>
+    <div id="c-bar"><i></i></div>
+    <div id="c-idx"></div>
+  </div>
+
+  <div id="ending"><div id="e-tx"></div><div id="e-sub"></div></div>
+</div>
+
+<div id="controls">
+  <button id="btn-play" title="播放 / 暂停（空格）">▶</button>
+  <input id="seekbar" type="range" min="0" max="1000" value="0" step="1">
+  <span id="clock">0.0 / 0.0s</span>
+</div>
+
+<script>
+(function () {
+  var STORY = __STORY__;
+
+  var stage = document.getElementById('stage');
+  var world = document.getElementById('world');
+  var svg = document.getElementById('map');
+  var spine = document.getElementById('spine');
+  var trail = document.getElementById('trail');
+  var marks = document.getElementById('marks');
+  var head = document.getElementById('head');
+  var card = document.getElementById('card');
+  var yrEl = document.getElementById('c-yr');
+  var tiEl = document.getElementById('c-ti');
+  var txEl = document.getElementById('c-tx');
+  var phEl = document.getElementById('c-ph');
+  var barEl = document.querySelector('#c-bar i');
+  var idxEl = document.getElementById('c-idx');
+  var plate = document.getElementById('nameplate');
+  var plateRule = document.getElementById('nm-rule');
+  var ending = document.getElementById('ending');
+  var bar = document.getElementById('seekbar');
+  var clock = document.getElementById('clock');
+  var btn = document.getElementById('btn-play');
+
+  var W = stage.offsetWidth, H = stage.offsetHeight;
+  var portrait = H > W;
+  var total = STORY.total || 0;
+  var nodes = STORY.nodes || [];
+  var beats = STORY.beats || [];
+  var N = nodes.length;
+
+  // 讲解占一个镜头的前 HOLD，剩下的时间用来沿光路走向下一站。
+  // 这样"念到哪里停在哪"和"讲完就走"是同一套时间轴，配音不用另外对齐。
+  var HOLD = 0.64;
+
+  // 镜头尺度：远景看得到路，近景只剩这一站。
+  // 落差必须够大——3% 的推近观众根本察觉不到，只会觉得画面在呼吸。
+  var Z_FAR = 0.84;
+  var Z_NEAR = 1.18;
+  // 推近只用讲解期的前四成完成，剩下的时间定住：有起止的动作才像"推镜"，
+  // 一路缓推到底反而像镜头在飘。
+  var PIN_SPAN = 0.40;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function ease(p) { return 1 - Math.pow(1 - p, 3); }
+
+  // ── 世界布局：节点沿一条横向蛇形铺开，光路串起来 ──
+  var GAP = portrait ? 720 : 1280;
+  var X0 = portrait ? 340 : 760;
+  // 世界要比画幅高得多：拉到远景时可视范围比画幅大，世界太矮就会露出空白底色。
+  // 节点压在世界正中，上下各留一整个画幅的高度供镜头晃。
+  var worldH = H * 2;
+  var BASE_Y = worldH * 0.5;
+  var AMP = portrait ? 120 : 165;
+  var worldW = X0 * 2 + Math.max(0, N - 1) * GAP;
+  svg.setAttribute('width', worldW);
+  svg.setAttribute('height', worldH);
+  world.style.width = worldW + 'px';
+  world.style.height = worldH + 'px';
+
+  var pos = nodes.map(function (nd, i) {
+    return {
+      x: X0 + i * GAP,
+      y: BASE_Y + (i % 2 ? -1 : 1) * (AMP * 0.55 + ((i * 37) % 5) * AMP * 0.2)
+    };
+  });
+
+  // Catmull-Rom 转三次贝塞尔：过点的曲线，不靠手调控制柄
+  function cat(pts) {
+    var d = 'M' + pts[0].x + ',' + pts[0].y;
+    for (var i = 0; i < pts.length - 1; i++) {
+      var p0 = pts[i - 1] || pts[i], p1 = pts[i];
+      var p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+      d += 'C' + (p1.x + (p2.x - p0.x) / 6) + ',' + (p1.y + (p2.y - p0.y) / 6)
+         + ' ' + (p2.x - (p3.x - p1.x) / 6) + ',' + (p2.y - (p3.y - p1.y) / 6)
+         + ' ' + p2.x + ',' + p2.y;
+    }
+    return d;
+  }
+
+  var lead = { x: (pos[0] ? pos[0].x : X0) - GAP * 0.55, y: BASE_Y + AMP * 0.9 };
+  var tail = {
+    x: (pos[N - 1] ? pos[N - 1].x : X0) + GAP * 0.55,
+    y: BASE_Y + AMP * 0.9
+  };
+  var ALL = [lead].concat(pos).concat([tail]);
+  var d = cat(ALL);
+  spine.setAttribute('d', d);
+  trail.setAttribute('d', d);
+
+  var LEN = Math.max(1, trail.getTotalLength());
+  trail.style.strokeDasharray = LEN + ' ' + LEN;
+  trail.style.strokeDashoffset = LEN;
+
+  // 弧长采样：节点在路径上的位置是算出来的，不是按序号均分的——
+  // 蛇形路径各段长度不同，按序号分会让光点走到一半突然追不上节点。
+  var SAMPLES = 1400;
+  var samples = [];
+  for (var s = 0; s <= SAMPLES; s++) {
+    var pt = trail.getPointAtLength(LEN * s / SAMPLES);
+    samples.push([pt.x, pt.y]);
+  }
+  function arcOf(x, y) {
+    var best = 0, bd = Infinity;
+    for (var i = 0; i <= SAMPLES; i++) {
+      var dx = samples[i][0] - x, dy = samples[i][1] - y;
+      var dd = dx * dx + dy * dy;
+      if (dd < bd) { bd = dd; best = i; }
+    }
+    return best / SAMPLES;
+  }
+  var nl = pos.map(function (p) { return N ? arcOf(p.x, p.y) : 0; });
+  if (!N) nl = [0];
+
+  // ── 节点标记 ──
+  var mkEls = [];
+  nodes.forEach(function (nd, i) {
+    var g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', 'mk');
+    g.setAttribute('transform', 'translate(' + pos[i].x + ',' + pos[i].y + ')');
+    var ring = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    ring.setAttribute('class', 'ring');
+    ring.setAttribute('r', '16');
+    var dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.setAttribute('class', 'dot');
+    dot.setAttribute('r', '9');
+    g.appendChild(ring);
+    g.appendChild(dot);
+    if (nd.year) {
+      var ty = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      ty.setAttribute('class', 'myr');
+      ty.setAttribute('y', '-28');
+      ty.textContent = nd.year;
+      g.appendChild(ty);
+    }
+    var ts = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    ts.setAttribute('class', 'mshort');
+    ts.setAttribute('y', '48');
+    ts.textContent = nd.short || '';
+    g.appendChild(ts);
+    marks.appendChild(g);
+    mkEls.push({ g: g, ring: ring });
+  });
+
+  // ── 照片：一次建好，切换只改 class，逐帧不重排 DOM ──
+  var figs = nodes.map(function (nd) {
+    var list = (nd.photos || []).filter(function (p) { return p && p.src; });
+    if (!list.length) return [];
+    var out = [];
+    list.forEach(function (p) {
+      var fig = document.createElement('figure');
+      var img = document.createElement('img');
+      img.src = p.src;
+      img.alt = p.caption || '';
+      fig.appendChild(img);
+      phEl.appendChild(fig);
+      out.push(fig);
+    });
+    return out;
+  });
+
+  document.getElementById('nm-title').textContent = STORY.title || '';
+  document.getElementById('nm-sub').textContent = STORY.subtitle || '';
+  document.getElementById('e-tx').textContent = STORY.end || '';
+  document.getElementById('e-sub').textContent = STORY.title || '';
+
+  function beatAt(t) {
+    if (!beats.length) return -1;
+    for (var i = 0; i < beats.length; i++) {
+      if (t < beats[i].end) return i;
+    }
+    return beats.length - 1;
+  }
+
+  function showPhoto(i, q) {
+    var list = figs[i] || [];
+    if (!list.length) {
+      phEl.classList.add('empty');
+      phEl.setAttribute('data-hint', '此处放照片');
+      return;
+    }
+    phEl.classList.remove('empty');
+    // 照片只在"讲"的那一段里轮播完，走位时不换图
+    var k = Math.min(list.length - 1, Math.floor(clamp(q / HOLD, 0, 1) * list.length));
+    for (var j = 0; j < list.length; j++) list[j].classList.toggle('on', j === k);
+    var inner = clamp(q / HOLD, 0, 1) * list.length - k;
+    var img = list[k].querySelector('img');
+    if (img) img.style.transform = 'scale(' + (1.02 + 0.08 * inner).toFixed(4) + ')';
+  }
+
+  var lastNode = -1;
+
+  // Pure function of t: 同一个 t 永远得到同一帧，截图才可复现。
+  window.__seek = function (t) {
+    t = clamp(t, 0, total);
+
+    var a, z, i = beatAt(t), q = 0;
+    var intro = STORY.intro || 0;
+    var endingAt = STORY.ending;
+    // 画面锚点：讲解时光点在右侧，卡片在左侧；结语时光路让到上方，把中间留给那句话
+    var ax = portrait ? 0.5 : 0.655;
+    var ay = portrait ? 0.33 : 0.44;
+
+    if (i >= 0 && beats[i]) {
+      q = clamp((t - beats[i].start) / Math.max(0.001, beats[i].end - beats[i].start), 0, 1);
+    }
+
+    if (N === 0) {
+      a = 0; z = Z_FAR;
+    } else if (t < intro) {
+      // 开场：镜头从更远处推进到第一个人生节点，落点和第一站的停靠位对齐
+      var p0 = clamp(t / Math.max(0.001, intro), 0, 1);
+      a = ls(0, nl[0], ease(p0));
+      z = ls(Z_FAR * 0.80, Z_FAR, ease(p0));
+    } else if (endingAt !== null && endingAt !== undefined && t >= endingAt) {
+      a = nl[N - 1];
+      var pe = clamp((t - endingAt) / Math.max(0.001, total - endingAt), 0, 1);
+      // 从近景慢慢拉远并把光路让上去：结语那段话要单独占住画面正中
+      z = ls(Z_NEAR, Z_FAR * 0.94, ease(pe));
+      ay = (portrait ? 0.33 : 0.44) + (portrait ? -0.10 : -0.14) * ease(pe);
+    } else if (i < 0) {
+      a = nl[0]; z = Z_FAR;
+    } else if (q < HOLD || i >= N - 1) {
+      // 停在节点上讲：用讲解前四成的时间把镜头推到位，然后稳住不动。
+      // 全程都在缓慢微推的话，观众只会觉得画面在呼吸，感觉不到"推过去了"。
+      a = nl[i];
+      var pin = clamp(q / (HOLD * PIN_SPAN), 0, 1);
+      z = ls(Z_FAR, Z_NEAR, ease(pin));
+    } else {
+      // 讲完就走：镜头从近景退回远景，正好接上下一站推近的起点
+      var pw = (q - HOLD) / (1 - HOLD);
+      a = ls(nl[i], nl[Math.min(i + 1, N - 1)], ease(pw));
+      z = ls(Z_NEAR, Z_FAR, ease(pw));
+    }
+
+    // ── 相机 ──
+    var pt2 = trail.getPointAtLength(LEN * clamp(a, 0, 1));
+    world.style.transform =
+      'translate(' + (W * ax - pt2.x * z).toFixed(2) + 'px,' +
+      (H * ay - pt2.y * z).toFixed(2) + 'px) scale(' + z.toFixed(4) + ')';
+    trail.style.strokeDashoffset = (LEN * (1 - clamp(a, 0, 1))).toFixed(2);
+    head.setAttribute('cx', pt2.x);
+    head.setAttribute('cy', pt2.y);
+    head.setAttribute('r', (7 / Math.max(0.6, z)).toFixed(2));
+
+    // 节点点亮：光点走过就亮，走回头路（预览拖拽）也会按当前进度重算
+    for (var m = 0; m < N; m++) {
+      var on = a >= nl[m] - 0.002;
+      mkEls[m].g.classList.toggle('on', on);
+      var fade = clamp((a - nl[m]) / 0.02, 0, 1);
+      mkEls[m].ring.setAttribute('opacity', (on ? 0.55 * (1 - fade) : 0).toFixed(3));
+      mkEls[m].ring.setAttribute('r', (16 + 26 * fade).toFixed(2));
+    }
+
+    // ── 名牌 ──
+    var plateOn = intro > 0 && t < intro;
+    var pp = intro > 0 ? clamp(t / intro, 0, 1) : 1;
+    plate.style.opacity = (plateOn ? 1 : 0);
+    if (plateOn) {
+      plate.style.transform = 'translateY(' + ((1 - ease(Math.min(1, pp / 0.7))) * 26).toFixed(2) + 'px)';
+      plateRule.style.transform = 'scaleX(' + ease(clamp((pp - 0.12) / 0.5, 0, 1)).toFixed(4) + ')';
+    }
+
+    // ── 结语 ──
+    var endOn = (endingAt !== null && endingAt !== undefined) && t >= endingAt;
+    if (endOn) {
+      var pe2 = clamp((t - endingAt) / Math.max(0.8, (total - endingAt) * 0.45), 0, 1);
+      ending.style.opacity = ease(pe2).toFixed(3);
+      // 拉远后相邻节点会挤进画面角落，结语时淡掉标记，只留一条光路
+      marks.style.opacity = (1 - 0.88 * ease(pe2)).toFixed(3);
+    } else {
+      ending.style.opacity = 0;
+      marks.style.opacity = 1;
+    }
+
+    // ── 卡片 ──
+    var showCard = !plateOn && !endOn && i >= 0 && i < N;
+    if (showCard) {
+      var nd = nodes[i];
+      // 换节点才重写文字：每帧赋 textContent 会让浏览器反复布局
+      if (i !== lastNode) {
+        lastNode = i;
+        yrEl.textContent = nd.year || '';
+        tiEl.textContent = nd.title || '';
+        txEl.textContent = nd.text || '';
+        idxEl.textContent = (i + 1) + ' / ' + N;
+      }
+      // 讲解完就退场：光点已经在走向下一站，上一站的文字还挂着的话，
+      // 观众不知道该看路上还是看卡片。
+      var cardIn = clamp(q / 0.10, 0, 1);
+      var cardOut = 1 - clamp((q - (HOLD + 0.08)) / ((1 - HOLD) * 0.70), 0, 1);
+      card.style.opacity = (cardIn * cardOut).toFixed(3);
+      barEl.style.width = (q * 100).toFixed(2) + '%';
+      showPhoto(i, q);
+    } else {
+      card.style.opacity = 0;
+      lastNode = -1;
+    }
+
+    if (bar && total > 0) bar.value = String(Math.round((t / total) * 1000));
+    if (clock) clock.textContent = t.toFixed(1) + ' / ' + total.toFixed(1) + 's';
+  };
+
+  function ls(a, b, p) { return a + (b - a) * p; }
+
+  // ── 预览播放器（播放靠墙钟，画面仍然只由 __seek 决定）──
+  var currentT = 0, playing = false, rafId = null, tBase = 0, tStart = 0;
+
+  function frame(ts) {
+    if (!playing) return;
+    if (!tStart) tStart = ts;
+    var t = tBase + (ts - tStart) / 1000;
+    if (t >= total) { t = total; playing = false; btn.textContent = '▶'; }
+    currentT = t;
+    window.__seek(t);
+    if (playing) rafId = requestAnimationFrame(frame);
+  }
+
+  window.__play = function () {
+    if (playing || total <= 0) return;
+    if (currentT >= total) currentT = 0;
+    playing = true; tBase = currentT; tStart = 0;
+    btn.textContent = '❚❚';
+    rafId = requestAnimationFrame(frame);
+  };
+  window.__pause = function () {
+    playing = false; tStart = 0;
+    if (rafId) cancelAnimationFrame(rafId);
+    btn.textContent = '▶';
+  };
+  window.__hide_ui = function () {
+    var c = document.getElementById('controls');
+    if (c) c.style.display = 'none';
+  };
+
+  if (btn) btn.addEventListener('click', function () { playing ? window.__pause() : window.__play(); });
+  if (bar) bar.addEventListener('input', function () {
+    window.__pause();
+    currentT = (parseFloat(bar.value) / 1000) * total;
+    window.__seek(currentT);
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); playing ? window.__pause() : window.__play(); }
+    else if (e.code === 'ArrowRight') { window.__pause(); currentT = Math.min(total, currentT + 1); window.__seek(currentT); }
+    else if (e.code === 'ArrowLeft') { window.__pause(); currentT = Math.max(0, currentT - 1); window.__seek(currentT); }
+  });
+
+  window.__seek(0);
+})();
+</script>
+</body>
+</html>

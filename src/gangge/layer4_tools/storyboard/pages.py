@@ -31,12 +31,13 @@ TEMPLATES: dict[str, str] = {
     "storyboard": "storyboard.html",
     "showcase": "showcase.html",
     "site": "showcase.html",
+    "person": "person.html",
     "site_inner": "site_inner.html",
     "studio": "studio.html",
 }
 
 #: 能拍成视频的页面（``site_inner`` 是内页片段，不是整页）。
-PAGE_KINDS: tuple[str, ...] = ("storyboard", "showcase", "site")
+PAGE_KINDS: tuple[str, ...] = ("storyboard", "showcase", "site", "person")
 
 
 @lru_cache(maxsize=None)

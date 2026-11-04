@@ -25,7 +25,7 @@
 | 你给 | 它出 | 怎么做到的 |
 |---|---|---|
 | 「把第三章写出来」 | 一章正文 + 审计报告 | 五层流水线：规划 → 撰写 → 校验 → 审计 → 修订，自动跑完 |
-| 一段口播稿 | 带配音、字幕的 mp4 | 五种视觉风格 + 竖屏 + 3D 展示页，技能里点一下就开始 |
+| 一段口播稿 | 带配音、字幕的 mp4 | 五种视觉风格 + 竖屏 + 3D 展示页 + 人物纪录片，技能里点一下就开始 |
 | 一个网址 | 3D 展示页 / 网站展示视频 | 整页截图装进浏览器框，滚一下镜头就往前推 |
 | 一块能验证的活 | 结论 + 验收结果 + 日志 | 外包给 Qoder 独立进程，主对话只收一段结论 |
 
@@ -100,13 +100,27 @@ AI：▶ Architect 规划 → Writer 撰写 → 审计 2 处逻辑问题 → 修
 | `storyboard` | 朴素分镜页（默认） | 最快最轻，纯信息 |
 | `showcase` | 3D 展示页：分镜装进浏览器框，滚动即推镜头 | 产品 / 项目介绍 |
 | `site` | 3D 展示页 + 真实网站整页截图当内页 | 介绍自己的站点（给 `url`） |
+| `person` | 人物光线纪录片：光路穿过一生的每个节点 | 人物生平、传记、纪念片（照片可选） |
 
 ![3D 展示页](src/gangge/layer4_tools/storyboard/previews/showcase.png)
 
 ![网站展示](src/gangge/layer4_tools/storyboard/previews/site.png)
 
-桌面端「⚡ 技能 → 视频出片」里有 10 条现成入口（五种风格 + 自动选风格 + 竖屏 +
-3D 展示页 + 网站展示 + 样式工作台），点一下就把提示词填好，不用记参数。命令行等价写法：
+![人物光线纪录片](src/gangge/layer4_tools/storyboard/previews/person.png)
+
+`person` 是**连续镜头**而不是切镜：光点沿线走，停在一个年份上讲一段，讲完继续走。
+分镜里第一个 `title` 是开场名牌、最后一个 `outro` 是结语，中间每个镜头就是一个人生节点
+（`year` / `title` / `text`）。照片给不给都行——给一个目录就按文件名轮着发到各节点，
+不给就画占位框，照样出片。
+
+桌面端「⚡ 技能 → 视频出片」里有 11 条现成入口（五种风格 + 自动选风格 + 竖屏 +
+3D 展示页 + 网站展示 + 人物纪录片 + 样式工作台），点一下就把提示词填好，不用记参数。
+
+人物纪录片是个例外：点它不会往输入框里塞提示词，而是把右侧翻到「✍ 填写」页——
+一张表填人名、副标题、结语和一串人生节点（年份/标题/正文/照片，随手增删排序），
+点「▶ 预览这一版」直接在浏览器里看，内容自动存草稿。要出片再用下面这条命令。
+
+命令行等价写法：
 
 ```bash
 # 现成文案 → 分镜 → 配音 → 成片
@@ -114,6 +128,10 @@ python -m gangge.layer4_tools.storyboard -c 口播稿.txt --page showcase --styl
 
 # 一个网址 → 整页截图 → 3D 展示视频
 python -m gangge.layer4_tools.storyboard -c 口播稿.txt --page site -u https://example.com
+
+# 一个人 + 一段生平 → 光线纪录片（照片可给可不给）
+# 现成示例：examples/person.json
+python -m gangge.layer4_tools.storyboard -f examples/person.json --page person --photos 照片目录
 
 # 只想先看页面，不渲染视频
 python -m gangge.layer4_tools.storyboard -s --page showcase --preview
@@ -232,7 +250,7 @@ LLM_TIMEOUT=300                # LLM 响应超时（秒）
 - [x] AI 自建工具 + 插件系统
 - [x] MCP 协议支持（stdio + SSE）
 - [x] Dramatica-Flow 小说创作引擎
-- [x] 视频出片（五种风格 / 竖屏 / 3D 展示页 / 网站展示）
+- [x] 视频出片（五种风格 / 竖屏 / 3D 展示页 / 网站展示 / 人物纪录片）
 - [x] Qoder 委派（scope + dod + 四态结果）
 - [x] PyQt6 桌面 GUI
 - [ ] Web UI（远程访问）

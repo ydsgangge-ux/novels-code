@@ -133,10 +133,11 @@ def _video_templates() -> list[Skill]:
 
 
 def _page_templates() -> list[Skill]:
-    """另外两种「页面」：3D 展示页、展示页里装真站点。
+    """另外几种「页面」：3D 展示页、展示页里装真站点、人物光线纪录片。
 
     和上面五种风格并列放在「视频出片」里——用户看到的都是"出一片"，只是拍法不同。
-    关键词分别是 ``page=showcase`` / ``page=site``，模型照着抄就能命中工具的枚举。
+    关键词分别是 ``page=showcase`` / ``page=site`` / ``page=person``，
+    模型照着抄就能命中工具的枚举。
     """
     return [
         Skill(
@@ -175,6 +176,26 @@ def _page_templates() -> list[Skill]:
                 "网址：＜网址＞\n"
                 "要求：3-4 个镜头；开场一句话说清这个站点解决什么问题，"
                 "结尾给一句行动号召；口播口语化，不用「赋能」「抓手」这类空话。"
+            ),
+        ),
+        Skill(
+            id="person_doc",
+            group="视频出片",
+            label="人物纪录片 · 一个人一生一条光路",
+            hint="给一个人名或生平，光点沿线走过每个年份，停一站讲一段；照片可选",
+            focus="＜人物＞",
+            preview="person.png",
+            template=(
+                "用 demo_video 工具做一条人物纪录片（浮生光线），page=person，style=dark。\n"
+                "人物：＜人物＞\n"
+                "要求：7-10 个镜头。第一个用 template=title 当开场"
+                "（title=人名，text=一句话概括这个人的一生）；"
+                "中间每个镜头是一个人生节点，用 template=quote，"
+                "year 写年份或年代（不确定就省略），title 一句话说清这一站，"
+                "text 写 35-70 字讲发生了什么；最后用 template=outro 收一句总结。\n"
+                "不要编造具体日期、数字和引语。\n"
+                "照片：用户给了照片目录就传给 photos 参数；没给就直接出片，"
+                "页面会画占位框，回头补图再渲染一次即可。"
             ),
         ),
     ]

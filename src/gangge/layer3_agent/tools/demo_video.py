@@ -50,6 +50,40 @@ template 只能取以下五个值，字段含义如下：
 主题：{topic}"""
 
 
+def _person_prompt(topic: str) -> str:
+    """人物页的分镜提示词。
+
+    和普通短视频的区别：这里不要"观点"，要"事件"——每个节点得是一个说得清
+    的时间切片，否则一条光路穿过一生，观众记不住任何一个点。
+    """
+    return f"""你是人物纪录片分镜师。把一个人物写成一条 60-120 秒的"浮生光线"短片分镜，
+只输出 JSON。
+
+人物：{topic}
+
+JSON 结构：
+{{"title": "人名", "subtitle": "一句话概括这个人的一生（≤14字）",
+  "style": "dark", "scenes": [{{...}}, ...]}}
+
+scenes 每个镜头 = 一个人生节点，字段：
+- template: 节点统一写 "quote"；开场镜头写 "title"，结尾镜头写 "outro"
+- year: 年份或年代，如 "1930"、"1980s"；不确定就省略这个字段，不要编
+- title: 这一站发生的事，一句话（≤14字），如 "生于北京"
+- text: 一两句话说清楚（35-70 字），要有具体的人、地点或动作，不要空评价
+- voiceover: 口语化旁白（35-70 个汉字），像纪录片解说词，承接上一站，念出来通顺
+
+规则：
+1. 共 7-10 个镜头，按时间顺序：第一个是开场（"title"：title=人名，text=副标题），
+   接着 5-8 个人生节点，最后一个"outro"（text=一句总结，≤24字，title 写空）。
+2. 节点要覆盖不同阶段：出身 / 求学或入行 / 转折 / 高光 / 晚年，不要全写成就。
+3. 不许编造具体日期、数字和引语。你不确定的年份就不写，宁可只有标题。
+4. 不要写 photos 字段——照片由用户提供，缺席是正常的。
+5. style：人物传记、纪念片用 dark；文化人物可用 paper；不要用 neon。
+6. 只输出 JSON 本身，不要解释，不要 markdown 代码块。
+
+人物：{topic}"""
+
+
 def _loads(text: str) -> Any:
     """Parse JSON out of a model answer that may wrap it in prose or fences."""
     text = (text or "").strip()
@@ -94,7 +128,9 @@ class DemoVideoTool(BaseTool):
             "render(渲染完整视频) / auto(写分镜并渲染，默认)。"
             "给 topic 会自动写分镜；也可以直接传 scenes 数组自行控制每一帧。"
             "page 决定拍哪种页面：storyboard 朴素分镜页 / showcase 3D 展示页 / "
-            "site 3D 展示页里装真实网站截图（需要 url）。"
+            "site 3D 展示页里装真实网站截图（需要 url）/ "
+            "person 人物光线纪录片（给一个人名或生平，生成一条光路穿过一生的短片，"
+            "照片可选）。"
             "渲染耗时约每 10 秒成片 30-60 秒。"
         )
 
@@ -112,6 +148,11 @@ class DemoVideoTool(BaseTool):
             "展示页",
             "网页",
             "网站",
+            "人物",
+            "纪录片",
+            "传记",
+            "生平",
+            "纪念",
         )
 
     @property
@@ -175,13 +216,22 @@ class DemoVideoTool(BaseTool):
                 },
                 "page": {
                     "type": "string",
-                    "enum": ["storyboard", "showcase", "site"],
+                    "enum": ["storyboard", "showcase", "site", "person"],
                     "description": (
                         "拍哪种页面：storyboard 朴素分镜页（默认、最轻）/ "
                         "showcase 3D 展示页（分镜装进浏览器框，滚动推镜头）/ "
-                        "site 3D 展示页里装真实网站截图（要同时给 url）"
+                        "site 3D 展示页里装真实网站截图（要同时给 url）/ "
+                        "person 人物光线纪录片（一条光路穿过一个人的一生，"
+                        "讲人物生平、传记、纪念片时用它）"
                     ),
                     "default": "storyboard",
+                },
+                "photos": {
+                    "type": "string",
+                    "description": (
+                        "可选：照片目录，只对 page=person 生效。按文件名顺序轮流发给"
+                        "每个人生节点；不给就画占位框，没图也能出片"
+                    ),
                 },
                 "url": {
                     "type": "string",
@@ -218,12 +268,16 @@ class DemoVideoTool(BaseTool):
 
     # ── storyboard acquisition ──────────────────────────────────
 
-    async def _draft(self, topic: str) -> dict[str, Any]:
-        """Ask the model for a storyboard, retrying once with the parse error."""
+    async def _draft(self, topic: str, person: bool = False) -> dict[str, Any]:
+        """Ask the model for a storyboard, retrying once with the parse error.
+
+        ``person`` 只是换一份提示词：人物页要的是"人生节点"而不是"观点要点"，
+        但落到 schema 上是同一套 scenes，下游不需要再分叉。
+        """
         if self.llm is None:
             raise ValueError("当前没有可用的主模型，无法自动写分镜；请直接传 scenes")
 
-        prompt = _draft_prompt(topic)
+        prompt = _person_prompt(topic) if person else _draft_prompt(topic)
         last_error = ""
         for attempt in range(2):
             ask = prompt if attempt == 0 else (
@@ -241,7 +295,9 @@ class DemoVideoTool(BaseTool):
                 logger.warning("[demo_video] storyboard parse failed: %s", e)
         raise ValueError(f"模型两次都没有给出合法分镜 JSON：{last_error}")
 
-    async def _resolve_storyboard(self, kwargs: dict[str, Any], need_draft: bool):
+    async def _resolve_storyboard(
+        self, kwargs: dict[str, Any], need_draft: bool, person: bool = False
+    ):
         from gangge.layer4_tools.storyboard import Storyboard
 
         if kwargs.get("scenes"):
@@ -257,7 +313,7 @@ class DemoVideoTool(BaseTool):
             raise ValueError("需要 topic、scenes 或 storyboard_file 之一")
         if not need_draft:
             raise ValueError("preview/render 需要 scenes 或 storyboard_file")
-        draft = await self._draft(topic)
+        draft = await self._draft(topic, person=person)
         if not isinstance(draft, dict):
             raise ValueError("模型给的分镜不是 JSON 对象")
 
@@ -298,9 +354,13 @@ class DemoVideoTool(BaseTool):
             return ToolResult(output=f"未知 action: {action}", is_error=True)
 
         topic = str(kwargs.get("topic") or "").strip()
+        # page 必须先定：人物页用的是另一份提示词（要"人生节点"，不是"要点"）
+        page = str(kwargs.get("page") or "storyboard").strip().lower()
         try:
             storyboard = await self._resolve_storyboard(
-                kwargs, need_draft=action in ("auto", "write") or bool(topic)
+                kwargs,
+                need_draft=action in ("auto", "write") or bool(topic),
+                person=page == "person",
             )
         except Exception as e:  # noqa: BLE001 - parse errors are model-facing
             return ToolResult(output=f"❌ 分镜无效：{e}", is_error=True)
@@ -325,12 +385,24 @@ class DemoVideoTool(BaseTool):
                 pass  # 非法帧率沿用分镜默认值，不值得为它中断整条流水线
 
         # 页面决定后半程：展示页要外壳配色和（可选）一张网站截图
-        page = str(kwargs.get("page") or "storyboard").strip().lower()
         if page not in PAGE_KINDS:
             return ToolResult(
                 output=f"❌ 未知 page: {page}（可选 {' / '.join(PAGE_KINDS)}）",
                 is_error=True,
             )
+        # 人物页的照片是可选输入：给了就轮流发到各节点，没给就画占位框
+        photo_notes: list[str] = []
+        photos_dir = str(kwargs.get("photos") or "").strip()
+        if photos_dir and page == "person":
+            from gangge.layer4_tools.storyboard.person import (
+                PersonPageError,
+                assign_photos,
+            )
+
+            try:
+                photo_notes = assign_photos(storyboard, photos_dir)
+            except PersonPageError as e:
+                return ToolResult(output=f"❌ 照片目录有问题：{e}", is_error=True)
         url = str(kwargs.get("url") or "").strip()
         site_shot = None
         if page == "site":
@@ -398,7 +470,8 @@ class DemoVideoTool(BaseTool):
                 output=(
                     f"✅ 预览页面已生成（{page}）\n- HTML: {html}\n"
                     f"- 预计时长: {storyboard.total_duration:.1f}s（未配音，按文字估算）\n"
-                    f"用浏览器打开即可逐帧查看；确认无误后 action=render 出片。"
+                    + "".join(f"- {note}\n" for note in photo_notes)
+                    + "用浏览器打开即可逐帧查看；确认无误后 action=render 出片。"
                 ),
                 metadata={
                     "html": str(html),
@@ -441,5 +514,6 @@ class DemoVideoTool(BaseTool):
         if result.srt:
             lines.append(f"- 字幕: {result.srt}")
         lines.append(f"- 分镜页: {result.html}")
+        lines += [f"- {note}" for note in photo_notes]
         lines += [f"- 提示: {note}" for note in result.notes]
         return ToolResult(output="\n".join(lines), metadata=data)
