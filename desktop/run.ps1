@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Gangge Code Desktop — AI 编程助手启动脚本
+    Novels Code Desktop — AI 编程助手启动脚本
 .DESCRIPTION
     启动 PyQt6 桌面应用，自动安装缺失依赖
 #>
@@ -10,7 +10,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectRoot = Resolve-Path "$ScriptDir\.."
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Gangge Code Desktop — AI 编程助手" -ForegroundColor Cyan
+Write-Host "  Novels Code Desktop — AI 编程助手" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -51,7 +51,7 @@ try {
 
 # Launch
 Write-Host ""
-Write-Host "[启动] 正在启动 Gangge Code Desktop..." -ForegroundColor Green
+Write-Host "[启动] 正在启动 Novels Code Desktop..." -ForegroundColor Green
 Write-Host ""
 
 Set-Location $ProjectRoot

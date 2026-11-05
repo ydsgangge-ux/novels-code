@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ Gangge Code
+# ⚡ Novels Code
 
 **会写小说的 AI 编程助手 —— 一句话写一章，一段文案出一条片**
 
@@ -36,7 +36,7 @@
 
 ```bash
 git clone https://github.com/ydsgangge-ux/novels-code.git
-cd gangge-code
+cd novels-code
 
 pip install -e ".[gui]"          # 桌面端（推荐）
 # 要视频出片就换成：pip install -e ".[gui,video]"（playwright + edge-tts）

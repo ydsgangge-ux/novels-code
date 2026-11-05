@@ -146,7 +146,7 @@ class StatusLine(Static):
 class GanggeApp(App):
     """Main Gangge TUI application."""
 
-    TITLE = "Gangge Code"
+    TITLE = "Novels Code"
     SUB_TITLE = "AI Coding Assistant"
     CSS = """
     Screen {
@@ -225,7 +225,7 @@ class GanggeApp(App):
     async def on_mount(self) -> None:
         """Initialize app on mount."""
         chat = self.query_one("#chat-box", ChatBox)
-        chat.add_system("正在初始化 Gangge Code...")
+        chat.add_system("正在初始化 Novels Code...")
 
         try:
             # Register tools via shared factory (gets ALL tools: bash, file_ops,

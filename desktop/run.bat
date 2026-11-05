@@ -1,11 +1,11 @@
 @echo off
 chcp 65001 >nul
-title Gangge Code Desktop
+title Novels Code Desktop
 
 cd /d "%~dp0.."
 
 echo ========================================
-echo   Gangge Code Desktop — AI 编程助手
+echo   Novels Code Desktop — AI 编程助手
 echo ========================================
 echo.
 
@@ -29,7 +29,7 @@ if %ERRORLEVEL% NEQ 0 (
     )
 )
 
-echo [启动] 正在启动 Gangge Code Desktop...
+echo [启动] 正在启动 Novels Code Desktop...
 echo.
 
 python desktop/app.py

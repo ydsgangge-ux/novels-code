@@ -1,4 +1,4 @@
-"""Gangge Code core module tests.
+"""Novels Code core module tests.
 
 Tests:
 1. AgenticLoop end-to-end (write_file, multi-tool, error feedback)

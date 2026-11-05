@@ -1,5 +1,5 @@
 """
-Gangge Code — MCP 客户端模块
+Novels Code — MCP 客户端模块
 src/gangge/layer4_tools/mcp_client.py
 
 职责：
@@ -137,7 +137,7 @@ class StdioMCPConnection:
         self._call("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "gangge-code", "version": "1.0.0"},
+            "clientInfo": {"name": "novels-code", "version": "1.0.0"},
         })
         self._notify("notifications/initialized", {})
         logger.info(f"[MCP] stdio 连接成功: {self.config.name}")
@@ -272,7 +272,7 @@ class SSEMCPConnection:
             resp = client.post(f"{self.config.url}/initialize", json={
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "gangge-code", "version": "1.0.0"},
+                "clientInfo": {"name": "novels-code", "version": "1.0.0"},
             })
             resp.raise_for_status()
             self._session_url = resp.json().get("sessionUrl", self.config.url)

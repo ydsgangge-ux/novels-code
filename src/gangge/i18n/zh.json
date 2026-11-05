@@ -1,5 +1,5 @@
 {
-  "app_title": "Gangge Code",
+  "app_title": "Novels Code",
   "app_subtitle": "AI 编程助手 — 5 层架构 Agentic Loop",
 
   "btn_new": "🔄 新建",
@@ -55,8 +55,8 @@
   "menu_tools": "工具(&T)",
   "menu_open_workspace": "打开工作目录...",
   "menu_help": "帮助(&H)",
-  "menu_about": "关于 Gangge Code",
-  "about_text": "<h2>Gangge Code v0.1.0</h2><p>AI 编程助手 — 5 层架构 Agentic Loop</p><hr><p>会话持久化 · 文件 Diff · 测试验证 · 批量任务 · 计划确认</p>",
+  "menu_about": "关于 Novels Code",
+  "about_text": "<h2>Novels Code v0.1.0</h2><p>AI 编程助手 — 5 层架构 Agentic Loop</p><hr><p>会话持久化 · 文件 Diff · 测试验证 · 批量任务 · 计划确认</p>",
 
   "session_new": "新会话",
   "session_count": "─ {n} 个会话 ─",
@@ -68,7 +68,7 @@
   "session_rename": "重命名会话",
   "session_rename_label": "会话名称:",
 
-  "settings_title": "⚙ 设置 - Gangge Code",
+  "settings_title": "⚙ 设置 - Novels Code",
   "settings_heading": "设置",
   "settings_provider": "LLM 提供商:",
   "settings_api_key": "API Key:",

@@ -49,7 +49,7 @@ class ShadowGit:
             return True
         try:
             self._run(["git", "init"], check=True)
-            name = user_name or "Gangge Code"
+            name = user_name or "Novels Code"
             email = user_email or "gangge@ai"
             self._run(["git", "config", "user.email", email], check=True)
             self._run(["git", "config", "user.name", name], check=True)

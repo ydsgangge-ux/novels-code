@@ -175,7 +175,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="gangge",
-        description="Gangge Code — AI Coding Assistant",
+        description="Novels Code — AI Coding Assistant",
     )
     parser.add_argument(
         "task",
@@ -218,7 +218,7 @@ def main() -> None:
     parser.add_argument(
         "--version",
         action="version",
-        version="gangge-code 0.1.0",
+        version="novels-code 0.1.0",
     )
 
     # ── Runtime composition ──

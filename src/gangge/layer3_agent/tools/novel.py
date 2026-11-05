@@ -1,5 +1,5 @@
 """
-小说写作工具组 — 将 Dramatica-Flow 叙事引擎封装为 Gangge Code 工具。
+小说写作工具组 — 将 Dramatica-Flow 叙事引擎封装为 Novels Code 工具。
 
 工具列表：
   - novel_init       创建一本新书（自动初始化模板角色/世界/事件）

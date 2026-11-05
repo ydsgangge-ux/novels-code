@@ -1,4 +1,4 @@
-"""Internationalization support for Gangge Code.
+"""Internationalization support for Novels Code.
 
 Usage:
     from gangge.i18n import t

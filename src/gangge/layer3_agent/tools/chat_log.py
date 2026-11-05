@@ -82,7 +82,7 @@ class ChatLogTool(BaseTool):
 
         header = (
             f"{'='*60}\n"
-            f"Gangge Code · 通用问答记录\n"
+            f"Novels Code · 通用问答记录\n"
             f"时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"主题: {title}\n"
             f"{'='*60}\n\n"

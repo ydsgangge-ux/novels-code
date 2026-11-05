@@ -9,7 +9,7 @@ from pathlib import Path
 #  核心原则：少说规则，多干活
 # ═══════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """你是 Gangge Code，一个自主编程 AI。通过调用工具完成任务。
+SYSTEM_PROMPT = """你是 Novels Code，一个自主编程 AI。通过调用工具完成任务。
 
 ## 工作目录
 `{workspace_path}`

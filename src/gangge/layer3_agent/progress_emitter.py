@@ -1,5 +1,5 @@
 """
-Gangge Code — 进度可视化事件系统
+Novels Code — 进度可视化事件系统
 src/gangge/layer3_agent/progress_emitter.py
 
 用法：

@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul 2>&1
-title Gangge Code - Desktop GUI
+title Novels Code - Desktop GUI
 
 :: Check Python
 python --version >nul 2>&1
@@ -32,7 +32,7 @@ if exist .env (
 )
 
 :: Launch GUI
-echo Starting Gangge Code Desktop...
+echo Starting Novels Code Desktop...
 python desktop\app.py
 
 if errorlevel 1 (

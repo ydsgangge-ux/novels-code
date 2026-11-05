@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ Gangge Code
+# ⚡ Novels Code
 
 **The AI coding assistant that writes novels — one line to a chapter, one script to a video**
 
@@ -22,7 +22,7 @@ English | [中文](./README.md)
 
 ## 📖 Core Feature: AI Novel Writing Engine
 
-Gangge Code integrates **Dramatica-Flow**, a complete novel creation system supporting end-to-end workflow from concept to manuscript:
+Novels Code integrates **Dramatica-Flow**, a complete novel creation system supporting end-to-end workflow from concept to manuscript:
 
 ### 🎯 Chat-Based Creation
 Talk directly in the main chat window, AI understands intent and acts:
@@ -108,7 +108,7 @@ Talk directly in the main chat window, AI understands intent and acts:
 
 ```bash
 git clone https://github.com/ydsgangge-ux/novels-code.git
-cd gangge-code
+cd novels-code
 ```
 
 ### 2. Install (pick one)
@@ -199,7 +199,7 @@ Type directly in the main chat window:
 ## 🎬 Demo
 
 <p align="center">
-  <img src="docs/screenshots/1.png" alt="Gangge Code Desktop GUI" width="90%" />
+  <img src="docs/screenshots/1.png" alt="Novels Code Desktop GUI" width="90%" />
   <br/>
   <em>Desktop GUI — Novel writing panels + AI coding assistant</em>
 </p>
@@ -416,7 +416,7 @@ TEMPERATURE=0.0
 ## 📁 Project Structure
 
 ```
-gangge-code/
+novels-code/
 ├── desktop/
 │   ├── app.py              # PyQt6 desktop application (with novel panels)
 │   ├── run.bat             # Windows one-click launcher

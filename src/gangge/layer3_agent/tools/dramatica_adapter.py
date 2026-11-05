@@ -1,7 +1,7 @@
 """
-LLM 适配器：将 Gangge Code 的 BaseLLM 适配为 Dramatica-Flow 的 LLMProvider。
+LLM 适配器：将 Novels Code 的 BaseLLM 适配为 Dramatica-Flow 的 LLMProvider。
 
-Gangge Code 使用 async BaseLLM.chat()，
+Novels Code 使用 async BaseLLM.chat()，
 Dramatica-Flow 使用 sync LLMProvider.complete() / stream()。
 本适配器在两者之间做桥接。
 """
@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 class DramaticaLLMAdapter(LLMProvider):
     """
-    将 Gangge Code 的 BaseLLM 适配为 Dramatica-Flow 的 LLMProvider。
+    将 Novels Code 的 BaseLLM 适配为 Dramatica-Flow 的 LLMProvider。
 
     Dramatica-Flow 的 Agent 全部使用同步调用（complete / stream），
-    而 Gangge Code 的 BaseLLM 是异步的（async chat）。
+    而 Novels Code 的 BaseLLM 是异步的（async chat）。
     本适配器通过 asyncio.run() 桥接。
     """
 

@@ -1,5 +1,5 @@
 {
-  "app_title": "Gangge Code",
+  "app_title": "Novels Code",
   "app_subtitle": "AI Coding Assistant — 5-Layer Agentic Loop",
 
   "btn_new": "🔄 New",
@@ -55,8 +55,8 @@
   "menu_tools": "&Tools",
   "menu_open_workspace": "Open Workspace...",
   "menu_help": "&Help",
-  "menu_about": "About Gangge Code",
-  "about_text": "<h2>Gangge Code v0.1.0</h2><p>AI Coding Assistant — 5-Layer Agentic Loop</p><hr><p>Session Persistence · File Diff · Test Verification · Batch Tasks · Plan Confirmation</p>",
+  "menu_about": "About Novels Code",
+  "about_text": "<h2>Novels Code v0.1.0</h2><p>AI Coding Assistant — 5-Layer Agentic Loop</p><hr><p>Session Persistence · File Diff · Test Verification · Batch Tasks · Plan Confirmation</p>",
 
   "session_new": "New Session",
   "session_count": "─ {n} Sessions ─",
@@ -68,7 +68,7 @@
   "session_rename": "Rename Session",
   "session_rename_label": "Session Name:",
 
-  "settings_title": "⚙ Settings - Gangge Code",
+  "settings_title": "⚙ Settings - Novels Code",
   "settings_heading": "Settings",
   "settings_provider": "LLM Provider:",
   "settings_api_key": "API Key:",

@@ -1,9 +1,9 @@
 @echo off
 chcp 65001 >nul 2>&1
-title Gangge Code - Install
+title Novels Code - Install
 
 echo ============================================
-echo   Gangge Code - Dependency Installer
+echo   Novels Code - Dependency Installer
 echo ============================================
 echo.
 

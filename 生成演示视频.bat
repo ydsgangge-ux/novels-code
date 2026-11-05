@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul 2>&1
-title Gangge Code - 演示视频生成
+title Novels Code - 演示视频生成
 cd /d "%~dp0"
 set "PYTHONPATH=%~dp0src"
 

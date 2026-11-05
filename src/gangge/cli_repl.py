@@ -50,7 +50,7 @@ console = Console()
 #  Helpers
 # ═════════════════════════════════════════════════════════════════
 
-GANGGE_ART = "[bold cyan]Gangge Code — AI Coding Assistant v0.1.0[/bold cyan]"
+GANGGE_ART = "[bold cyan]Novels Code — AI Coding Assistant v0.1.0[/bold cyan]"
 
 
 def _print_banner(workspace: str, model: str):

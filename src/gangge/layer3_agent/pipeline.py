@@ -90,7 +90,7 @@ class PipelineResult:
 
 # ── Planner Prompt ──
 
-PLANNER_SYSTEM_PROMPT = """你是 Gangge Code 的任务规划器。你的唯一职责是将用户任务拆解为可执行的步骤列表。
+PLANNER_SYSTEM_PROMPT = """你是 Novels Code 的任务规划器。你的唯一职责是将用户任务拆解为可执行的步骤列表。
 
 ## 规则
 
@@ -303,7 +303,7 @@ class PlanExecutor:
 
 # ── Verifier Prompt ──
 
-VERIFIER_SYSTEM_PROMPT = """你是 Gangge Code 的验证器。检查任务执行结果，报告完成情况。
+VERIFIER_SYSTEM_PROMPT = """你是 Novels Code 的验证器。检查任务执行结果，报告完成情况。
 
 ## 规则
 

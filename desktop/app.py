@@ -1,5 +1,5 @@
 """
-Gangge Code Desktop — PyQt6 GUI for the AI Coding Assistant.
+Novels Code Desktop — PyQt6 GUI for the AI Coding Assistant.
 
 Features:
   - 4 LLM providers (DeepSeek, OpenAI, Anthropic, Ollama)
@@ -9332,7 +9332,7 @@ def main():
             from PyQt6.QtWidgets import QMessageBox
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Icon.Critical)
-            msg.setWindowTitle("Gangge Code 崩溃")
+            msg.setWindowTitle("Novels Code 崩溃")
             msg.setText(f"程序发生未捕获异常：\n{exc_value}")
             msg.setDetailedText(f"日志文件：{log_file}\n\n{tb_text}")
             msg.exec()
@@ -9347,11 +9347,11 @@ def main():
         "线程异常: %s", args.exc_value, exc_info=(args.exc_type, args.exc_value, args.exc_traceback)
     )
 
-    logger.info("Gangge Code 启动，日志文件: %s", log_file)
+    logger.info("Novels Code 启动，日志文件: %s", log_file)
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
-    app.setApplicationName("Gangge Code")
+    app.setApplicationName("Novels Code")
     app.setApplicationVersion("0.1.0")
     app.setOrganizationName("Gangge")
     app.setStyleSheet(DARK_STYLESHEET)

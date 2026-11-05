@@ -1,5 +1,5 @@
 {
-  "_comment": "Gangge Code MCP Server 配置示例。放到项目根的 .gangge/mcp_servers.json 才生效。",
+  "_comment": "Novels Code MCP Server 配置示例。放到项目根的 .gangge/mcp_servers.json 才生效。",
   "_doc": "transport 支持 stdio（本地进程）与 sse（远程 HTTP）；工具以 {server}__{tool} 的名字暴露给模型",
   "_generate": "也可以让 `python -m gangge.layer4_tools.dsh_plugins export <插件目录>` 自动写入 mcp-client 型插件",
 
