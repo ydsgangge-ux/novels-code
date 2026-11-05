@@ -21,9 +21,9 @@ REM Check PyQt6
 python -c "import PyQt6" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo [提示] 正在安装 PyQt6...
-    pip install PyQt6
+    python -m pip install PyQt6
     if %ERRORLEVEL% NEQ 0 (
-        echo [错误] PyQt6 安装失败，请手动运行: pip install PyQt6
+        echo [错误] PyQt6 安装失败，请手动运行: python -m pip install PyQt6
         pause
         exit /b 1
     )

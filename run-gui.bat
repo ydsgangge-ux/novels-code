@@ -14,7 +14,7 @@ if errorlevel 1 (
 python -c "import PyQt6" >nul 2>&1
 if errorlevel 1 (
     echo PyQt6 not found. Installing...
-    pip install -e ".[gui]"
+    python -m pip install -e ".[gui]"
     if errorlevel 1 (
         echo [ERROR] Failed to install PyQt6. Run install.bat first.
         pause

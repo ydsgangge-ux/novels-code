@@ -18,6 +18,22 @@ if errorlevel 1 (
 
 for /f "tokens=2 delims= " %%v in ('python --version 2^>^&1') do set PYVER=%%v
 echo [OK] Python %PYVER% detected
+
+:: Check pip. Some Python installs ship python.exe on PATH but not pip.exe,
+:: so always go through "python -m pip" and bootstrap it if missing.
+python -m pip --version >nul 2>&1
+if errorlevel 1 (
+    echo [WARN] pip not found, trying to bootstrap with ensurepip...
+    python -m ensurepip --upgrade >nul 2>&1
+)
+python -m pip --version >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] pip is not available for this Python.
+    echo         Try running: python -m ensurepip --upgrade
+    pause
+    exit /b 1
+)
+echo [OK] pip ready
 echo.
 
 :: Ask install mode
@@ -33,11 +49,11 @@ echo.
 echo Installing...
 
 if "%MODE%"=="1" (
-    pip install -e .
+    python -m pip install -e .
 ) else if "%MODE%"=="3" (
-    pip install -e ".[all]"
+    python -m pip install -e ".[all]"
 ) else (
-    pip install -e ".[gui]"
+    python -m pip install -e ".[gui]"
 )
 
 if errorlevel 1 (
