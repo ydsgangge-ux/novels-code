@@ -138,6 +138,8 @@ AGENT_PROFILES = {
             "demo_video",
             # 外包一个可验证闭环给 Qoder CLI（省上下文）
             "qoder_delegate",
+            # 3D 建模（装了 Blender 才注册）
+            "blender",
         },
     },
     "novel": {
@@ -197,6 +199,8 @@ AGENT_PROFILES = {
             # 3D 展示页 / 网站展示：点了技能就该把 demo_video 挂上
             "展示页", "网站展示", "网页展示", "showcase",
             "video", "animation", "narration",
+            # 3D 建模
+            "blender", "3d", "建模", "零件图纸", "渲染图", "模型文件",
         ],
         "tools": {
             "demo_video",
@@ -205,6 +209,8 @@ AGENT_PROFILES = {
             "TodoWrite", "ask_user", "chat_log", "tool_search",
             # 检查渲染结果
             "vision", "generate_image",
+            # 3D 建模（装了 Blender 才注册）
+            "blender",
         },
     },
 }
@@ -264,11 +270,13 @@ PROFILE_CORE: dict[str, set[str]] = {
         "chat_log",
         "tool_search",
         "qoder_delegate",
+        "blender",
     },
     # Novel and research sessions are domain sessions: hiding their own domain
     # tools behind a search would only add a round to every single turn.
     "media": {
         "demo_video",
+        "blender",
         "read_file", "list_dir", "grep", "glob",
         "write_file", "edit_file", "apply_patch",
         "TodoWrite", "ask_user", "chat_log", "tool_search",
@@ -673,7 +681,19 @@ def create_tool_registry(
                 os.environ.pop("GANGGE_COMFYUI_ACTIVE", None)
         except Exception as e:
             logger.debug("[Registry] ComfyUI check skipped: %s", e)
-            os.environ.pop("GANGGE_COMFYUI_ACTIVE", None)
+        os.environ.pop("GANGGE_COMFYUI_ACTIVE", None)
+
+    # ── Blender 3D 建模（装了 Blender 就自动启用，无需 MCP 配置）──
+    try:
+        from gangge.layer3_agent.tools.blender import BlenderTool, find_blender
+
+        if find_blender():
+            registry.register(BlenderTool(workspace=workspace or "."))
+            logger.info("[Registry] Blender detected — 3D modeling tool activated")
+        else:
+            logger.debug("[Registry] Blender not found — blender tool skipped")
+    except Exception as e:
+        logger.debug("[Registry] Blender tool skipped: %s", e)
 
     # ── Novel Writing Tools (Dramatica-Flow) ──
     try:
