@@ -27,7 +27,7 @@ SETTLE = 1.9
 #: 展示页截图用的时间点：第一镜头已落位、机位刚推近一点，最像"正在介绍"。
 SHOWCASE_AT = 1.5
 #: 网站页预览里那张"截图"用的是自己的分镜页——离线、可复现，不依赖外网站点。
-SITE_DEMO_URL = "https://github.com/ydsgangge-ux/gangge-code"
+SITE_DEMO_URL = "https://github.com/ydsgangge-ux/novels-code"
 
 
 @dataclass(frozen=True)

@@ -51,7 +51,7 @@ MIN_FREE_COMMIT_MB = 1024
 _ANIM_DIR = Path(tempfile.gettempdir()) / "gangge-skill-anim"
 
 #: 展示页样例里的假地址栏；和 previews 的 ``site.png`` 用的是同一个。
-_DEMO_URL = "https://github.com/ydsgangge-ux/gangge-code"
+_DEMO_URL = "https://github.com/ydsgangge-ux/novels-code"
 #: 这两条技能的样例不是"某一套配色"，而是另一种页面外壳。
 _PAGE_STEMS = {"showcase", "site"}
 

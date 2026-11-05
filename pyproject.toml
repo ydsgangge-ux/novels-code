@@ -66,9 +66,9 @@ all = [
 gangge = "gangge.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/ydsgangge-ux/gangge-code"
-Repository = "https://github.com/ydsgangge-ux/gangge-code"
-Issues = "https://github.com/ydsgangge-ux/gangge-code/issues"
+Homepage = "https://github.com/ydsgangge-ux/novels-code"
+Repository = "https://github.com/ydsgangge-ux/novels-code"
+Issues = "https://github.com/ydsgangge-ux/novels-code/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

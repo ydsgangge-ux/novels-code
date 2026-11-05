@@ -107,7 +107,7 @@ Talk directly in the main chat window, AI understands intent and acts:
 ### 1. Clone
 
 ```bash
-git clone https://github.com/ydsgangge-ux/gangge-code.git
+git clone https://github.com/ydsgangge-ux/novels-code.git
 cd gangge-code
 ```
 

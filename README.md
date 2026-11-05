@@ -35,7 +35,7 @@
 ## 🚀 三分钟跑起来
 
 ```bash
-git clone https://github.com/ydsgangge-ux/gangge-code.git
+git clone https://github.com/ydsgangge-ux/novels-code.git
 cd gangge-code
 
 pip install -e ".[gui]"          # 桌面端（推荐）
