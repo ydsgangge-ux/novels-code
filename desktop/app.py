@@ -122,6 +122,7 @@ from gangge.layer4_tools.qoder_cli.config import (
 )
 from skill_preview import SkillEffectPanel
 from git_panel import GitRepo, SourceControlPanel, confirm_security
+from pet import PetWindow
 
 # ── LLM Provider definitions ─────────────────────────────────────
 PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
@@ -6216,6 +6217,7 @@ class GanggeDesktop(QMainWindow):
         tb.addSeparator()
 
         tb.addWidget(_tb_btn("📖", "新建小说", self._novel_new_book))
+        tb.addWidget(_tb_btn("🐟", "桌宠（跑任务时联动）", self._toggle_pet))
 
         sp = QWidget()
         sp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -7161,6 +7163,9 @@ class GanggeDesktop(QMainWindow):
     # ── Events ────────────────────────────────────────────────
     def closeEvent(self, event):
         self._cancel_task()
+        pet = getattr(self, "_pet_window", None)
+        if pet is not None:
+            pet.close()
         self._save_settings()
         self._db.close()
         event.accept()
@@ -8061,6 +8066,36 @@ class GanggeDesktop(QMainWindow):
                 self._append_output(_t("git_push_fail", error=err), "system")
         self._update_git_status()
 
+    # ── 桌宠 ──────────────────────────────────────────────────
+    def _ensure_pet(self) -> PetWindow:
+        if getattr(self, "_pet_window", None) is None:
+            self._pet_window = PetWindow()
+        return self._pet_window
+
+    def _show_pet(self):
+        pet = self._ensure_pet()
+        pet.show()
+        pet.raise_()
+        self._settings.setValue("pet/enabled", "true")
+
+    def _toggle_pet(self):
+        pet = self._ensure_pet()
+        if pet.isVisible():
+            pet.hide()
+            self._settings.setValue("pet/enabled", "false")
+            self._status_label.setText("🐟 桌宠已隐藏")
+        else:
+            pet.show()
+            pet.raise_()
+            self._settings.setValue("pet/enabled", "true")
+            self._status_label.setText("🐟 桌宠已显示（素材目录 .gangge_data/pet，右键可打开）")
+
+    def _pet_state(self, state: str):
+        """把任务状态同步给桌宠（没开桌宠时什么都不做）。"""
+        pet = getattr(self, "_pet_window", None)
+        if pet is not None and pet.isVisible():
+            pet.set_state(state)
+
     def _on_sc_status(self, summary: str):
         """版本面板刷新后，同步工具栏的分支标签。"""
         if not hasattr(self, "_git_branch_label"):
@@ -8810,10 +8845,13 @@ class GanggeDesktop(QMainWindow):
             tool_name=tool_name, args=args,
         )
         self._novel_worker.progress.connect(lambda msg: self._append_output(msg, "assistant"))
+        self._novel_worker.progress.connect(lambda _m: self._pet_state("working"))
         self._novel_worker.finished.connect(self._on_novel_direct_finished)
+        self._pet_state("thinking")
         self._novel_worker.start()
 
     def _on_novel_direct_finished(self, result: dict):
+        self._pet_state("error" if result.get("error") else "success")
         self._running = False
         self._btn_run.setVisible(True)
         self._batch_btn.setEnabled(True)
@@ -8967,6 +9005,8 @@ class GanggeDesktop(QMainWindow):
                 multimodal_llm = mm_llm
                 logging.getLogger("gangge").info("多模态模型已就绪，通过 vision 工具调用")
 
+        self._pet_state("thinking")   # 🐟 已发送，模型还在想
+
         self._worker = GanggeWorker(
             llm=llm, task=task, workspace=workspace,
             multimodal_llm=multimodal_llm,
@@ -8988,6 +9028,9 @@ class GanggeDesktop(QMainWindow):
         self._worker.text_block.connect(self._append_output)
         self._worker.tool_call_sig.connect(self._on_tool_call)
         self._worker.finished.connect(lambda s: self._on_finished(s, llm))
+        # 🐟 桌宠联动：开始输出 / 调工具 → 干活中
+        self._worker.text_block.connect(lambda *_a: self._pet_state("working"))
+        self._worker.tool_call_sig.connect(lambda *_a: self._pet_state("working"))
         self._worker.ask_user_sig.connect(self._on_ask_user)
         self._worker.permission_ask.connect(self._on_permission_ask)
         # ── Experimental Mode: forward metrics to panel ──
@@ -9036,6 +9079,13 @@ class GanggeDesktop(QMainWindow):
             self._timer_label.setText(f"⏱ {mins:02d}:{secs:02d}")
 
     def _on_finished(self, summary: dict, llm: BaseLLM | None):
+        # 🐟 桌宠：空 summary = 取消 / 失败 = 出错 / 其它 = 完成
+        if not summary:
+            self._pet_state("idle")
+        elif summary.get("error"):
+            self._pet_state("error")
+        else:
+            self._pet_state("success")
         self._running = False
         self._btn_run.setVisible(True)
         self._btn_stop.setVisible(False)
@@ -9621,6 +9671,10 @@ class GanggeDesktop(QMainWindow):
         st = self._settings.value("window_state")
         if st:
             self.restoreState(st)
+        # 🐟 上次退出时桌宠是开着的 → 启动后自动显示
+        if self._settings.value("pet/enabled", "false") == "true":
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(800, self._show_pet)
 
 
 # ═════════════════════════════════════════════════════════════════
