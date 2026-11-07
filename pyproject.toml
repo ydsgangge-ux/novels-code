@@ -80,7 +80,7 @@ where = ["src"]
 "gangge.layer4_permission" = ["*.yml"]
 # 技能「效果」页签用的静态预览图 + 各种页面模板。模板是数据不是代码，
 # 不带进 wheel 的话，pip 装出来的包一渲染就 FileNotFoundError。
-"gangge.layer4_tools.storyboard" = ["previews/*.png", "pages/*.html"]
+"gangge.layer4_tools.storyboard" = ["previews/*.png", "pages/*.html", "pages/vendor/*.js"]
 
 [tool.ruff]
 line-length = 100

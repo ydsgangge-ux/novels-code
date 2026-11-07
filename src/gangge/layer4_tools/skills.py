@@ -133,11 +133,11 @@ def _video_templates() -> list[Skill]:
 
 
 def _page_templates() -> list[Skill]:
-    """另外几种「页面」：3D 展示页、展示页里装真站点、人物光线纪录片。
+    """另外几种「页面」：3D 展示页、展示页里装真站点、人物光线、时间线飞行、迷你沙盘。
 
     和上面五种风格并列放在「视频出片」里——用户看到的都是"出一片"，只是拍法不同。
-    关键词分别是 ``page=showcase`` / ``page=site`` / ``page=person``，
-    模型照着抄就能命中工具的枚举。
+    关键词分别是 ``page=showcase`` / ``page=site`` / ``page=person`` / ``page=flight``
+    / ``page=miniature``，模型照着抄就能命中工具的枚举。
     """
     return [
         Skill(
@@ -196,6 +196,48 @@ def _page_templates() -> list[Skill]:
                 "不要编造具体日期、数字和引语。\n"
                 "照片：用户给了照片目录就传给 photos 参数；没给就直接出片，"
                 "页面会画占位框，回头补图再渲染一次即可。"
+            ),
+        ),
+        Skill(
+            id="flight_timeline",
+            group="视频出片",
+            label="时间线飞行 · 3D 光路片头",
+            hint="一条光路在夜色空间里延伸，镜头跟着飞，到站停住推近讲一段"
+            "；公司史 / 项目大事记 / 传记片头这类有先后顺序的内容最合适",
+            focus="＜主题＞",
+            preview="flight.png",
+            template=(
+                "用 demo_video 工具做一条时间线飞行短片，page=flight，style=dark。\n"
+                "主题：＜主题＞\n"
+                "要求：7-10 个镜头。第一个用 template=title 当开场"
+                "（title=标题，text=一句话概括这段历程）；"
+                "中间每个镜头是一个时间节点，用 template=quote，"
+                "year 写年份或年代（不确定就省略），title 一句话说清这一站（≤14字），"
+                "text 写 35-70 字讲发生了什么；最后用 template=outro 收一句总结。\n"
+                "不要编造具体日期、数字和引语。\n"
+                "照片：用户给了照片目录就传给 photos 参数；没给就直接出片，"
+                "站点旁边会留占位框，回头补图再渲染一次即可。"
+            ),
+        ),
+        Skill(
+            id="miniature_map",
+            group="视频出片",
+            label="迷你沙盘 · 白天治愈系 3D 地图",
+            hint="小路从乡村木屋走到城市高楼，箭头一路前进、到站落下图钉"
+            "；品牌故事 / 旅行回顾 / 成长历程，比夜景温柔",
+            focus="＜主题＞",
+            preview="miniature.png",
+            template=(
+                "用 demo_video 工具做一条迷你沙盘短片，page=miniature，style=dark"
+                "（沙盘固定是白天的治愈配色，style 只影响文案语气）。\n"
+                "主题：＜主题＞\n"
+                "要求：5-8 个镜头。第一个用 template=title 当开场"
+                "（title=标题，text=一句话概括这段路）；"
+                "中间每个镜头是路上的一站，用 template=quote，"
+                "title 一句话说清这一站（≤14字），text 写 35-70 字，"
+                "最好带具体的地点或画面；最后用 template=outro 收一句总结。\n"
+                "不要编造具体日期、数字和引语。\n"
+                "照片：用户给了照片目录就传给 photos 参数；没给就直接出片。"
             ),
         ),
     ]

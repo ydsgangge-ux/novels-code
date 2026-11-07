@@ -13,6 +13,7 @@ import json
 import sys
 from pathlib import Path
 
+from gangge.layer4_tools.storyboard.pages import NODE_PAGES, PAGE_KINDS
 from gangge.layer4_tools.storyboard.schema import DECOR_NAMES, STYLE_NAMES
 
 
@@ -86,19 +87,21 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-frames", action="store_true", help="保留 PNG 帧序列")
     p.add_argument(
         "--page",
-        choices=("storyboard", "showcase", "site", "person"),
+        choices=PAGE_KINDS,
         default="storyboard",
         help=(
             "拍哪种页面：朴素分镜页（默认）/ 3D 展示页 / 3D 展示页+真实网站截图（需 --url）"
-            " / 人物光线纪录片（一个人 → 一条光路穿过一生）"
+            " / 人物光线纪录片（俯视光路地图）"
+            " / 时间线飞行（Three.js 夜色光路）"
+            " / 迷你沙盘（白天治愈系，乡村→小镇→城市）"
         ),
     )
     p.add_argument(
         "--photos",
         metavar="DIR",
         help=(
-            "照片目录，只对 --page person 生效：按文件名顺序轮流发给每个人生节点；"
-            "不给就画占位框，没图也能出片"
+            f"照片目录，只对 --page {' / '.join(NODE_PAGES)} 生效："
+            "按文件名顺序轮流发给每个节点；不给就画占位框，没图也能出片"
         ),
     )
     p.add_argument(
@@ -229,10 +232,14 @@ async def _run(args: argparse.Namespace) -> int:
     elif args.aspect == "16:9":
         storyboard.width, storyboard.height = 1920, 1080
 
-    # 人物页的照片是可选输入：给了就轮流发到各节点，没给就画占位框。
+    # 节点型页面（人物 / 飞行 / 沙盘）的照片都是可选输入：
+    # 给了就轮流发到各节点，没给就画占位框。
     if args.photos:
-        if args.page != "person":
-            print("提示：--photos 只对 --page person 生效，已忽略", file=sys.stderr)
+        if args.page not in NODE_PAGES:
+            print(
+                f"提示：--photos 只对 {' / '.join(NODE_PAGES)} 生效，已忽略",
+                file=sys.stderr,
+            )
         else:
             from gangge.layer4_tools.storyboard.person import PersonPageError, assign_photos
 
@@ -285,6 +292,8 @@ async def _run(args: argparse.Namespace) -> int:
         "showcase": "3D 展示页",
         "site": "3D 展示页 + 网站截图",
         "person": "人物光线纪录片",
+        "flight": "时间线飞行（夜色光路）",
+        "miniature": "迷你沙盘（白天治愈系）",
     }[args.page]
     print(f"页面: {page_label}")
     print(f"输出: {out_dir}")

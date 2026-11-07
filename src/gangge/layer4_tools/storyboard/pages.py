@@ -5,11 +5,13 @@
 
 * ``pages/storyboard.html`` —— 朴素分镜页（逐镜头时间轴驱动）；
 * ``pages/showcase.html``   —— 3D 展示页（浏览器框 + 滚动即机位）；
-* ``pages/site_inner.html`` —— 网站截图内页（``__seek(t)`` 平移长图）。
+* ``pages/site_inner.html`` —— 网站截图内页（``__seek(t)`` 平移长图）；
+* ``pages/person.html``     —— 人物光线纪录片（俯视一张光路地图）；
+* ``pages/flight.html``     —— 时间线飞行页（Three.js 三维光路：夜色空间 / 白天沙盘）。
 
-``showcase`` 与 ``site`` 共用同一个外壳，区别只是框里装的东西——所以它们指向同一
-个文件，注册表里写明，::func:`gangge.layer4_tools.storyboard.pipeline.write_page`
-按名字取。
+``showcase`` 与 ``site`` 共用同一个外壳，区别只是框里装的东西；``flight`` 与
+``miniature`` 同理，共用一份 Three.js 引擎，只换世界——所以它们指向同一个文件，
+注册表里写明，:func:`gangge.layer4_tools.storyboard.pipeline.write_page` 按名字取。
 
 新增一种页面：放一个 ``.html`` 进来、在 ``TEMPLATES`` 里登记一行，CLI 的 ``--page``、
 ``demo_video`` 的 ``page`` 参数和技能菜单就都能选到它——不用再改渲染代码。
@@ -32,12 +34,25 @@ TEMPLATES: dict[str, str] = {
     "showcase": "showcase.html",
     "site": "showcase.html",
     "person": "person.html",
+    "flight": "flight.html",
+    "miniature": "flight.html",
     "site_inner": "site_inner.html",
     "studio": "studio.html",
 }
 
 #: 能拍成视频的页面（``site_inner`` 是内页片段，不是整页）。
-PAGE_KINDS: tuple[str, ...] = ("storyboard", "showcase", "site", "person")
+PAGE_KINDS: tuple[str, ...] = (
+    "storyboard",
+    "showcase",
+    "site",
+    "person",
+    "flight",
+    "miniature",
+)
+
+#: 吃"节点"分镜的页面：一个镜头 = 时间线上的一个站点。
+#: 写分镜的提示词、照片目录的分配规则都按这个集合判断，不各写一份。
+NODE_PAGES: tuple[str, ...] = ("person", "flight", "miniature")
 
 
 @lru_cache(maxsize=None)

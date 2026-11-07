@@ -40,6 +40,8 @@ class Shot:
     height: int
     scale: float
     page: str = "storyboard"
+    #: 截图取哪一刻。飞行页要停在某个站点上才好看，所以这一刻是按分镜算出来的。
+    at: float = SHOWCASE_AT
 
 
 def _portrait(style: str = "neon") -> Storyboard:
@@ -54,6 +56,66 @@ def _site(style: str = "neon") -> Storyboard:
     return sb
 
 
+def _journey() -> Storyboard:
+    """飞行页 / 沙盘页预览用的分镜：四个站点，正好是一段"历程"的样子。"""
+    return Storyboard.from_dict(
+        {
+            "title": "从一间小屋到一座城",
+            "subtitle": "十年，一直在往前走",
+            "style": "dark",
+            "scenes": [
+                {
+                    "template": "title",
+                    "title": "从一间小屋到一座城",
+                    "text": "十年，一直在往前走",
+                    "voiceover": "十年前，我们从山脚下的一间小屋出发。",
+                },
+                {
+                    "template": "quote",
+                    "year": "2015",
+                    "title": "山脚下的小屋",
+                    "text": "一台旧电脑，一个想把事情做好的念头。",
+                    "voiceover": "那时候只有一台旧电脑，和一个想把事情做好的念头。",
+                },
+                {
+                    "template": "quote",
+                    "year": "2018",
+                    "title": "搬进镇上",
+                    "text": "八个人，一间带院子的小楼。",
+                    "voiceover": "三年后我们搬进镇上一间带院子的小楼，团队有了八个人。",
+                },
+                {
+                    "template": "quote",
+                    "year": "2021",
+                    "title": "走进城市",
+                    "text": "第一次带着作品走进大城市。",
+                    "voiceover": "第一次带着作品走进大城市，站台很小，来看的人很多。",
+                },
+                {
+                    "template": "quote",
+                    "year": "2025",
+                    "title": "在一座城里",
+                    "text": "窗外是高楼，窗内还是那群人。",
+                    "voiceover": "现在我们在一座城里，窗外是高楼，窗内还是那群人。",
+                },
+                {
+                    "template": "outro",
+                    "title": "",
+                    "text": "路还长，继续走。",
+                    "voiceover": "路还长，我们继续往前走。",
+                },
+            ],
+        }
+    )
+
+
+def _station_at(sb: Storyboard, index: int = 1) -> float:
+    """分镜里第 ``index`` 个镜头的正中间——停站推近的那一刻。"""
+    slots = sb.timeline()
+    scene, start, end = slots[min(index, len(slots) - 1)]
+    return round((start + end) / 2, 2)
+
+
 def _shots() -> list[Shot]:
     shots = [
         # 1920×1080 → 768×432：右侧面板最宽 600px，这个尺寸放大看也不糊
@@ -62,6 +124,11 @@ def _shots() -> list[Shot]:
     shots.append(Shot("portrait", _portrait(), 1080, 1920, 0.5))
     shots.append(Shot("showcase", demo_storyboard("neon"), 1920, 1080, 0.4, page="showcase"))
     shots.append(Shot("site", _site(), 1920, 1200, 0.36, page="site"))
+    for page in ("flight", "miniature"):
+        journey = _journey()
+        shots.append(
+            Shot(page, journey, 1920, 1080, 0.4, page=page, at=_station_at(journey, 2))
+        )
     return shots
 
 
@@ -71,6 +138,11 @@ def _html_for(shot: Shot) -> str:
     slots = sb.timeline()
     if shot.page == "storyboard":
         return render_page(sb, slots)
+
+    if shot.page in ("flight", "miniature"):
+        from gangge.layer4_tools.storyboard.flight import render_flight
+
+        return render_flight(sb, slots, page=shot.page)
 
     from gangge.layer4_tools.storyboard.showcase import render_showcase
 
@@ -90,12 +162,24 @@ async def _shoot(shots: list[Shot], html_files: dict[str, Path]) -> None:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=["--hide-scrollbars"])
+        # 飞行页是 WebGL 场景：没有显卡的机器要靠 SwiftShader 软件渲染，否则拍到空画面
+        browser = await pw.chromium.launch(
+            args=[
+                "--hide-scrollbars",
+                "--use-angle=swiftshader",
+                "--enable-unsafe-swiftshader",
+                "--ignore-gpu-blocklist",
+            ]
+        )
         for shot in shots:
             page = await browser.new_page(
                 viewport={"width": shot.width, "height": shot.height},
                 device_scale_factor=shot.scale,
             )
+            # 飞行页认这个标记：关掉自带播放循环，只由 __seek 驱动。
+            # 别往 file:// URL 上挂 query，Chromium 会随机 net::ERR_FAILED。
+            if shot.page in ("flight", "miniature"):
+                await page.add_init_script("window.__CAPTURE_MODE__=true")
             await page.goto(html_files[shot.name].resolve().as_uri(), wait_until="load")
             await page.evaluate("() => document.fonts.ready")
             if shot.page == "storyboard":
@@ -108,10 +192,13 @@ async def _shoot(shots: list[Shot], html_files: dict[str, Path]) -> None:
                 start, end = scenes[0]["start"], scenes[0]["end"]
                 await page.evaluate("(t) => window.__seek(t)", min(start + SETTLE, end - 0.3))
             else:
-                # 展示页：等内页就绪再定位，否则拍到的是空框
-                await page.evaluate("() => window.__ready")
+                # 展示页等内页就绪；飞行页的 __ready 是函数，要调用才拿到 Promise
+                if shot.page in ("flight", "miniature"):
+                    await page.evaluate("() => window.__ready()")
+                else:
+                    await page.evaluate("() => window.__ready")
                 await page.evaluate("() => window.__hide_ui()")
-                await page.evaluate("(t) => window.__seek(t)", SHOWCASE_AT)
+                await page.evaluate("(t) => window.__seek(t)", shot.at)
             await page.wait_for_timeout(60)
             await page.screenshot(
                 path=str(PREVIEW_DIR / f"{shot.name}.png"),

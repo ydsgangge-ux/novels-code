@@ -129,6 +129,17 @@ def write_page(
             render_person(storyboard, slots, base_dir=out_dir), encoding="utf-8"
         )
         return person
+    # 飞行页同样是连续镜头，而且自带 Three.js 场景：引擎文件在 pages/flight.html，
+    # flight / miniature 两页只有世界不同。
+    if page in ("flight", "miniature"):
+        from gangge.layer4_tools.storyboard.flight import render_flight
+
+        target = out_dir / f"{page}.html"
+        target.write_text(
+            render_flight(storyboard, slots, page=page, base_dir=out_dir),
+            encoding="utf-8",
+        )
+        return target
     # 到这里才导入：showcase 自己也带命令行入口，模块级导入会让
     # ``python -m ...showcase`` 触发 runpy 的重复导入告警。
     from gangge.layer4_tools.storyboard.showcase import (

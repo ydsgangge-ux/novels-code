@@ -222,7 +222,7 @@ def test_schema_offers_person_and_photos():
 
 @pytest.mark.asyncio
 async def test_tool_preview_uses_the_person_prompt(tmp_path: Path):
-    """给 topic + page=person 时，模型收到的是"人生节点"提示词。"""
+    """给 topic + page=person 时，模型收到的是"时间节点"提示词，不是要点式分镜。"""
     seen: list[str] = []
 
     class _Recorder:
@@ -238,7 +238,8 @@ async def test_tool_preview_uses_the_person_prompt(tmp_path: Path):
     )
 
     assert not result.is_error, result.output
-    assert "人生节点" in seen[0]
+    assert "时间节点" in seen[0]
+    assert "bullets" not in seen[0]  # 要点式分镜喂给光路页会变成一串孤立的观点
     assert (tmp_path / "out" / "person.html").is_file()
 
 
