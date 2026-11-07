@@ -2,6 +2,7 @@
 
 素材由使用者自己提供，放在 .gangge_data/pet/<动作>/ 下（mp4 / webm / mov /
 gif / png 都行），程序用 imageio-ffmpeg 逐帧解码后绘到透明窗口上。
+仓库里另带一套内置素材（desktop/assets/pet），用户目录为空时用它兜底。
 
 动作约定（目录名即状态名）：
     idle      空闲（必须，其它动作缺失时都用它兜底）
@@ -64,6 +65,8 @@ _README = """桌宠素材说明
 ================
 
 每个动作一个文件夹，把视频/动图丢进去就能用（mp4 / webm / mov / gif / png）。
+程序自带 idle / working / error 三个动作的内置素材（desktop/assets/pet），
+你自己放进这个目录的文件会优先播放，内置素材只在这个动作没文件时兜底。
 
   idle/      空闲 —— 必须有，其它动作没有素材时都用它
   thinking/  你按下发送、模型还在想
@@ -105,11 +108,17 @@ def default_asset_root() -> Path:
         return home
 
 
+def bundled_asset_root() -> Path:
+    """随仓库发布的内置素材（desktop/assets/pet），保证开箱就有东西可播。"""
+    return Path(__file__).resolve().parent / "assets" / "pet"
+
+
 class PetAssets:
-    """扫描素材目录，按动作归类。"""
+    """扫描素材目录，按动作归类：用户素材优先，内置素材兜底。"""
 
     def __init__(self, root: Path | None = None):
         self.root = root or default_asset_root()
+        self.bundled = bundled_asset_root()
         self.ensure()
 
     def ensure(self) -> None:
@@ -123,8 +132,8 @@ class PetAssets:
         except OSError:
             pass
 
-    def files(self, action: str) -> list[Path]:
-        folder = self.root / action
+    @staticmethod
+    def _scan(folder: Path) -> list[Path]:
         if not folder.is_dir():
             return []
         try:
@@ -140,6 +149,12 @@ class PetAssets:
                 continue
             result.append(p)
         return sorted(result, key=lambda p: p.name.lower())
+
+    def files(self, action: str) -> list[Path]:
+        """用户目录里的素材排前面，内置素材跟在后面兜底。"""
+        mine = self._scan(self.root / action)
+        builtin = self._scan(self.bundled / action) if self.bundled != self.root else []
+        return mine + builtin
 
     def count(self, action: str) -> int:
         return len(self.files(action))
@@ -201,6 +216,13 @@ def probe_video_size(path: str | Path) -> tuple[int, int]:
     return w, h
 
 
+def _decoder_candidates(path: str) -> list[list[str]]:
+    """带 alpha 的 webm 必须用 libvpx 解码器，ffmpeg 内置解码器会丢掉透明通道。"""
+    if Path(path).suffix.lower() == ".webm":
+        return [["-c:v", "libvpx-vp9"], ["-c:v", "libvpx"], []]
+    return [[]]
+
+
 class FrameThread(QThread):
     """后台解码：自己起 ffmpeg 输出 RGBA rawvideo，逐帧推给 UI。
 
@@ -241,9 +263,12 @@ class FrameThread(QThread):
         target_fps = max(1.0, min(float(MAX_FPS), src_fps))
         frame_interval = 1.0 / target_fps
 
+        candidates = _decoder_candidates(self._path)
+        cand = 0
         while not self._stop:
             cmd = [
                 _ffmpeg_exe(), "-hide_banner", "-v", "error",
+                *candidates[cand],
                 "-i", self._path,
                 "-an",                                        # 丢掉音轨，避免干扰数据流
                 "-vf", f"scale=-2:min({MAX_SIDE}\\,ih)",       # 大视频先缩小再传
@@ -289,6 +314,9 @@ class FrameThread(QThread):
                 except Exception:
                     pass
 
+            if frames == 0 and cand + 1 < len(candidates):
+                cand += 1          # 这个解码器一帧都没解出来，换下一个
+                continue
             if self._stop or not self._loop or frames <= 1:
                 return
             self.msleep(40)
