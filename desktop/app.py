@@ -121,6 +121,7 @@ from gangge.layer4_tools.qoder_cli.config import (
     STRENGTHS as QODER_STRENGTHS,
 )
 from skill_preview import SkillEffectPanel
+from git_panel import GitRepo, SourceControlPanel, confirm_security
 
 # ── LLM Provider definitions ─────────────────────────────────────
 PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
@@ -1512,7 +1513,8 @@ class GanggeWorker(QThread):
 #  File Browser Widget
 # ═════════════════════════════════════════════════════════════════
 class FileBrowserWidget(QWidget):
-    file_selected = pyqtSignal(str)
+    file_selected = pyqtSignal(str)     # 单击 → 右侧预览
+    file_activated = pyqtSignal(str)    # 双击 → 交给系统默认程序打开
 
     FILE_ICONS = {
         ".py": "🐍", ".js": "📜", ".ts": "📘", ".jsx": "⚛️", ".tsx": "⚛️",
@@ -1534,26 +1536,36 @@ class FileBrowserWidget(QWidget):
     FOLDER_ICON = "📁"
     FOLDER_OPEN_ICON = "📂"
     DEFAULT_FILE_ICON = "📄"
+    MAX_CHILDREN = 600   # 单个目录最多列出的条目数，避免展开超大目录时卡顿
 
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        # 顶部：标题 + 手动刷新按钮
+        # 顶部：标题 + 打开目录 / 刷新按钮
         header = QHBoxLayout()
         title = QLabel("项目文件")
         title.setStyleSheet("color:#8b949e;font-size:12px;font-weight:600;")
-        self._btn_refresh = QPushButton("🔄 刷新")
-        self._btn_refresh.setFixedSize(64, 24)
-        self._btn_refresh.setStyleSheet(
+        _hdr_btn_style = (
             "QPushButton{background:#21262d;color:#c9d1d9;border:1px solid #30363d;"
             "border-radius:4px;font-size:12px;}"
             "QPushButton:hover{background:#30363d;}"
         )
+        self._btn_open_dir = QPushButton("🗂️")
+        self._btn_open_dir.setFixedSize(28, 24)
+        self._btn_open_dir.setToolTip("在资源管理器中打开当前目录")
+        self._btn_open_dir.setStyleSheet(_hdr_btn_style)
+        self._btn_open_dir.clicked.connect(
+            lambda: self.reveal_in_explorer(self._root_path) if self._root_path else None
+        )
+        self._btn_refresh = QPushButton("🔄 刷新")
+        self._btn_refresh.setFixedSize(64, 24)
+        self._btn_refresh.setStyleSheet(_hdr_btn_style)
         self._btn_refresh.clicked.connect(self.refresh)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self._btn_open_dir)
         header.addWidget(self._btn_refresh)
         layout.addLayout(header)
 
@@ -1564,6 +1576,9 @@ class FileBrowserWidget(QWidget):
         self._tree.itemExpanded.connect(self._on_expand)
         self._tree.itemCollapsed.connect(self._on_collapse)
         self._tree.itemClicked.connect(self._on_click)
+        self._tree.itemDoubleClicked.connect(self._on_double_click)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self._tree.setStyleSheet(
             "QTreeWidget{background:#0d1117;border:1px solid #21262d;border-radius:6px;"
             "color:#c9d1d9;outline:none;}"
@@ -1600,25 +1615,37 @@ class FileBrowserWidget(QWidget):
         root_item.setExpanded(True)
 
     def _populate(self, parent_item, dir_path, depth):
-        if depth > 4:
+        if depth > 8:
             return
         try:
             entries = sorted(Path(dir_path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-        except PermissionError:
+        except (PermissionError, OSError):
             return
-        hidden = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".idea"}
+        shown = 0
         for entry in entries:
-            if entry.name.startswith(".") and entry.name != ".env":
+            if shown >= self.MAX_CHILDREN:
+                more = QTreeWidgetItem([f"… 还有 {len(entries) - shown} 项未显示"])
+                more.setForeground(0, QColor("#484f58"))
+                parent_item.addChild(more)
+                break
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
                 continue
-            if entry.name in hidden:
-                continue
-            icon = self._get_icon(entry)
+            icon = self.FOLDER_ICON if is_dir else self._get_icon(entry)
             child = QTreeWidgetItem([f"{icon} {entry.name}"])
             child.setData(0, Qt.ItemDataRole.UserRole, str(entry))
-            if entry.is_dir():
+            # 隐藏项（以 . 开头，如 .git / .venv）照常列出，仅用灰字区分
+            if entry.name.startswith("."):
+                child.setForeground(0, QColor("#8b949e"))
+                child.setToolTip(0, f"{entry}\n（隐藏项）")
+            else:
+                child.setToolTip(0, str(entry))
+            if is_dir:
                 child.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
                 child.addChild(QTreeWidgetItem(["(loading)"]))
             parent_item.addChild(child)
+            shown += 1
 
     def _on_expand(self, item):
         text = item.text(0)
@@ -1648,6 +1675,60 @@ class FileBrowserWidget(QWidget):
         path = item.data(0, Qt.ItemDataRole.UserRole) or ""
         if path and os.path.isfile(path):
             self.file_selected.emit(path)
+
+    def _on_double_click(self, item, col):
+        """双击：文件 → 交给系统默认程序；文件夹 → 展开/收起。"""
+        path = item.data(0, Qt.ItemDataRole.UserRole) or ""
+        if not path:
+            return
+        if os.path.isfile(path):
+            self.file_activated.emit(path)
+        elif os.path.isdir(path):
+            item.setExpanded(not item.isExpanded())
+
+    def _on_context_menu(self, pos):
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+        path = item.data(0, Qt.ItemDataRole.UserRole) or ""
+        if not path:
+            return
+        is_dir = os.path.isdir(path)
+        menu = QMenu(self)
+        act_open = menu.addAction("🚀 用默认程序打开" if not is_dir else "📂 展开/收起")
+        act_reveal = menu.addAction("🗂️ 在资源管理器中显示")
+        act_copy = menu.addAction("📋 复制路径")
+        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen is act_open:
+            if is_dir:
+                item.setExpanded(not item.isExpanded())
+            else:
+                self.file_activated.emit(path)
+        elif chosen is act_reveal:
+            self.reveal_in_explorer(path)
+        elif chosen is act_copy:
+            QApplication.clipboard().setText(path)
+
+    def reveal_in_explorer(self, path: str):
+        """在系统文件管理器中定位文件/文件夹（Windows 下自动选中）。"""
+        try:
+            if sys.platform.startswith("win"):
+                import subprocess
+                if os.path.isdir(path):
+                    subprocess.Popen(["explorer", os.path.normpath(path)])
+                else:
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", "-R", path])
+            else:
+                from PyQt6.QtCore import QUrl
+                from PyQt6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(QUrl.fromLocalFile(
+                    path if os.path.isdir(path) else os.path.dirname(path)
+                ))
+        except Exception:
+            pass
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -6173,6 +6254,7 @@ class GanggeDesktop(QMainWindow):
             "border-bottom:none;padding:6px 16px;font-size:11px;}"
             "QTabBar::tab:selected{background:#0d1117;color:#f0f6fc;border-bottom:2px solid #f78166;}"
         )
+        self._sidebar_tabs = sidebar_tabs
 
         # ── Sessions tab ──
         sess_tab = QWidget()
@@ -6186,10 +6268,14 @@ class GanggeDesktop(QMainWindow):
             "QListWidget::item:selected{background:#1f6feb;color:#fff;}"
         )
         self._session_list.itemClicked.connect(self._on_session_clicked)
+        self._session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._session_list.customContextMenuRequested.connect(self._on_session_context_menu)
         sess_lay.addWidget(self._session_list)
         sess_btn_row = QHBoxLayout()
         for text, tip, cb in [
             ("➕", _t("sidebar_new"), lambda: self._new_session()),
+            ("🆕", "新建会话 + 新建项目文件夹（清空当前目录地址）",
+             lambda: self._new_session_with_project()),
             ("✏️", _t("sidebar_rename"), lambda: self._rename_session()),
             ("🗑️", _t("sidebar_delete"), lambda: self._delete_session()),
         ]:
@@ -6233,8 +6319,16 @@ class GanggeDesktop(QMainWindow):
             "FileBrowserWidget{background:#0d1117;border:1px solid #21262d;border-radius:4px;color:#c9d1d9;}"
         )
         self._file_browser.file_selected.connect(self._on_file_selected)
+        self._file_browser.file_activated.connect(self._on_file_activated)
         fl.addWidget(self._file_browser)
         sidebar_tabs.addTab(files_tab, "📂 文件")
+
+        # ── Source control tab（版本管理）──
+        self._sc_panel = SourceControlPanel()
+        self._sc_panel.status_changed.connect(self._on_sc_status)
+        self._sc_panel.notify.connect(self._on_sc_notify)
+        self._sc_panel.push_requested.connect(self._git_push)
+        sidebar_tabs.addTab(self._sc_panel, "🔀 版本")
 
         # ── Novel tab ──
         self._novel_sidebar = NovelSidebarPanel()
@@ -6490,6 +6584,10 @@ class GanggeDesktop(QMainWindow):
         )
         self._ws_input.textChanged.connect(
             lambda: self._novel_sidebar.set_workspace(self._ws_input.text())
+        )
+        # 工作目录变化 → 版本管理面板跟着刷新
+        self._ws_input.textChanged.connect(
+            lambda: self._sc_panel.set_workspace(self._ws_input.text())
         )
         self._ws_input.textChanged.connect(
             lambda: self._on_workspace_changed()
@@ -7069,51 +7167,170 @@ class GanggeDesktop(QMainWindow):
 
     # ── Session ───────────────────────────────────────────────
     def _new_session(self):
+        # 新建会话时先决定用哪个项目文件夹，绝不复用旧项目当默认（想复用可以显式选）
+        cur_ws = self._ws_input.text().strip()
+        box = QMessageBox(self)
+        box.setWindowTitle("新建会话")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("这个会话在哪个项目文件夹里工作？")
+        box.setInformativeText(
+            f"当前项目：{cur_ws or '（未选择）'}\n"
+            "「新建项目文件夹」会在 gangge_projects 下创建一个全新的项目目录。"
+        )
+        btn_new = box.addButton("🆕 新建项目文件夹", QMessageBox.ButtonRole.AcceptRole)
+        btn_reuse = box.addButton("📂 沿用当前项目", QMessageBox.ButtonRole.ActionRole)
+        btn_reuse.setEnabled(bool(cur_ws) and os.path.isdir(cur_ws))
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_new)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is btn_new:
+            default_name = f"project_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            name, ok = QInputDialog.getText(
+                self, "新建项目",
+                "项目文件夹名（保存在 gangge_projects 下）：",
+                text=default_name,
+            )
+            if not ok:
+                return
+            name = (name or "").strip().replace("/", "_").replace("\\", "_")
+            if not name:
+                return
+            ws = self._create_project_dir(Path.cwd() / "gangge_projects" / name)
+        elif clicked is btn_reuse:
+            ws = cur_ws
+        else:
+            return
+        if not ws:
+            return
+        self._start_session(ws)
+
+    def _new_session_with_project(self):
+        """一键：清空当前目录地址 → 新建项目文件夹 → 新建会话绑定它。"""
+        self._ws_input.clear()
+        ws = self._create_project_dir(
+            Path.cwd() / "gangge_projects" / f"project_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        if not ws:
+            return
+        self._start_session(ws)
+
+    def _start_session(self, workspace: str):
+        """用指定项目文件夹新建一个会话并选中它。"""
         self._clear_output()
         self._tool_panel.clear_entries()
-        ws = self._ws_input.text().strip()
-        sid = self._db.create_session(_t("session_new"), ws)
+        sid = self._db.create_session(_t("session_new"), workspace)
         self._current_session_id = sid
-        self._refresh_session_list()
-        # Select the new session in the list
-        for i in range(self._session_list.count()):
-            item = self._session_list.item(i)
-            if item and item.data(Qt.ItemDataRole.UserRole) == sid:
-                self._session_list.setCurrentItem(item)
-                break
+        self._refresh_session_list()   # 当前会话会被高亮选中
         self._status_label.setText(_t("status_new_session", sid=sid))
 
     def _refresh_session_list(self):
+        """刷新会话列表。
+
+        始终列出**全部**会话（不按当前工作目录过滤）：点击会话只是把它
+        绑定的项目文件夹同步到左侧文件窗口，绝不会把列表缩窄。
+        """
         self._session_list.clear()
-        # 按当前工作目录过滤，只显示属于该目录的会话
-        current_ws = self._ws_input.text().strip()
-        sessions = self._db.list_sessions(50, workspace=current_ws)
+        sessions = self._db.list_sessions(50)
+        current_item = None
         for s in sessions:
-            ws_tag = " 📁" if s["workspace"] else ""
-            label = f"{s['title'][:30]}  ({s['updated_at'][:16]}){ws_tag}"
+            ws = (s.get("workspace") or "").strip()
+            title = (s["title"] or "未命名")[:22]
+            label = f"{title}  ({(s.get('updated_at') or '')[:16]})"
+            if ws:
+                ws_name = os.path.basename(os.path.normpath(ws)) or ws
+                label += f"  📁{ws_name}"
+            else:
+                label += "  ⚠未绑定"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, s["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1, s["title"])
+            item.setToolTip(ws or "该会话没有记录项目文件夹（右键可把当前目录绑定给它）")
             self._session_list.addItem(item)
+            if s["id"] == self._current_session_id:
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+                item.setForeground(QColor("#f0f6fc"))
+                current_item = item
+            elif not ws:
+                item.setForeground(QColor("#8b949e"))
 
-        # 如果当前工作目录有会话，在列表底部加分隔提示
-        if current_ws and sessions:
+        if current_item is not None:
+            self._session_list.setCurrentItem(current_item)
+
+        # 底部统计（全部会话数）
+        if sessions:
             sep = QListWidgetItem(_t("session_count", n=len(sessions)))
             sep.setFlags(sep.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             sep.setForeground(QColor("#666666"))
             self._session_list.addItem(sep)
 
+    def _ensure_workspace(self) -> str:
+        """返回当前工作目录；完全没有选择目录时才创建新项目目录（兜底用）。"""
+        ws = self._ws_input.text().strip()
+        if ws:
+            return ws
+        return self._create_project_dir(
+            Path.cwd() / "gangge_projects" / f"project_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+
+    def _create_project_dir(self, path: Path) -> str:
+        """创建项目目录并切换过去，返回路径（失败返回空串）。"""
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "新建项目", f"创建项目文件夹失败:\n{path}\n\n{e}")
+            return ""
+        ws = str(path)
+        self._ws_input.setText(ws)
+        self._file_browser.set_root(ws)
+        if hasattr(self, "_status_label"):
+            self._status_label.setText(f"📁 新建项目: {ws}")
+        return ws
+
+    def _sync_session_workspace(self, sid: str, session: dict | None = None) -> str:
+        """把会话记录的项目文件夹加载到左侧文件窗口，返回加载的路径。
+
+        只读取、不改写：旧会话没有记录目录时保持当前项目不变，
+        避免新建/切换会话时被意外绑到旧文件夹上。
+        """
+        sess = session if session is not None else self._db.get_session(sid)
+        ws = ((sess or {}).get("workspace") or "").strip()
+        if not ws:
+            return ""
+        if not os.path.isdir(ws):
+            if hasattr(self, "_status_label"):
+                self._status_label.setText(f"⚠ 项目文件夹不存在: {ws}")
+            return ""
+        cur = self._ws_input.text().strip()
+        if cur and os.path.normcase(os.path.normpath(cur)) == os.path.normcase(os.path.normpath(ws)):
+            self._file_browser.set_root(ws)  # 同目录也刷新一次，反映磁盘变化
+        else:
+            self._ws_input.setText(ws)       # textChanged → 刷新文件树
+            self._file_browser.set_root(ws)
+        return ws
+
     def _on_session_clicked(self, item):
         sid = item.data(Qt.ItemDataRole.UserRole)
-        if not sid or sid == self._current_session_id:
+        if not sid:
+            return
+        if sid == self._current_session_id:
+            # 已是当前会话：仍确保文件窗口停在它绑定的项目目录
+            self._sync_session_workspace(sid)
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._refresh_session_list)
             return
 
-        # Save current session messages
-        self._save_current_session_messages()
-
-        # Load new session
+        # 注意：切换会话不写库、不更新时间戳（避免点击就把会话顶到列表最前）
         self._current_session_id = sid
         self._clear_output()
+
+        # 先把会话的项目文件夹同步到左侧文件窗口（必须在恢复历史之前：
+        # 切换工作目录会清空 _conversation_history）
+        sess = self._db.get_session(sid)
+        self._sync_session_workspace(sid, session=sess)
 
         # ── CHANGE: 方案C — load_turns 重建对话历史 ──────────
         turn_msgs = self._db.load_turns(sid, limit=self._db.MAX_LOAD_MESSAGES)
@@ -7157,16 +7374,55 @@ class GanggeDesktop(QMainWindow):
         # ── 恢复 _conversation_history（修跨会话失忆 bug） ──
         self._restore_conversation_history(sid, turn_msgs)
 
-        # Restore session workspace if set
-        sess = self._db.get_session(sid)
-        if sess and sess["workspace"]:
-            old_ws = self._ws_input.text().strip()
-            if sess["workspace"] != old_ws:
-                self._ws_input.setText(sess["workspace"])
-                self._file_browser.set_root(sess["workspace"])
-                self._refresh_session_list()  # 工作目录变了 → 刷新会话列表
-
         self._status_label.setText(_t("status_session", title=sess['title'] if sess else sid))
+        # 刷新高亮/文件夹标记（列表内容仍是全部会话，不会缩窄）
+        self._refresh_session_list()
+
+    def _on_session_context_menu(self, pos):
+        """会话列表右键：加载项目文件夹、资源管理器、重命名、删除。"""
+        item = self._session_list.itemAt(pos)
+        if item is None:
+            return
+        sid = item.data(Qt.ItemDataRole.UserRole)
+        if not sid:
+            return
+        sess = self._db.get_session(sid) or {}
+        ws = (sess.get("workspace") or "").strip()
+        has_ws = bool(ws) and os.path.isdir(ws)
+        cur_ws = self._ws_input.text().strip()
+        cur_name = os.path.basename(os.path.normpath(cur_ws)) or cur_ws if cur_ws else ""
+
+        menu = QMenu(self)
+        act_open = menu.addAction("📂 加载项目文件夹到文件窗口")
+        act_open.setEnabled(has_ws)
+        act_reveal = menu.addAction("🗂️ 在资源管理器中打开")
+        act_reveal.setEnabled(has_ws)
+        act_bind = menu.addAction(f"🔗 把当前目录绑定给该会话（{cur_name}）" if cur_name else "🔗 把当前目录绑定给该会话")
+        act_bind.setEnabled(bool(cur_ws) and os.path.isdir(cur_ws))
+        menu.addSeparator()
+        act_rename = menu.addAction("✏️ 重命名会话")
+        act_delete = menu.addAction("🗑️ 删除会话")
+
+        chosen = menu.exec(self._session_list.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_open:
+            self._sync_session_workspace(sid, session=sess)
+            self._sidebar_tabs.setCurrentIndex(1)   # 切到「文件」页
+            self._refresh_session_list()
+        elif chosen is act_reveal:
+            self._file_browser.reveal_in_explorer(ws)
+        elif chosen is act_bind:
+            self._db.update_session(sid, workspace=cur_ws)
+            self._sync_session_workspace(sid)
+            self._refresh_session_list()
+            self._status_label.setText(f"🔗 已绑定项目文件夹: {cur_ws}")
+        elif chosen is act_rename:
+            self._session_list.setCurrentItem(item)
+            self._rename_session()
+        elif chosen is act_delete:
+            self._session_list.setCurrentItem(item)
+            self._delete_session()
 
     def _restore_conversation_history(self, sid: str, turn_msgs: list[dict]):
         """从 DB 恢复对话历史，解决跨会话失忆问题。
@@ -7290,12 +7546,13 @@ class GanggeDesktop(QMainWindow):
             self._refresh_session_list()
 
     def _save_current_session_messages(self):
-        """Save current output to session DB."""
-        if not self._current_session_id:
-            return
-        # We already save incrementally in _append_output, so this is a no-op
-        # But we update the session timestamp
-        self._db.update_session(self._current_session_id, updated_at=datetime.now().isoformat())
+        """空操作：消息已在 save_turn（每轮结束）里写入数据库。
+
+        注意：这里绝不能更新 sessions.updated_at —— 否则"点一下会话"
+        就会刷新时间，旧会话被顶到列表最上面，按时间就找不到了。
+        时间只在真正产生对话内容时（save_turn）才更新。
+        """
+        return
 
     # ── Skills (常用工作流下拉) ────────────────────────────────
     def _refresh_skill_menu(self):
@@ -7642,6 +7899,15 @@ class GanggeDesktop(QMainWindow):
         if not sg.is_available() and not sg.ensure_init(user_name=gh_user, user_email=gh_email):
             self._status_label.setText(_t("status_git_no_repo"))
             return
+        # 🔒 提交前安全检查：拦住 .env / 私钥 / Token 之类不该进版本库的东西
+        try:
+            pending = GitRepo(workspace).changed_paths()
+        except Exception:
+            pending = []
+        if not confirm_security(self, workspace, pending):
+            self._status_label.setText("已取消提交（安全检查未通过）")
+            self._append_output("⛔ 提交已取消：安全检查发现敏感内容\n", "system")
+            return
         message, ok = QInputDialog.getText(
             self, _t("git_save_title"),
             _t("git_save_prompt"),
@@ -7717,6 +7983,15 @@ class GanggeDesktop(QMainWindow):
         # Step 2: Auto-commit uncommitted changes
         status_info = sg.status()
         if status_info.get("changed_files", 0) > 0:
+            # 🔒 推送前先对要提交的改动做安全检查
+            try:
+                pending = GitRepo(workspace).changed_paths()
+            except Exception:
+                pending = []
+            if not confirm_security(self, workspace, pending):
+                self._status_label.setText("已取消推送（安全检查未通过）")
+                self._append_output("⛔ 推送已取消：安全检查发现敏感内容\n", "system")
+                return
             reply = QMessageBox.question(
                 self, _t("git_autocommit_title"),
                 _t("git_autocommit_msg", n=status_info["changed_files"]),
@@ -7754,7 +8029,16 @@ class GanggeDesktop(QMainWindow):
             remote_url = url
             self._append_output(_t("git_remote_set", url=remote_url), "system")
 
-        # Step 4: Push
+        # Step 4: Push —— 上传前再扫一遍即将推送的提交内容
+        try:
+            outgoing = GitRepo(workspace).outgoing_files()
+        except Exception:
+            outgoing = []
+        if outgoing and not confirm_security(self, workspace, outgoing):
+            self._status_label.setText("已取消推送（安全检查未通过）")
+            self._append_output("⛔ 推送已取消：待推送的提交里存在敏感内容\n", "system")
+            return
+
         branch = sg.get_current_branch()
         self._status_label.setText(_t("status_git_pushing"))
         QApplication.processEvents()
@@ -7777,8 +8061,28 @@ class GanggeDesktop(QMainWindow):
                 self._append_output(_t("git_push_fail", error=err), "system")
         self._update_git_status()
 
+    def _on_sc_status(self, summary: str):
+        """版本面板刷新后，同步工具栏的分支标签。"""
+        if not hasattr(self, "_git_branch_label"):
+            return
+        if summary:
+            self._git_branch_label.setText(f"🔀 {summary}")
+            self._git_branch_label.setStyleSheet("color:#58a6ff;font-size:11px;padding:0 6px;")
+            self._git_branch_label.setVisible(True)
+        else:
+            self._git_branch_label.setVisible(False)
+
+    def _on_sc_notify(self, message: str):
+        """版本面板里的提交结果 → 状态栏 + 输出区。"""
+        if hasattr(self, "_status_label"):
+            self._status_label.setText(message)
+        self._append_output(message + "\n", "system")
+        self._update_git_status()
+
     def _update_git_status(self):
         workspace = self._ws_input.text().strip()
+        if hasattr(self, "_sc_panel"):
+            self._sc_panel.set_workspace(workspace)   # 同目录时面板内部会跳过
         if not workspace:
             self._git_branch_label.setVisible(False)
             return
@@ -8147,6 +8451,23 @@ class GanggeDesktop(QMainWindow):
 
     def _append_system_msg(self, msg: str):
         self._output.append(f'<p style="color:#8b949e;font-style:italic;">{msg}</p>')
+
+    def _on_file_activated(self, file_path: str):
+        """文件树双击 → 用系统默认程序打开（省得去资源管理器里逐层找）。"""
+        p = Path(file_path)
+        if not p.is_file():
+            return
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(p))  # type: ignore[attr-defined]  # Windows 专用
+            else:
+                from PyQt6.QtCore import QUrl
+                from PyQt6.QtGui import QDesktopServices
+
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+            self._status_label.setText(f"📄 已用默认程序打开: {p.name}")
+        except Exception as e:
+            QMessageBox.warning(self, "打开失败", f"无法打开文件:\n{p}\n\n{e}")
 
     def _on_file_selected(self, file_path: str):
         try:
@@ -8554,7 +8875,7 @@ class GanggeDesktop(QMainWindow):
 
         # Create a new session for batch if none exists
         if not self._current_session_id:
-            ws = self._ws_input.text().strip()
+            ws = self._ensure_workspace()
             self._current_session_id = self._db.create_session("批量任务", ws)
             self._refresh_session_list()
 
@@ -8569,16 +8890,12 @@ class GanggeDesktop(QMainWindow):
             os.environ["GANGGE_WORKSPACE"] = workspace
 
     def _execute_single(self, llm: BaseLLM, task: str, batch_index: int = 0, batch_total: int = 1):
-        workspace = self._ws_input.text().strip()
-        if not workspace:
-            # Auto-create project folder
-            from datetime import datetime
-            ws_dir = Path.cwd() / "gangge_projects" / f"project_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            ws_dir.mkdir(parents=True, exist_ok=True)
-            workspace = str(ws_dir)
-            self._ws_input.setText(workspace)
-            self._file_browser.set_root(workspace)
-            self._status_label.setText(f"📁 自动创建项目: {workspace}")
+        workspace = self._ensure_workspace() or str(Path.cwd())
+        # 手动输入的新路径可能还不存在 → 自动建出来
+        try:
+            Path(workspace).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         auto_allow = self._auto_allow_cb.isChecked()
         plan_mode = self._plan_mode_cb.isChecked()
         extra_prompt = self._extra_prompt.toPlainText().strip()
@@ -8592,7 +8909,7 @@ class GanggeDesktop(QMainWindow):
         # ── Project context will be built in Worker thread to avoid blocking UI ──
         auto_inject = self._auto_inject_cb.isChecked()
 
-        # Create session if none
+        # Create session if none（已有会话保持它自己记录的项目文件夹，不自动改写）
         if not self._current_session_id:
             self._current_session_id = self._db.create_session(task[:40], workspace)
             self._refresh_session_list()
