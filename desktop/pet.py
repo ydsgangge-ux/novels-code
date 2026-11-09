@@ -507,8 +507,9 @@ class PetWindow(QWidget):
         self._matte_thread: MatteThread | None = None
         self._matte_note = ""       # 抠像进度提示，画在画面底部
 
-        size = int(self._settings.value("pet/size", 220) or 220)
-        self.resize(size, size)
+        # 这个值是"最长边"的像素数：横躺/宽幅素材会按宽度收敛，不会把窗口撑得特别大
+        self._size = int(self._settings.value("pet/size", 220) or 220)
+        self.resize(self._size, self._size)
 
         self._revert_timer = QTimer(self)
         self._revert_timer.setSingleShot(True)
@@ -621,12 +622,12 @@ class PetWindow(QWidget):
 
     def _on_frame(self, img: QImage):
         self._pixmap = QPixmap.fromImage(img)
-        # 按素材宽高比调整窗口，别让角色被挤成很小一块
+        # 按素材宽高比调整窗口，保证角色不被拉伸
         if img.height() > 0:
             aspect = img.width() / img.height()
             if abs(aspect - self._aspect) > 0.01:
                 self._aspect = aspect
-                self.resize(max(48, int(round(self.height() * aspect))), self.height())
+                self._fit_window()
         self.update()
         if self._thread is not None:
             self._thread.ack()      # 告诉解码线程可以取下一帧了
@@ -730,7 +731,7 @@ class PetWindow(QWidget):
     def wheelEvent(self, event):  # noqa: N802
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             sizes = self.SIZES
-            idx = min(range(len(sizes)), key=lambda i: abs(sizes[i] - self.width()))
+            idx = min(range(len(sizes)), key=lambda i: abs(sizes[i] - self._size))
             idx = max(0, min(len(sizes) - 1, idx + (-1 if event.angleDelta().y() > 0 else 1)))
             self._resize_to(sizes[idx])
             event.accept()
@@ -749,10 +750,30 @@ class PetWindow(QWidget):
         self.update()
 
     def _resize_to(self, size: int):
-        """size 指高度，宽度按素材比例算。"""
-        self.resize(max(48, int(round(size * self._aspect))), size)
+        """size 指最长边，另一条边按素材比例算。"""
+        self._size = size
         self._settings.setValue("pet/size", size)
+        self._fit_window()
         self.update()
+
+    def _fit_window(self):
+        """把窗口收敛到 size×size 的方框里：宽幅素材按宽度算，竖幅按高度算。
+
+        以前固定"高度 = size、宽度随比例无限长"，横躺的 sleep 素材会被放大成
+        一张 430px 宽的大图；现在最长边不超过 size，各动作看起来一样大。
+        """
+        size = max(48, int(self._size))
+        aspect = self._aspect if self._aspect > 0 else 1.0
+        if aspect >= 1.0:
+            w, h = size, max(24, int(round(size / aspect)))
+        else:
+            w, h = max(24, int(round(size * aspect))), size
+        if (w, h) == (self.width(), self.height()):
+            return
+        # 以"脚底中点"为锚点缩放：换个动作时角色不会整体上下乱跳
+        foot = QPoint(self.geometry().center().x(), self.geometry().bottom())
+        self.resize(w, h)
+        self.move(foot.x() - w // 2, foot.y() - h + 1)
 
     def contextMenuEvent(self, event):  # noqa: N802
         menu = QMenu(self)
@@ -779,7 +800,7 @@ class PetWindow(QWidget):
         for size in self.SIZES:
             act = size_menu.addAction(f"{size} px")
             act.setCheckable(True)
-            act.setChecked(self.width() == size)
+            act.setChecked(self._size == size)
             act.triggered.connect(lambda _checked=False, s=size: self._resize_to(s))
         menu.addAction("❌ 关闭桌宠", self.hide)
         menu.exec(event.globalPos())
