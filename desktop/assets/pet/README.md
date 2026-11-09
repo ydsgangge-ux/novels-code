@@ -6,9 +6,12 @@ action: `idle/`, `thinking/`, `working/`, `success/`, `error/`, `sleep/`.
 Currently shipped: `idle`, `working`, `error` (VP9 + alpha WebM, ~200 KB each).
 Missing actions fall back to `idle`.
 
-These are only fallbacks. Files in `.gangge_data/pet/<action>/` win over the
-bundled ones and are picked first, so you can drop your own clips there without
-touching the repo (that folder is git-ignored).
+**This folder is never played directly.** On first launch the files are copied
+into the user's asset folder `.gangge_data/pet/<action>/`, so they show up where
+users expect them and can be deleted there with a right-click → "打开素材文件夹".
+Deleting a copied file keeps it deleted; right-click → "恢复内置表情" copies the
+missing ones back. Only actions that are still empty get seeded, so your own
+clips are never overwritten.
 
 To convert a solid-background clip, right-click the pet window →
 "自动抠像": it writes a transparent APNG into `.gangge_data/pet/<action>/` and

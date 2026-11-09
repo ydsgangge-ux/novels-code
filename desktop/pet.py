@@ -2,7 +2,8 @@
 
 素材由使用者自己提供，放在 .gangge_data/pet/<动作>/ 下（mp4 / webm / mov /
 gif / png 都行），程序用 imageio-ffmpeg 逐帧解码后绘到透明窗口上。
-仓库里另带一套内置素材（desktop/assets/pet），用户目录为空时用它兜底。
+仓库里另带一套内置素材（desktop/assets/pet），首次运行会把它复制进素材目录，
+所以用户看到、想删的都只是那个目录里的普通文件。
 
 动作约定（目录名即状态名）：
     idle      空闲（必须，其它动作缺失时都用它兜底）
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -60,13 +62,18 @@ VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}
 MAX_SIDE = 400      # 解码输出的最大高度，超过就缩小（保护 CPU / 内存）
 MAX_FPS = 24        # 播放帧率上限
 MAX_ASSET_MB = 60   # 单个素材超过这个体积直接跳过
+SEED_MARK = ".builtin_copied"   # 标记：内置素材已经铺过一次，删了就不再自动长回来
 
 _README = """桌宠素材说明
 ================
 
 每个动作一个文件夹，把视频/动图丢进去就能用（mp4 / webm / mov / gif / png）。
-程序自带 idle / working / error 三个动作的内置素材（desktop/assets/pet），
-你自己放进这个目录的文件会优先播放，内置素材只在这个动作没文件时兜底。
+程序自带 idle / working / error 三套内置表情：第一次启动时，某个动作还是空的，
+就会把内置表情复制进这个目录（所以你在这里看到的就是它在播的东西）。
+
+不想看内置表情？
+  * 直接删掉这里的文件就行，删掉之后程序不会再自动塞回来。
+  * 删错了，右键桌宠 → "恢复内置表情"，会把缺的补回来（自己放的文件不受影响）。
 
   idle/      空闲 —— 必须有，其它动作没有素材时都用它
   thinking/  你按下发送、模型还在想
@@ -114,12 +121,17 @@ def bundled_asset_root() -> Path:
 
 
 class PetAssets:
-    """扫描素材目录，按动作归类：用户素材优先，内置素材兜底。"""
+    """扫描素材目录，按动作归类。
+
+    内置素材（desktop/assets/pet）不直接参与播放，而是首次运行时复制进用户的
+    素材目录 —— 这样"删掉不想要的内置表情"就是删一个能看见的文件。
+    """
 
     def __init__(self, root: Path | None = None):
         self.root = root or default_asset_root()
         self.bundled = bundled_asset_root()
         self.ensure()
+        self.seed()
 
     def ensure(self) -> None:
         try:
@@ -150,11 +162,43 @@ class PetAssets:
             result.append(p)
         return sorted(result, key=lambda p: p.name.lower())
 
+    def seed(self, force: bool = False) -> int:
+        """把内置素材复制进用户素材目录，返回复制了几个文件。
+
+        只在"这个动作还没有任何素材"时自动铺一次（留下标记，删掉之后不会再自己长回来）；
+        force=True 用于右键菜单的"恢复内置素材"，只补缺失的文件。
+        """
+        if self.bundled == self.root or not self.bundled.is_dir():
+            return 0
+        marker = self.root / SEED_MARK
+        if marker.exists() and not force:
+            return 0
+
+        copied = 0
+        for action in ACTIONS:
+            src_dir = self.bundled / action
+            if not src_dir.is_dir():
+                continue
+            if not force and self._scan(self.root / action):
+                continue                    # 用户已经放了自己的素材，不打扰
+            for src in self._scan(src_dir):
+                dst = self.root / action / src.name
+                if dst.exists():
+                    continue
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    copied += 1
+                except OSError:
+                    pass
+        try:
+            marker.write_text("内置素材已铺到本目录，删掉其中文件即可不再显示。\n", encoding="utf-8")
+        except OSError:
+            pass
+        return copied
+
     def files(self, action: str) -> list[Path]:
-        """用户目录里的素材排前面，内置素材跟在后面兜底。"""
-        mine = self._scan(self.root / action)
-        builtin = self._scan(self.bundled / action) if self.bundled != self.root else []
-        return mine + builtin
+        return self._scan(self.root / action)
 
     def count(self, action: str) -> int:
         return len(self.files(action))
@@ -693,7 +737,8 @@ class PetWindow(QWidget):
             act.setChecked(self._state == action)
             act.triggered.connect(lambda _checked=False, a=action: self.set_state(a, force=True))
         menu.addSeparator()
-        menu.addAction("📂 打开素材文件夹", self._open_assets)
+        menu.addAction("📂 打开素材文件夹（删表情就在这里删）", self._open_assets)
+        menu.addAction("♻️ 恢复内置表情", self._restore_bundled)
         if matte_available():
             if self._matte_thread is None:
                 act = menu.addAction("✂️ 自动抠像（去掉纯色背景）", self._start_matte)
@@ -715,6 +760,19 @@ class PetWindow(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._assets.root)))
         except Exception:
             pass
+
+    def _restore_bundled(self):
+        """把仓库内置的萌宠表情补回素材目录（只补缺失的文件）。"""
+        copied = self._assets.seed(force=True)
+        self._file_idx = 0
+        self._start_current()
+        self._flash(f"已恢复 {copied} 个内置表情" if copied else "内置表情都在，没有需要恢复的")
+
+    def _flash(self, text: str, ms: int = 4000):
+        """在画面底部闪一条提示。"""
+        self._matte_note = text
+        self.update()
+        QTimer.singleShot(ms, self._clear_matte_note)
 
     # ── 自动抠像 ──────────────────────────────────────────────
     def _has_pending_video(self) -> bool:
