@@ -58,6 +58,8 @@ MEDIA_EXTS = {
 }
 # 能用自动抠像处理的"实心背景"素材（gif/png 已经是图，不处理）
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}
+# 通常带透明通道的格式：同一动作里优先播它们，别让没抠过的原始 mp4 抢先挡屏
+ALPHA_EXTS = {".apng", ".webm", ".mov", ".gif", ".png", ".webp"}
 
 MAX_SIDE = 400      # 解码输出的最大高度，超过就缩小（保护 CPU / 内存）
 MAX_FPS = 24        # 播放帧率上限
@@ -160,7 +162,9 @@ class PetAssets:
             except OSError:
                 continue
             result.append(p)
-        return sorted(result, key=lambda p: p.name.lower())
+        # 透明素材排前面（同一动作里往往同时躺着"原始 mp4 + 抠好的 apng"），
+        # 组内仍按文件名排序，保证每次启动的播放顺序稳定。
+        return sorted(result, key=lambda p: (0 if p.suffix.lower() in ALPHA_EXTS else 1, p.name.lower()))
 
     def seed(self, force: bool = False) -> int:
         """把内置素材复制进用户素材目录，返回复制了几个文件。
@@ -276,6 +280,7 @@ class FrameThread(QThread):
 
     frame = pyqtSignal(QImage)
     failed = pyqtSignal(str)
+    looped = pyqtSignal()      # 完整播完一遍（循环模式下用来轮换素材）
 
     def __init__(self, path: Path, loop: bool = True, parent=None):
         super().__init__(parent)
@@ -363,6 +368,7 @@ class FrameThread(QThread):
                 continue
             if self._stop or not self._loop or frames <= 1:
                 return
+            self.looped.emit()          # 这一遍播完了，可以让 UI 换下一个素材
             self.msleep(40)
 
 
@@ -545,7 +551,9 @@ class PetWindow(QWidget):
         self._start_current()
 
         if state in ("success", "error"):
-            self._revert_timer.start(5000)      # 播完 5 秒回空闲
+            # 正常是"这一遍播完就回空闲"（见 _on_playback_finished），
+            # 这里的定时器只是兜底，防止解码卡住时永远停在这个状态。
+            self._revert_timer.start(60_000)
         elif state in ("thinking", "working"):
             self._sleep_timer.start(300_000)    # 5 分钟没有新动作就睡觉
         elif state == "idle":
@@ -573,15 +581,37 @@ class PetWindow(QWidget):
         if path is None:
             self._pixmap = None
             self._notice = "把视频放进素材文件夹\n右键 → 打开素材文件夹"
+            if self._state in ("success", "error"):
+                self._revert_timer.start(3000)
             self.update()
             return
 
         self._notice = ""
         loop = self._state not in ("success", "error")
-        self._thread = FrameThread(path, loop=loop, parent=self)
-        self._thread.frame.connect(self._on_frame)
-        self._thread.failed.connect(self._on_decode_error)
-        self._thread.start()
+        thread = FrameThread(path, loop=loop, parent=self)
+        self._thread = thread
+        thread.frame.connect(self._on_frame)
+        thread.failed.connect(self._on_decode_error)
+        # 素材有长有短：success/error 播完一整遍再回空闲，别按固定秒数砍
+        thread.finished.connect(lambda t=thread: self._on_playback_finished(t))
+        if loop:
+            thread.looped.connect(lambda t=thread: self._advance_asset(t))
+        thread.start()
+
+    def _on_playback_finished(self, thread: FrameThread):
+        if thread is not self._thread:
+            return                    # 已经被别的动作替换掉了
+        if self._state in ("success", "error"):
+            self.set_state("idle", force=True)
+
+    def _advance_asset(self, thread: FrameThread):
+        """同一个动作里不止一个素材时，播完一遍自动换下一个。"""
+        if thread is not self._thread:
+            return
+        if len(self._assets.files(self._state)) <= 1:
+            return
+        self._file_idx += 1
+        self._start_current()
 
     def _stop_thread(self):
         if self._thread is not None:
