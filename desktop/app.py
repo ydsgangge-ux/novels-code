@@ -119,6 +119,7 @@ from gangge.layer4_tools.qoder_cli.config import (
     MODELS as QODER_MODELS,
     PERMISSIONS as QODER_PERMISSIONS,
     STRENGTHS as QODER_STRENGTHS,
+    merge_models as merge_qoder_models,
 )
 from skill_preview import SkillEffectPanel
 from git_panel import GitRepo, SourceControlPanel, confirm_security
@@ -6130,8 +6131,8 @@ class GanggeDesktop(QMainWindow):
 
         self._qoder_model_combo = QComboBox(self)
         self._qoder_model_combo.setEditable(True)  # 允许手填新模型名
-        for _name in QODER_MODELS:
-            self._qoder_model_combo.addItem(_name, _name)
+        # 内置清单只是离线兜底；上次"检测 CLI"实测到的模型也一并铺进来
+        self._fill_qoder_models(self._qoder_model_combo, self._cached_qoder_models())
         self._qoder_model_combo.hide()
 
         self._qoder_strength_combo = QComboBox(self)
@@ -6792,9 +6793,11 @@ class GanggeDesktop(QMainWindow):
                 return
             ok_models, models = list_models(exe_path, timeout_s=20)
             if ok_models and isinstance(models, list):
+                # 关键：把实测结果灌进下拉框，CLI 升级后新增的模型才选得到
+                self._apply_qoder_models(models, extra_combo=_qd_model)
                 QMessageBox.information(
                     dlg, "Qoder CLI",
-                    f"可用：{detail}\n登录正常，可用模型 {len(models)} 个：\n"
+                    f"可用：{detail}\n登录正常，可用模型 {len(models)} 个（已刷新下拉框）：\n"
                     + "、".join(models),
                 )
             else:
@@ -9551,6 +9554,32 @@ class GanggeDesktop(QMainWindow):
             self._live_role, self._live_pos = "", -1
 
     # ── Settings ──────────────────────────────────────────────
+    def _cached_qoder_models(self) -> list[str]:
+        """内置清单 + 上次"检测 CLI"实测到的模型（存在 QSettings 里，逗号分隔）。"""
+        raw = str(self._settings.value("qoder_models", "") or "")
+        detected = [n.strip() for n in raw.split(",") if n.strip()]
+        return merge_qoder_models(detected, QODER_MODELS)
+
+    @staticmethod
+    def _fill_qoder_models(combo: QComboBox, names: list[str]) -> None:
+        """重填模型下拉框，尽量保住用户当前选中的那个。"""
+        current = combo.currentText().strip()
+        combo.blockSignals(True)
+        combo.clear()
+        for name in names:
+            combo.addItem(name, name)
+        if current:
+            combo.setCurrentText(current)
+        combo.blockSignals(False)
+
+    def _apply_qoder_models(self, detected: list[str], extra_combo: QComboBox | None = None) -> None:
+        """实测到模型后：写缓存 + 刷新设置页和弹窗里的下拉框。"""
+        self._settings.setValue("qoder_models", ",".join(detected))
+        names = merge_qoder_models(detected, QODER_MODELS)
+        self._fill_qoder_models(self._qoder_model_combo, names)
+        if extra_combo is not None:
+            self._fill_qoder_models(extra_combo, names)
+
     def _save_settings(self):
         key = self._provider_combo.currentData()
         self._settings.setValue("provider", key)

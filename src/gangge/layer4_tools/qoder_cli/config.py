@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -33,10 +34,14 @@ DEFAULT_IDLE_TIMEOUT_S = 600
 DEFAULT_HARD_TIMEOUT_S = 0
 DEFAULT_MODEL = "Auto"
 
-#: ``--list-models`` 实测结果（v1.1.80）。前端下拉可编辑，允许手填新模型名。
+#: ``--list-models`` 实测结果（v1.1.80，2026-11 复核）。仅作离线兜底快照：
+#: CLI 升级后新增的模型以实测结果为准（见 :func:`list_models` / :func:`merge_models`），
+#: 前端下拉是可编辑的，也允许直接手填新模型名。
 MODELS: tuple[str, ...] = (
     "Auto",
     "Fast",
+    "Qwen4-Max",
+    "Qwen4-Max-Preview",
     "Qwen3.8-Max",
     "Qwen3.8-Flash",
     "DeepSeek-V4-Pro",
@@ -45,6 +50,7 @@ MODELS: tuple[str, ...] = (
     "GLM-5.3-Flash",
     "Kimi-K3.1-Pro",
     "Kimi-K2.8-Preview",
+    "Step-5-Preview",
     "MiniMax-M3.1-Flash",
 )
 
@@ -257,7 +263,8 @@ def auth_token() -> str:
     return (os.environ.get("QODER_PERSONAL_ACCESS_TOKEN") or "").strip()
 
 
-def _run_cli(exe: str, args: list[str], timeout_s: int = 20) -> tuple[int, str]:
+def _run_cli(exe: str, args: list[str], timeout_s: int = 20,
+             only_stdout: bool = False) -> tuple[int, str]:
     import subprocess
 
     try:
@@ -271,6 +278,11 @@ def _run_cli(exe: str, args: list[str], timeout_s: int = 20) -> tuple[int, str]:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return -1, f"启动失败: {type(exc).__name__}: {exc}"
+    stdout = (proc.stdout or "").strip()
+    # 有的版本会把告警（例如 native modules 解压失败 EPERM）写进 stderr，
+    # 解析列表时必须只用 stdout，否则告警会被当成一个"模型名"。
+    if only_stdout and stdout:
+        return proc.returncode, stdout
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     return proc.returncode, out
 
@@ -309,14 +321,42 @@ def help_flags(executable: str, timeout_s: int = 20) -> frozenset[str]:
 
 
 def list_models(executable: str = "", timeout_s: int = 30) -> tuple[bool, list[str] | str]:
-    """``--list-models``：确认登录态的同时拿到当前账号可用的模型名。"""
+    """``--list-models``：确认登录态的同时拿到当前账号可用的模型名。
+
+    CLI 升级后新增的模型只能从这里的实测结果看到（``MODELS`` 是写死的老快照），
+    所以前端必须拿它去刷新下拉框，不然就会出现"检测到了但菜单里没有"。
+    """
+    import re
+
     try:
         exe = resolve_executable(executable)
     except QoderNotAvailable as exc:
         return False, str(exc)
-    code, out = _run_cli(exe, ["--list-models"], timeout_s)
+    code, out = _run_cli(exe, ["--list-models"], timeout_s, only_stdout=True)
     if code != 0:
         return False, out or f"退出码 {code}"
+    # 只认"长得像模型名"的行：日志/告警（[qodercli] ...、Warning: ...）一律丢掉
+    pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:+\-/]*$")
     lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    models = [ln for ln in lines if ln.lower() != "model"]
+    models = [
+        ln for ln in lines
+        if len(ln) <= 48 and pattern.match(ln) and ln.lower() not in ("model", "models")
+    ]
     return (True, models) if models else (False, "没有返回任何模型（可能未登录）")
+
+
+def merge_models(detected: Iterable[str], base: Iterable[str] = MODELS) -> list[str]:
+    """把 CLI 实测到的模型并进内置清单（去重、保序、新模型追加在后面）。
+
+    内置 ``MODELS`` 只是离线兜底快照；实测结果里多出来的（比如 Qwen4-Max、
+    Step-5-Preview）必须出现在下拉框里，用户才能选得到。
+    """
+    seen: set[str] = set()
+    merged: list[str] = []
+    for name in list(base) + list(detected):
+        text = str(name).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        merged.append(text)
+    return merged

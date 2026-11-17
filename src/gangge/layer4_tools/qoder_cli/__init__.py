@@ -20,6 +20,7 @@ from gangge.layer4_tools.qoder_cli.config import (
     QoderNotAvailable,
     help_flags,
     list_models,
+    merge_models,
     probe_version,
     resolve_executable,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "delegate_sync",
     "help_flags",
     "list_models",
+    "merge_models",
     "parse_output",
     "probe_version",
     "resolve_executable",
