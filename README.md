@@ -279,7 +279,15 @@ LLM_PROVIDER=deepseek          # deepseek / openai / anthropic / ollama
 DEEPSEEK_API_KEY=sk-xxx
 MAX_ROUNDS=30                  # 最大工具调用轮数
 LLM_TIMEOUT=300                # LLM 响应超时（秒）
+
+MAX_TOKENS=16384               # 单次回复输出上限
+CONTEXT_WINDOW_TOKENS=128K     # 模型上下文窗口（支持 128K / 1M / 131072）
+MAX_HISTORY_ROUNDS=6           # 滑动窗口：只保留最近 N 轮
+TOOL_RESULT_MAX_CHARS=6000     # 单条工具输出字符上限
 ```
+
+桌面端可以直接在「设置 → 上下文与输出」里改这四项（支持填 `1M`），改完立即生效，
+不用重启；`.env` 里的值只是没有设置过时的默认值。
 
 架构与扩展点（运行时组合、护栏、请求级 hook）见 [`docs/architecture.md`](docs/architecture.md)。
 

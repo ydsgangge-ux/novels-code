@@ -119,11 +119,13 @@ class LoopConfig:
 
     # ── Sliding window: keep only recent N rounds, discard older ──
     enable_sliding_window: bool = True
-    max_history_rounds: int = 6  # only keep recent N user/assistant pairs
+    # only keep recent N user/assistant pairs（可用 MAX_HISTORY_ROUNDS 覆盖）
+    max_history_rounds: int = int(os.environ.get("MAX_HISTORY_ROUNDS", "6") or 6)
 
     # ── Tool result truncation ──
     enable_tool_result_truncation: bool = True
-    tool_result_max_chars: int = 6000
+    # 单条工具输出保留的字符上限（可用 TOOL_RESULT_MAX_CHARS 覆盖）
+    tool_result_max_chars: int = int(os.environ.get("TOOL_RESULT_MAX_CHARS", "6000") or 6000)
 
     # ── Lazy project map: only inject full index on first round ──
     enable_lazy_project_map: bool = True

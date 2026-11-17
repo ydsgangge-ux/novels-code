@@ -1117,7 +1117,9 @@ class GanggeWorker(QThread):
                  previous_messages: list | None = None,
                  attachments: list | None = None,
                  auto_inject: bool = False,
-                 multimodal_llm: Any | None = None):
+                 multimodal_llm: Any | None = None,
+                 history_rounds: int = 0,
+                 tool_result_chars: int = 0):
         super().__init__()
         self.llm = llm
         self.multimodal_llm = multimodal_llm
@@ -1140,6 +1142,8 @@ class GanggeWorker(QThread):
         self._model = model_name or getattr(llm, "model", "")
         self._attachments = attachments or []
         self._auto_inject = auto_inject
+        self.history_rounds = history_rounds        # 0 = 用 LoopConfig 默认
+        self.tool_result_chars = tool_result_chars  # 0 = 用 LoopConfig 默认
         self._cancel = False
         self._approved_plan = ""
         self._ask_user_answer = ""
@@ -1351,6 +1355,9 @@ class GanggeWorker(QThread):
             memory_bank_changelog=self.memory_bank_changelog,
             ganggerules=self.ganggerules,
             ask_user_callback=_ask_user_callback,
+            # 设置页可调：历史窗口 + 工具输出截断（0 表示沿用 LoopConfig 默认/环境变量）
+            **({"max_history_rounds": self.history_rounds} if self.history_rounds else {}),
+            **({"tool_result_max_chars": self.tool_result_chars} if self.tool_result_chars else {}),
         )
 
         if self.workspace:
@@ -5600,6 +5607,33 @@ def _fetch_ollama_models(base_url: str) -> list[str]:
         return []
 
 
+# ── Helper: 上下文/输出上限的数值解析 ────────────────────────
+def _parse_token_count(text: str, default: int) -> int:
+    """把 "128K" / "1M" / "131072" 这类写法转成 token 数（K=1024，M=1048576）。"""
+    raw = str(text or "").strip().lower().replace(",", "").replace("_", "")
+    if not raw:
+        return default
+    mult = 1
+    if raw.endswith("k"):
+        mult, raw = 1024, raw[:-1]
+    elif raw.endswith("m"):
+        mult, raw = 1024 * 1024, raw[:-1]
+    try:
+        value = int(float(raw) * mult)
+    except ValueError:
+        return default
+    return value if value >= 256 else default
+
+
+def _format_token_count(value: int) -> str:
+    """131072 → "128K"，1048576 → "1M"，其它原样显示。"""
+    if value >= 1024 * 1024 and value % (1024 * 1024) == 0:
+        return f"{value // (1024 * 1024)}M"
+    if value >= 1024 and value % 1024 == 0:
+        return f"{value // 1024}K"
+    return str(value)
+
+
 # ═════════════════════════════════════════════════════════════════
 #  Experimental Panel — Prefix Cache / Prompt / Compression / Token / Attention / Agent Graph
 # ═════════════════════════════════════════════════════════════════
@@ -6877,6 +6911,46 @@ class GanggeDesktop(QMainWindow):
         wf.addRow("", _web_test)
         form.addWidget(web_g)
 
+        # ── 上下文 / 输出上限 ──
+        ctx_g = QGroupBox("上下文与输出（决定长任务能记多久）")
+        ctx_g.setStyleSheet(llm_g.styleSheet())
+        cf = QFormLayout(ctx_g)
+        cf.setSpacing(6)
+
+        _ctx = QComboBox()
+        _ctx.setEditable(True)      # 也可以直接填 300000 / 1M
+        for _v in (131_072, 204_800, 262_144, 524_288, 1_048_576):
+            _ctx.addItem(_format_token_count(_v), _v)
+        _ctx.setCurrentText(_format_token_count(self._ctx_window_tokens()))
+        _ctx.setToolTip("模型上下文窗口。只影响“用到 92% 就压缩”的触发点和占用率显示。")
+        cf.addRow("上下文窗口 (tokens)", _ctx)
+
+        _out = QComboBox()
+        _out.setEditable(True)
+        for _v in (8_192, 16_384, 32_768, 65_536, 131_072):
+            _out.addItem(_format_token_count(_v), _v)
+        _out.setCurrentText(_format_token_count(self._max_output_tokens()))
+        _out.setToolTip("单次回复最多输出多少 token（思考型模型的思考也算在内）。")
+        cf.addRow("单次输出上限 (tokens)", _out)
+
+        _hist = QSpinBox()
+        _hist.setRange(1, 200)
+        _hist.setValue(self._history_rounds())
+        _hist.setToolTip("滑动窗口：只保留最近 N 轮对话，更早的直接丢弃。")
+        cf.addRow("保留最近 N 轮对话", _hist)
+
+        _trunc = QSpinBox()
+        _trunc.setRange(500, 400_000)
+        _trunc.setSingleStep(1000)
+        _trunc.setValue(self._tool_result_chars())
+        _trunc.setToolTip("单条工具输出最多保留多少字符（超出会截掉中间、保留头尾）。")
+        cf.addRow("工具输出截断 (字符)", _trunc)
+
+        _ctx_hint = QLabel("窗口写大只是更晚触发压缩，不会让模型变强；写小了会频繁压缩、丢上下文。")
+        _ctx_hint.setWordWrap(True)
+        cf.addRow("", _ctx_hint)
+        form.addWidget(ctx_g)
+
         # ── Advanced ──
         ad_g = QGroupBox(_t("settings_advanced"))
         ad_g.setStyleSheet(llm_g.styleSheet())
@@ -7009,6 +7083,15 @@ class GanggeDesktop(QMainWindow):
             self._mm_model_combo.setCurrentText(_mm_model.currentText())
             self._mm_base_url_input.setText(_mm_base_url.text())
             self._max_rounds_spin.setValue(_rounds.value())
+            # 上下文 / 输出上限（存原始 token 数，显示形式是 128K / 1M 这种）
+            self._settings.setValue(
+                "ctx_window", _parse_token_count(_ctx.currentText(), self._ctx_window_tokens())
+            )
+            self._settings.setValue(
+                "max_output_tokens", _parse_token_count(_out.currentText(), self._max_output_tokens())
+            )
+            self._settings.setValue("history_rounds", _hist.value())
+            self._settings.setValue("tool_result_chars", _trunc.value())
             self._auto_allow_cb.setChecked(_auto_allow.isChecked())
             self._auto_inject_cb.setChecked(_auto_inject.isChecked())
             self._test_verify_cb.setChecked(_test_verify.isChecked())
@@ -8702,11 +8785,11 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 请输入 Anthropic API Key")
                 return None
             from gangge.layer5_llm.anthropic import AnthropicLLM
-            return AnthropicLLM(api_key=api_key, model=model, max_tokens=int(os.environ.get("MAX_TOKENS", "16384")), temperature=temperature)
+            return self._apply_llm_limits(AnthropicLLM(api_key=api_key, model=model, max_tokens=self._max_output_tokens(), temperature=temperature))
         elif provider_key == "ollama":
             url = self._base_url_input.text().strip() or "http://localhost:11434/v1"
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=url, api_key="ollama", model=model, max_tokens=int(os.environ.get("MAX_TOKENS", "16384")), temperature=temperature)
+            return self._apply_llm_limits(OpenAICompatLLM(base_url=url, api_key="ollama", model=model, max_tokens=self._max_output_tokens(), temperature=temperature))
         elif provider_key == "custom":
             base_url = self._base_url_input.text().strip()
             if not base_url:
@@ -8716,7 +8799,7 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 自定义模式需要填写模型名称")
                 return None
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=int(os.environ.get("MAX_TOKENS", "16384")), temperature=temperature)
+            return self._apply_llm_limits(OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=self._max_output_tokens(), temperature=temperature))
         else:
             api_key_env = cfg.get("api_key_env", "")
             if not api_key and api_key_env:
@@ -8730,7 +8813,7 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 请填写 Base URL")
                 return None
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return OpenAICompatLLM(base_url=base_url, api_key=api_key, model=model, max_tokens=int(os.environ.get("MAX_TOKENS", "16384")), temperature=temperature)
+            return self._apply_llm_limits(OpenAICompatLLM(base_url=base_url, api_key=api_key, model=model, max_tokens=self._max_output_tokens(), temperature=temperature))
 
     def _build_multimodal_llm(self) -> BaseLLM | None:
         """Build a separate multimodal LLM for image recognition tasks."""
@@ -9015,6 +9098,8 @@ class GanggeDesktop(QMainWindow):
             multimodal_llm=multimodal_llm,
             previous_messages=self._conversation_history,
             max_rounds=self._max_rounds_spin.value(),
+            history_rounds=self._history_rounds(),
+            tool_result_chars=self._tool_result_chars(),
             plan_mode=plan_mode, project_context="",  # built in worker thread
             system_prompt_extra=extra_prompt, auto_allow=auto_allow,
             batch_index=batch_index, batch_total=batch_total,
@@ -9554,6 +9639,49 @@ class GanggeDesktop(QMainWindow):
             self._live_role, self._live_pos = "", -1
 
     # ── Settings ──────────────────────────────────────────────
+    # ── 上下文 / 输出上限（设置页可调，缺省回落到 .env）──
+    def _ctx_window_tokens(self) -> int:
+        """模型上下文窗口。只影响压缩触发点与占用率显示，不改模型真实能力。"""
+        try:
+            saved = int(self._settings.value("ctx_window", 0) or 0)
+        except (TypeError, ValueError):
+            saved = 0
+        if saved > 0:
+            return saved
+        return _parse_token_count(os.environ.get("CONTEXT_WINDOW_TOKENS", ""), 131_072)
+
+    def _max_output_tokens(self) -> int:
+        """单次回复的输出上限。"""
+        try:
+            saved = int(self._settings.value("max_output_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            saved = 0
+        if saved > 0:
+            return saved
+        return _parse_token_count(os.environ.get("MAX_TOKENS", ""), 16384)
+
+    def _history_rounds(self) -> int:
+        """滑动窗口保留多少轮历史（超出部分丢弃）。"""
+        try:
+            return max(1, int(self._settings.value("history_rounds", 6) or 6))
+        except (TypeError, ValueError):
+            return 6
+
+    def _tool_result_chars(self) -> int:
+        """单条工具输出最多保留多少字符。"""
+        try:
+            return max(200, int(self._settings.value("tool_result_chars", 6000) or 6000))
+        except (TypeError, ValueError):
+            return 6000
+
+    def _apply_llm_limits(self, llm: BaseLLM) -> BaseLLM:
+        """把设置页里的上下文窗口套到实例上（不覆盖 provider 默认值以外的东西）。"""
+        try:
+            llm.CONTEXT_WINDOW_TOKENS = self._ctx_window_tokens()
+        except Exception:  # noqa: BLE001 - 只读属性就当改不了，别挡住建模型
+            pass
+        return llm
+
     def _cached_qoder_models(self) -> list[str]:
         """内置清单 + 上次"检测 CLI"实测到的模型（存在 QSettings 里，逗号分隔）。"""
         raw = str(self._settings.value("qoder_models", "") or "")
