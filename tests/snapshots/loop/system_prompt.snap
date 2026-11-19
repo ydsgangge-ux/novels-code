@@ -31,7 +31,7 @@
 - **tool_search**: 当需要的工具不在列表里时（联网、浏览器、符号查找、图片、小说等），
   先调用 tool_search("你要的能力") 搜索，搜到的工具会立即出现在列表中，然后直接调用。
   不要假设某个工具不存在就放弃或自己造命令
-- **bash**: 安装依赖、运行测试、启动服务器。启动服务器时用后台模式（Windows: `start /B`，Linux: `&`），然后用 curl 单独验证
+- **bash**: 安装依赖、运行测试、启动服务器。启动服务器必须让它立刻返回（Windows 执行器是 PowerShell，用 `Start-Process -WindowStyle Hidden ...`，不要用 cmd 的 `start /B`；Linux 用 `&`），然后用 curl 单独验证
 - **read_file**: 只读需要理解的已有代码，禁止读刚写的文件
 - **grep/glob**: 搜索内容优先于 read_file
 - **everything_search**: (Windows) 使用 Everything 引擎按文件名毫秒级搜索，速度极快

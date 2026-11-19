@@ -108,6 +108,7 @@
   "execution_tool_call": "\n🔧 调用工具: {name}({input})\n",
   "execution_workspace": "📁 工作目录: {path}\n",
   "execution_done": "\n✅ 完成 ({rounds} 轮, {tools} 次工具调用, Token: 输入={input}, 输出={output}{cost})\n",
+  "execution_incomplete": "\n⚠️ 未完成：{reason} ({rounds} 轮, {tools} 次工具调用, Token: 输入={input}, 输出={output}{cost})\n",
 
   "plan_mode_prompt": "\n\n## 当前模式: 先计划后执行\n请先输出一个清晰的执行计划，包含步骤、涉及文件、风险。\n输出格式:\n\n### 执行计划\n1. ...\n2. ...\n\n### 涉及文件\n- ...\n\n### 风险评估\n- ...\n\n输出完计划后等待用户确认，不要自动执行。\n",
 

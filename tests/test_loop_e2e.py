@@ -18,7 +18,7 @@ from gangge.layer3_agent.tools.registry import ToolRegistry
 from gangge.layer4_permission.guard import PermissionGuard
 from gangge.layer4_permission.rules import PermissionPolicy
 from gangge.layer5_llm.base import Message, Role
-from support.fake_llm import RecordingEmitter, ScriptedLLM, call, say
+from support.fake_llm import RecordingEmitter, ScriptedLLM, Turn, call, say
 from support.snapshot import assert_snapshot
 
 LONG_ANSWER = (
@@ -316,6 +316,37 @@ async def test_tool_search_unlocks_a_deferred_tool_mid_turn(tmp_path):
     assert [e.tool_name for e in result.tool_executions] == ["tool_search", "web_search"]
     # The search result told the model the tool is now usable.
     assert "已加入你的工具列表" in result.tool_executions[0].output
+
+
+@pytest.mark.asyncio
+async def test_compression_threshold_uses_current_context_not_cumulative(tmp_path):
+    """累计 token 早就超过窗口，但每次请求只占 10%，不该压缩。
+
+    回归点：阈值以前用 total_tokens["input"]（全程累加），跑到第 N 轮必然超过
+    100%，于是每轮都压、使用率还一路涨（实测 98%→454%），历史被反复压没。
+    """
+
+    class SmallWindowLLM(ScriptedLLM):
+        @property
+        def max_context_tokens(self) -> int:
+            return 1000
+
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    turns = [
+        Turn(
+            tool_calls=[("echo", {"text": str(i)})],
+            usage={"input_tokens": 100, "output_tokens": 5},
+        )
+        for i in range(15)
+    ]
+    llm = SmallWindowLLM(turns + [say(LONG_ANSWER)])
+
+    loop, emitter = _loop(tmp_path, llm, registry, max_tool_rounds=20)
+    result = await loop.run(_user("连续调用工具"))
+
+    assert len(result.tool_executions) == 15
+    assert "上下文压缩" not in emitter.text, "单次请求只占 10% 窗口，不该触发压缩"
 
 
 # ── Snapshots (prompt-drift guards) ────────────────────────────

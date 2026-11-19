@@ -254,19 +254,36 @@ class _DeltaBatcher:
         self._buffer: list[str] = []
         self._size = 0
         self._reasoning: list[str] = []
+        self._think_last_emit = 0.0   # 上次推送实时思考片段的时间
+        self._think_acc = 0           # 距上次推送累积的字符数
+        self._think_buf: list[str] = []   # 尚未推给实时窗口的增量
         self.deltas = 0          # raw text/reasoning deltas received
         self.emitted_chars = 0   # answer characters pushed to the UI
         self.thinking_chars = 0  # reasoning characters pushed to the UI
 
     async def __call__(self, block: ContentBlock) -> None:
         if block.type == ContentType.THINKING:
-            # Reasoning is delivered as ONE block per model call, never streamed
-            # token by token: a collapsible "思考过程" bubble per token is pure
-            # noise (and a UI flood), while a single block is what a reader
-            # actually wants to expand afterwards.
+            # 主界面仍然只在调用结束时给一张折叠卡片（"思考过程"），逐 token
+            # 建卡是纯噪声。这里额外按 0.35s / 500 字符节流推一份增量，只供
+            # "实时思考"窗口用；用户没开窗口时 UI 直接丢弃，不产生布局变化。
             if block.text:
                 self.deltas += 1
                 self._reasoning.append(block.text)
+                now = time.monotonic()
+                self._think_buf.append(block.text)
+                self._think_acc += len(block.text)
+                if now - self._think_last_emit >= 0.35 or self._think_acc >= 500:
+                    # 推累积缓冲而不是当前片段：只发当前 delta 会在节流时丢字，
+                    # 窗口里看到的思考就变成断断续续的碎片。
+                    pending = "".join(self._think_buf)
+                    self._think_buf.clear()
+                    self._think_last_emit = now
+                    self._think_acc = 0
+                    await self._emit(ContentBlock(
+                        type=ContentType.THINKING,
+                        text=pending,
+                        partial=True,
+                    ))
             return
 
         if block.type == ContentType.TEXT:
@@ -286,6 +303,14 @@ class _DeltaBatcher:
         await self._emit(block)
 
     async def _flush_thinking(self) -> None:
+        # 先把还没推给实时窗口的尾巴补上，否则窗口会比完整卡片少一段。
+        if self._think_buf:
+            tail = "".join(self._think_buf)
+            self._think_buf.clear()
+            self._think_acc = 0
+            await self._emit(ContentBlock(
+                type=ContentType.THINKING, text=tail, partial=True,
+            ))
         if not self._reasoning:
             return
         text = "".join(self._reasoning)
@@ -493,6 +518,34 @@ class AgenticLoop:
                 except Exception as e:
                     logger.warning(f"[Memory Bank] 写入 decisions.md 失败: {e}")
 
+    @staticmethod
+    def _current_todos() -> list[dict]:
+        """当前任务清单（由 TodoWrite 维护）。取不到时返回空列表。"""
+        try:
+            from gangge.layer3_agent.tools.todo import get_todo_state
+            return get_todo_state().get_all()
+        except Exception:
+            logger.debug("[Memory Bank] 读取任务清单失败", exc_info=True)
+            return []
+
+    @staticmethod
+    def _replace_round_block(text: str, marker: str, block: str) -> str:
+        """写入某一轮的变更块：已有同轮记录就整体替换，否则追加。
+
+        changelog 以 ``## 标题`` 分块，块内为纯文本行。
+        """
+        kept: list[str] = []
+        skipping = False
+        for line in text.splitlines():
+            if line.startswith("## "):
+                skipping = marker in line
+                if skipping:
+                    continue
+            if not skipping:
+                kept.append(line)
+        body = "\n".join(kept).strip()
+        return f"{body}\n\n{block}" if body else block
+
     def _auto_save_progress(
         self,
         file_registry: dict[str, dict],
@@ -519,10 +572,17 @@ class AgenticLoop:
             return
 
         total = len(written_files)
-        progress_pct = min(100, int(total / max(total, 1) * 100))
+
+        # 进度必须来自任务清单；"已写文件数 / 已写文件数" 恒等于 100%，不能当进度用
+        todos = self._current_todos()
+        if todos:
+            done_count = sum(1 for t in todos if t.get("status") == "completed")
+            progress_line = f"进度: {int(done_count / len(todos) * 100)}%（{done_count}/{len(todos)} 项任务）"
+        else:
+            progress_line = "进度: 进行中（本任务未创建任务清单）"
 
         lines = [
-            f"进度: {progress_pct}%",
+            progress_line,
             f"已修改文件数: {total}",
             f"最后更新: 第 {round_num + 1} 轮",
             "",
@@ -539,9 +599,22 @@ class AgenticLoop:
                 detail += f" (funcs: {', '.join(info['functions'][:8])})"
             lines.append(f"- [x] `{p}` [{action}, 第{rnd}轮]{detail}")
 
+        pending_items = [
+            str(t.get("content", "")).strip()
+            for t in todos
+            if t.get("status") != "completed" and str(t.get("content", "")).strip()
+        ]
         lines.append("")
         lines.append("### 下一步")
-        lines.append("- [ ] 继续完成剩余文件（参考任务清单）")
+        if pending_items:
+            for item in pending_items[:5]:
+                lines.append(f"- [ ] {item}")
+            if len(pending_items) > 5:
+                lines.append(f"- [ ] 另有 {len(pending_items) - 5} 项待完成")
+        elif todos:
+            lines.append("- 无（任务清单已全部完成）")
+        else:
+            lines.append("- [ ] 继续完成剩余文件（本任务未创建清单）")
 
         new_progress = "\n".join(lines)
         try:
@@ -550,18 +623,31 @@ class AgenticLoop:
         except Exception as e:
             logger.warning(f"[Memory Bank] 自动保存 progress.md 失败: {e}")
 
-        changelog_entry = (
-            f"\n## {datetime.now().strftime('%Y-%m-%d %H:%M')} (第{round_num + 1}轮自动记录)\n"
-            f"- 已完成: {', '.join(f'`{p}`' for p in written_files[-3:])}"
-            f"{' 等' if total > 3 else ''}\n"
-        )
-        try:
-            existing = changelog_file.read_text(encoding="utf-8") if changelog_file.exists() else ""
-            if changelog_entry.strip() not in existing:
-                changelog_file.write_text(existing + changelog_entry, encoding="utf-8")
-                self.config.memory_bank_changelog = (existing + changelog_entry).strip()
-        except Exception as e:
-            logger.warning(f"[Memory Bank] 自动保存 changelog.md 失败: {e}")
+        # 同一轮内每写一个文件都会走到这里：按轮次合并，同一轮的记录整体替换，
+        # 不再追加一串时间戳相同、文件列表逐次变长的近重复条目。
+        this_round = round_num + 1
+        round_files = [p for p in written_files if file_registry[p].get("round") == this_round]
+        if not round_files and not any("round" in info for info in file_registry.values()):
+            # 老数据没记轮次才退回"最近写入"；本轮确实没写文件（例如只跑了
+            # TodoWrite / 测试）时留空，否则会给每轮都刷一条重复的变更记录。
+            round_files = written_files[-3:]
+        if round_files:
+            marker = f"(第{this_round}轮自动记录)"
+            listed = ", ".join(f"`{p}`" for p in round_files[:10])
+            if len(round_files) > 10:
+                listed += f" 等 {len(round_files)} 个文件"
+            changelog_entry = (
+                f"## {datetime.now().strftime('%Y-%m-%d %H:%M')} {marker}\n"
+                f"- 已完成: {listed}\n"
+            )
+            try:
+                existing = changelog_file.read_text(encoding="utf-8") if changelog_file.exists() else ""
+                updated = self._replace_round_block(existing, marker, changelog_entry)
+                if updated != existing:
+                    changelog_file.write_text(updated, encoding="utf-8")
+                    self.config.memory_bank_changelog = updated.strip()
+            except Exception as e:
+                logger.warning(f"[Memory Bank] 自动保存 changelog.md 失败: {e}")
 
     async def _git_checkpoint(self, label: str) -> str | None:
         """Run Shadow Git checkpoint in a thread to avoid blocking the event loop."""
@@ -751,8 +837,9 @@ class AgenticLoop:
         cumulative_output = total_tokens.get("output", 0)
 
         # ── Context window usage ──
+        # 口径同上：看本轮请求占了多少窗口，累计值不能当占用率。
         context_window = self.llm.max_context_tokens if self.llm else 0
-        usage_ratio = (cumulative_input / context_window) if context_window > 0 else 0.0
+        usage_ratio = (input_tokens / context_window) if context_window > 0 else 0.0
 
         # ── Tool calls this round ──
         tool_calls_this_round: list[str] = []
@@ -1445,6 +1532,11 @@ class AgenticLoop:
                 )
                 if lint_note:
                     output += f"\n\n{lint_note}"
+            elif not result.is_error and name.lower() == "todowrite":
+                # TodoWrite 只改任务清单、不写文件。不在这里刷新的话，progress.md
+                # 会停在最后一次写文件的状态：收尾轮只剩跑测试/标记完成时，
+                # 记录就永远显示"进行中 xx%"，和实际不符。
+                self._auto_save_progress(file_registry, round_num, user_task_desc)
 
             results.add_tool_result(
                 call_id=tool_call.id,
@@ -1469,9 +1561,14 @@ class AgenticLoop:
                 continue
 
             any_tool_succeeded = True
-            # Productive = something changed on disk or a command ran. Reads and
-            # searches never count, which is what the stall guard keys off.
-            if name in ("write_file", "edit_file", "apply_patch", "bash", "novel_write_chapter"):
+            # Productive = something changed on disk, a command ran, or the work was
+            # actually verified. Reads and searches never count, which is what the
+            # stall guard keys off. 验证类工具必须算"有进展"——否则连续看几张截图、
+            # 跑两次测试就会被判成"数轮无进展"而提前收尾。
+            if name in (
+                "write_file", "edit_file", "apply_patch", "bash", "novel_write_chapter",
+                "run_tests", "lint_check", "browser_debug",
+            ):
                 productive = True
 
             # ── Runtime auto-advance Todo state ──
@@ -1865,6 +1962,9 @@ class AgenticLoop:
         is_empty_dir = detect_empty_workspace(self.config.workspace_dir)
         executions: list[ToolExecution] = []
         total_tokens: dict[str, int] = {"input": 0, "output": 0}
+        # 最近一次请求的输入 token 数 ≈ 当前上下文占用。压缩阈值必须看它，
+        # 不能看 total_tokens（那是全程累计值，只会单调上涨）。
+        last_request_tokens = 0
         has_modified_files = False
         any_tool_succeeded = False
         consecutive_readonly_rounds = 0  # Track rounds with only read tools
@@ -1957,13 +2057,12 @@ class AgenticLoop:
             tool_defs = self._get_all_tool_defs(phase=current_phase)
 
             # ── Token-based auto compression (Claude Code style: 92% threshold) ──
-            # Check token usage and compress if approaching context limit
+            # 判据是"上一次请求实际占了窗口多少"，不是全程累计 token。
+            # 用累计值会得到单调上涨的比例（100%→200%→400%），于是每轮都压、
+            # 把历史压没了还继续报"使用率 454%"。
             if round_num > 0:
-                total_input = total_tokens.get("input", 0)
-                # Estimate context usage: if input tokens exceed 92% of max, compress
-                context_limit = self.config.max_tokens * 12  # rough char-to-token ratio
-                if total_input > 0 and self.llm.max_context_tokens > 0:
-                    usage_ratio = total_input / self.llm.max_context_tokens
+                if last_request_tokens > 0 and self.llm.max_context_tokens > 0:
+                    usage_ratio = last_request_tokens / self.llm.max_context_tokens
                     if usage_ratio > 0.92:
                         _before = len(messages)
                         messages = await self._compress_history(messages, round_num)
@@ -2016,6 +2115,10 @@ class AgenticLoop:
             # delta arrives as soon as the model starts, and a placeholder would
             # end up glued to the front of every answer.
             step = self._begin_step(round_num, len(call_messages), len(tool_defs))
+            # 真正的"卡住"判定下移到 adapter 的流式看门狗（首包 / chunk 间隔）。
+            # 这里只留一个远大于它的兜底：思考型模型连续输出几分钟 reasoning
+            # 是正常行为，用 llm_timeout 当总上限会把好好的请求砍掉。
+            total_budget = max(self.config.llm_timeout * 6, 3600.0)
             try:
                 response = await asyncio.wait_for(
                     self._chat(
@@ -2023,10 +2126,10 @@ class AgenticLoop:
                         tools=tool_defs,
                         system=system,
                     ),
-                    timeout=self.config.llm_timeout,
+                    timeout=total_budget,
                 )
             except asyncio.TimeoutError:
-                error_text = f"LLM 调用超时（{self.config.llm_timeout:.0f}s），请检查网络或 API 状态"
+                error_text = f"LLM 调用超时（{total_budget:.0f}s 总时长上限），任务未完成"
                 logger.error(error_text)
                 self.emitter.emit(EventType.ERROR, error_text)
                 self._end_step(step, error="timeout")
@@ -2079,6 +2182,8 @@ class AgenticLoop:
             # Track token usage
             total_tokens["input"] += response.usage.get("input_tokens", 0)
             total_tokens["output"] += response.usage.get("output_tokens", 0)
+            # 这一轮的 input_tokens 才是"当前上下文有多大"，压缩阈值用它。
+            last_request_tokens = response.usage.get("input_tokens", 0)
 
             # ── Experimental Mode: emit per-round metrics ──
             try:

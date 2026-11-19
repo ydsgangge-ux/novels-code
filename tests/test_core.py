@@ -355,6 +355,28 @@ class TestBashWindowsCompat:
             "File should be created inside workspace"
 
 
+@pytest.mark.asyncio
+async def test_bash_nonzero_exit_is_error(tmp_path: Path):
+    """非零退出码必须判成失败。
+
+    回归点：以前 is_error 只看输出前缀（"[错误]"/"[超时]"），`npm test`
+    退出码 1、输出满屏 ✖ 也照样标成成功，于是"最后一次验证 ✅ 已通过"和
+    真实的测试失败同时出现，模型反复重跑、白白烧掉十几轮。
+    """
+    from gangge.layer3_agent.tools.bash import BashTool
+
+    tool = BashTool(workspace=str(tmp_path))
+
+    bad = await tool.execute(command='python -c "import sys; sys.exit(3)"')
+    assert bad.is_error is True
+    assert bad.metadata.get("exit_code") == 3
+    assert "[exit 3]" in bad.output
+
+    good = await tool.execute(command='python -c "import sys; sys.exit(0)"')
+    assert good.is_error is False
+    assert good.metadata.get("exit_code") == 0
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Test 5: Message chain integrity (_trim_history)
 # ═══════════════════════════════════════════════════════════════

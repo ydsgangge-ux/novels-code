@@ -90,64 +90,86 @@ class GrepTool(BaseTool):
         if not base.exists():
             return ToolResult(output=f"路径不存在: {search_path}", is_error=True)
 
-        # Default exclude patterns
-        exclude_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
-        if exclude:
-            exclude_dirs.add(exclude)
+        # path 指向单个文件是最常见的用法之一：过去直接 os.walk 一个文件会得到
+        # 0 个文件，然后返回"未找到匹配 (已搜索 0 个文件)"——看起来像"没有这个
+        # 关键字"，实际上根本没搜过。单个文件就直接搜它。
+        if base.is_file():
+            targets = [base]
+            rel_root = base.parent
+        else:
+            # Default exclude patterns
+            exclude_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
+            if exclude:
+                exclude_dirs.add(exclude)
+            targets = []
+            for root, dirs, filenames in os.walk(base):
+                # Filter excluded directories
+                dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
+                for fname in filenames:
+                    targets.append(Path(root) / fname)
+            rel_root = base
+
+        exts_filter: list[str] = []
+        if include:
+            # Support patterns like "*.py" or ".py" or "*.py,*.ts"
+            for ext in include.split(","):
+                ext = ext.strip()
+                if ext.startswith("*"):
+                    ext = ext[1:]  # Remove leading *
+                exts_filter.append(ext)
+
+        # Skip binary files
+        skip_exts = (".pyc", ".pyo", ".so", ".dll", ".exe", ".png", ".jpg", ".gif")
 
         results = []
         files_searched = 0
 
-        for root, dirs, filenames in os.walk(base):
-            # Filter excluded directories
-            dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
+        for fpath in targets:
+            fname = fpath.name
+            if exts_filter and not any(fname.endswith(ext) for ext in exts_filter):
+                continue
+            if fname.endswith(skip_exts):
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+                lines = content.splitlines()
+            except (OSError, PermissionError):
+                continue
 
-            for fname in filenames:
-                # Filter by include pattern
-                if include:
-                    # Support patterns like "*.py" or ".py" or "*.py,*.ts"
-                    exts = []
-                    for ext in include.split(","):
-                        ext = ext.strip()
-                        if ext.startswith("*"):
-                            ext = ext[1:]  # Remove leading *
-                        exts.append(ext)
-                    if not any(fname.endswith(ext) for ext in exts):
-                        continue
-
-                # Skip binary files
-                if fname.endswith((".pyc", ".pyo", ".so", ".dll", ".exe", ".png", ".jpg", ".gif")):
-                    continue
-
-                fpath = Path(root) / fname
-                try:
-                    content = fpath.read_text(encoding="utf-8", errors="replace")
-                    lines = content.splitlines()
-                except (OSError, PermissionError):
-                    continue
-
-                files_searched += 1
-                for i, line in enumerate(lines):
-                    if regex.search(line):
-                        rel_path = fpath.relative_to(base) if base != Path(".") else fpath
-                        # Get context
-                        start = max(0, i - context_lines)
-                        end = min(len(lines), i + context_lines + 1)
-                        context = [
-                            f"  {j + 1:>4}| {lines[j]}" + ("  ◀" if j == i else "")
-                            for j in range(start, end)
-                        ]
-                        results.append(
-                            f"\n{rel_path}:{i + 1}\n" + "\n".join(context)
-                        )
-                        if len(results) >= max_results:
-                            break
-                if len(results) >= max_results:
-                    break
+            files_searched += 1
+            for i, line in enumerate(lines):
+                if regex.search(line):
+                    try:
+                        rel_path = fpath.relative_to(rel_root)
+                    except ValueError:
+                        rel_path = fpath
+                    # Get context
+                    start = max(0, i - context_lines)
+                    end = min(len(lines), i + context_lines + 1)
+                    context = [
+                        f"  {j + 1:>4}| {lines[j]}" + ("  ◀" if j == i else "")
+                        for j in range(start, end)
+                    ]
+                    results.append(
+                        f"\n{rel_path}:{i + 1}\n" + "\n".join(context)
+                    )
+                    if len(results) >= max_results:
+                        break
             if len(results) >= max_results:
                 break
 
         if not results:
+            if files_searched == 0:
+                # 一个文件都没读到：不是"没匹配到"，而是搜索根本没发生，
+                # 直接说清楚，避免模型换着关键字重试到把轮次耗光。
+                return ToolResult(
+                    output=(
+                        f"⚠️ 在 '{search_path}' 下没有可搜索的文件，"
+                        f"pattern '{pattern}' 未执行任何匹配。"
+                        "请把 path 指向目录（例如 \".\"）或一个具体文件。"
+                    ),
+                    is_error=True,
+                )
             return ToolResult(
                 output=f"未找到匹配 '{pattern}' (已搜索 {files_searched} 个文件)",
             )

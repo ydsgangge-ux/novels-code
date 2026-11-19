@@ -36,6 +36,10 @@ _JS_EXTS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
 _GO_EXTS = {".go"}
 _RS_EXTS = {".rs"}
 
+# 纯 JS 后缀：tsc 在没开 allowJs 时，无论代码对错都会报"不支持的扩展名/需要 allowJs"，
+# 属于保证性假阳性。对这类文件显式开 allowJs 且只做语法检查（checkJs=false）。
+_JS_ONLY_EXTS = {".js", ".jsx", ".mjs", ".cjs"}
+
 _PYTHON_CHECKERS: dict[str, dict[str, Any]] = {
     "pyright": {
         "cmd": "pyright",
@@ -153,12 +157,20 @@ def _parse_pylint(output: str, path: str) -> list[dict]:
 
 _TS_LINE_RE = re.compile(r"\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+)?:?\s*(.*)")
 
+# tsc 的"配置/输入"类提示与代码质量无关，不能当成代码错误回给模型。
+_TS_CONFIG_NOISE_RE = re.compile(
+    r"allowJs|unsupported extension|No inputs were found|TS18003|TS6054|TS5053",
+    re.I,
+)
+
 
 def _parse_tsc(output: str, path: str) -> list[dict]:
     """tsc --pretty false 的输出：``file(12,5): error TS2322: ...``"""
     results = []
     for line in (output or "").splitlines():
         if Path(path).name not in line and path not in line:
+            continue
+        if _TS_CONFIG_NOISE_RE.search(line):
             continue
         m = _TS_LINE_RE.search(line)
         if not m:
@@ -314,9 +326,14 @@ class LintCheckTool(BaseTool):
 
         tsc = shutil.which("tsc") or shutil.which("tsc.cmd")
         if tsc or self._has_local_bin(file_path, "tsc"):
-            cmd = [tsc, "--noEmit", "--pretty", "false", str(file_path)] if tsc else [
-                npm, "--no-install", "tsc", "--noEmit", "--pretty", "false", str(file_path)
-            ]
+            if tsc:
+                cmd = [tsc, "--noEmit", "--pretty", "false"]
+            else:
+                cmd = [npm, "--no-install", "tsc", "--noEmit", "--pretty", "false"]
+            if file_path.suffix.lower() in _JS_ONLY_EXTS:
+                # 不带 allowJs 的话 tsc 对任何 .js 都报错，与代码本身无关
+                cmd += ["--allowJs", "--checkJs", "false"]
+            cmd.append(str(file_path))
             return self._run_and_report(cmd, "_parse_tsc", "tsc", file_path)
 
         return _missing("JS/TS", _JS_INSTALL_HINT)
@@ -374,9 +391,13 @@ class LintCheckTool(BaseTool):
             return ToolResult(output=f"✅ {label} 检查通过，未发现错误。")
         if not diagnostics:
             # 解析不出来但退出码非 0：把原始输出截一段还回去，别装作通过
-            snippet = ((result.stdout or "") + (result.stderr or "")).strip()[:800]
+            snippet = ((result.stdout or "") + (result.stderr or "")).strip()
+            if snippet and _TS_CONFIG_NOISE_RE.search(snippet):
+                # 检查器自身的配置问题（例如 tsc 不认识 .js），不是代码错误，
+                # 报成 error 会让模型反复"修"一份本来正确的代码。
+                return ToolResult(output=f"{label} 只报了配置提示，已跳过：{snippet[:200]}")
             return ToolResult(
-                output=f"⚠️ {label} 退出码 {result.returncode}，但没能解析出具体位置：\n{snippet}",
+                output=f"⚠️ {label} 退出码 {result.returncode}，但没能解析出具体位置：\n{snippet[:800]}",
                 is_error=True,
             )
 

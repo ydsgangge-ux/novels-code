@@ -108,6 +108,7 @@
   "execution_tool_call": "\n🔧 Tool Call: {name}({input})\n",
   "execution_workspace": "📁 Workspace: {path}\n",
   "execution_done": "\n✅ Done ({rounds} rounds, {tools} tool calls, Tokens: input={input}, output={output}{cost})\n",
+  "execution_incomplete": "\n⚠️ Incomplete: {reason} ({rounds} rounds, {tools} tool calls, Tokens: input={input}, output={output}{cost})\n",
 
   "plan_mode_prompt": "\n\n## Current Mode: Plan First, Execute Later\nPlease output a clear execution plan with steps, files involved, and risks.\nFormat:\n\n### Execution Plan\n1. ...\n2. ...\n\n### Files Involved\n- ...\n\n### Risk Assessment\n- ...\n\nAfter outputting the plan, wait for user confirmation. Do not execute automatically.\n",
 

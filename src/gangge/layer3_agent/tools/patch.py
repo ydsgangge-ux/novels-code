@@ -234,16 +234,29 @@ def seek_sequence(haystack: list[str], pattern: list[str], start: int = 0) -> tu
 
 
 def apply_file_ops(ops: list[FileOp], workspace: Path) -> list[dict[str, Any]]:
-    """Apply parsed ops to disk. Returns per-file records (path, diff, counts)."""
+    """Apply parsed ops to disk. Returns per-file records (path, diff, counts).
+
+    中途失败时明确告诉调用方"哪些文件已经改好并落盘了"——多文件补丁不是原子的，
+    以前只回一句"补丁应用失败"，模型得自己 grep 才知道改没改，容易重复应用。
+    """
     records: list[dict[str, Any]] = []
     for op in ops:
         target = _resolve(op.path, workspace)
-        if op.kind == "add":
-            records.append(_apply_add(op, target))
-        elif op.kind == "delete":
-            records.append(_apply_delete(op, target))
-        else:
-            records.append(_apply_update(op, target, workspace))
+        try:
+            if op.kind == "add":
+                records.append(_apply_add(op, target))
+            elif op.kind == "delete":
+                records.append(_apply_delete(op, target))
+            else:
+                records.append(_apply_update(op, target, workspace))
+        except PatchError as exc:
+            if records:
+                done = "、".join(f"`{r['path']}`" for r in records)
+                raise PatchError(
+                    f"{exc}\n本补丁包含 {len(ops)} 个文件，其中已成功写入: {done}。"
+                    "只需修剩下的失败块，不要重复应用已成功的部分。"
+                ) from exc
+            raise
     return records
 
 

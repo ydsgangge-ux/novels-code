@@ -1405,7 +1405,11 @@ class GanggeWorker(QThread):
                 self._streamed_text_chars += len(block.text or "")
                 self.text_block.emit(block.text, "assistant")
             elif block.type == ContentType.THINKING:
-                self.text_block.emit(block.text, "thinking")
+                if getattr(block, "partial", False):
+                    # 增量片段只喂给"实时思考"窗口；没开窗口时下游直接丢弃。
+                    self.text_block.emit(block.text, "thinking-live")
+                else:
+                    self.text_block.emit(block.text, "thinking")
             elif block.type == ContentType.TOOL_USE:
                 inp = json.dumps(block.tool_input, ensure_ascii=False)[:200]
                 self.text_block.emit(_t("execution_tool_call", name=block.tool_name, input=inp), "tool")
@@ -1488,10 +1492,19 @@ class GanggeWorker(QThread):
         # 一律显示"✅ 完成"——用户等了 10 分钟，以为任务做完了，实际一行没改。
         reason = str(getattr(result, "completion_reason", "") or "")
         error_text = ""
+        warn_text = ""
         if reason == "llm_timeout":
             error_text = "LLM 调用超时，任务未完成（可加大 LLM_TIMEOUT 或检查网络）"
         elif reason == "llm_error":
             error_text = "LLM 调用失败，任务未完成"
+        elif reason == "stalled_no_progress":
+            # 自动收尾＝待办没做完就被结束，最后一次验证很可能还是失败的，
+            # 这时再打 ✅ 完成会让人以为测试全过。
+            warn_text = "已自动收尾，待办未完成，最后一次验证可能未通过"
+        elif reason == "max_rounds":
+            warn_text = "已达最大工具调用轮数，任务可能未完成"
+        elif reason == "consecutive_readonly":
+            warn_text = "连续多轮只读，未做实际修改"
 
         summary = {
             "rounds": result.total_rounds,
@@ -1502,6 +1515,7 @@ class GanggeWorker(QThread):
             "cost": cost_display,
             "completion_reason": reason,
             "error": error_text,
+            "warning": warn_text,
             "shadow_checkpoint_before": result.extra.get("shadow_checkpoint_before", ""),
             "shadow_checkpoint_after": result.extra.get("shadow_checkpoint_after", ""),
         }
@@ -1516,6 +1530,12 @@ class GanggeWorker(QThread):
         if error_text:
             # 超时/失败只报错误，不再打一行"执行完成"让结论自相矛盾。
             self.text_block.emit(f"\n❌ {error_text}\n", "error")
+        elif warn_text:
+            self.text_block.emit(
+                _t("execution_incomplete", reason=warn_text, rounds=result.total_rounds,
+                   tools=len(result.tool_executions), input=inp, output=out, cost=cost_part),
+                "system",
+            )
         else:
             self.text_block.emit(
                 _t("execution_done", rounds=result.total_rounds, tools=len(result.tool_executions), input=inp, output=out, cost=cost_part),
@@ -5016,13 +5036,30 @@ def auto_git_commit(workspace: str, message: str) -> str:
             cwd=workspace, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
         if result.returncode == 0:
-            hash_match = ""
-            for line in (result.stdout or "").splitlines():
-                if "commit" in line:
-                    hash_match = line.strip()
-                    break
-            return hash_match or "committed"
+            # 原来靠解析 commit 输出里含 "commit" 的那一行，普通提交
+            # （[master abc1234] xxx）根本匹配不到，只能返回 "committed"。
+            try:
+                short = subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=workspace, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=5,
+                ).stdout.strip()
+            except Exception:
+                short = ""
+            return f"已提交 {short}" if short else "committed"
         elif "nothing to commit" in (result.stdout or "") or "nothing to commit" in (result.stderr or ""):
+            # 工作区已干净不等于"什么都没发生"：shadow git 的 checkpoint 可能已经
+            # 提交过这次改动。只说"(无变更)"会让人以为改动没被记录，这里带上 HEAD。
+            try:
+                head = subprocess.run(
+                    ["git", "log", "-1", "--oneline"],
+                    cwd=workspace, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=5,
+                ).stdout.strip()
+            except Exception:
+                head = ""
+            if head:
+                return f"无需重复提交（工作区已干净，最近提交 {head}）"
             return "(无变更)"
         else:
             return f"commit failed: {(result.stderr or '')[:200]}"
@@ -6135,6 +6172,77 @@ class ExperimentalPanel(QWidget):
 # ═════════════════════════════════════════════════════════════════
 #  Main Window
 # ═════════════════════════════════════════════════════════════════
+class ThinkingWindow(QDialog):
+    """实时思考窗口（手动打开）。
+
+    主输出区仍然只在模型调用结束时给一张折叠卡片；这里是独立窗口，增量文本
+    边到边写。没打开时 UI 直接丢弃增量，主界面布局和渲染开销都不受影响。
+    """
+
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🧠 实时思考")
+        self.resize(660, 500)
+        self.setStyleSheet("QDialog{background:#0d1117;}")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        bar = QHBoxLayout()
+        self._count_label = QLabel("0 字")
+        self._count_label.setStyleSheet("color:#8b949e;font-size:11px;")
+        bar.addWidget(self._count_label)
+        bar.addStretch()
+
+        self._follow_cb = QCheckBox("跟随最新")
+        self._follow_cb.setChecked(True)
+        self._follow_cb.setStyleSheet("QCheckBox{color:#8b949e;font-size:11px;}")
+        bar.addWidget(self._follow_cb)
+
+        clear_btn = QPushButton("清空")
+        clear_btn.setStyleSheet(
+            "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:4px;"
+            "color:#8b949e;font-size:11px;padding:2px 10px;}"
+            "QPushButton:hover{background:#30363d;color:#c9d1d9;}"
+        )
+        clear_btn.clicked.connect(self.clear)
+        bar.addWidget(clear_btn)
+        lay.addLayout(bar)
+
+        self._view = QPlainTextEdit()
+        self._view.setReadOnly(True)
+        self._view.setStyleSheet(
+            "QPlainTextEdit{background:#0d1117;color:#c9d1d9;border:1px solid #21262d;"
+            "font-family:'Consolas','Courier New',monospace;font-size:12px;padding:6px;}"
+        )
+        lay.addWidget(self._view, 1)
+
+        self._chars = 0
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        self._chars += len(text)
+        self._count_label.setText(f"{self._chars} 字")
+        self._view.moveCursor(QTextCursor.MoveOperation.End)
+        self._view.insertPlainText(text)
+        if self._follow_cb.isChecked():
+            scroll = self._view.verticalScrollBar()
+            scroll.setValue(scroll.maximum())
+
+    def clear(self) -> None:
+        self._view.clear()
+        self._chars = 0
+        self._count_label.setText("0 字")
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 class GanggeDesktop(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -6149,6 +6257,8 @@ class GanggeDesktop(QMainWindow):
         self._current_session_id: str = ""
         self._batch_tasks: list[str] = []
         self._batch_queue: list[str] = []
+        # 实时思考窗口：懒创建，用户点开才接收增量（见 _append_output）
+        self._thinking_window: ThinkingWindow | None = None
 
         # Session DB
         self._db = SessionDB()
@@ -6645,6 +6755,18 @@ class GanggeDesktop(QMainWindow):
         )
         self._batch_btn.clicked.connect(self._run_batch)
         btn_col.addWidget(self._batch_btn)
+
+        # 实时思考入口：默认不出声，点开才开窗接收增量
+        self._think_btn = QPushButton("🧠 思考")
+        self._think_btn.setToolTip("实时查看模型思考过程（独立窗口，关掉即停止渲染）")
+        self._think_btn.setFixedHeight(28)
+        self._think_btn.setStyleSheet(
+            "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:4px;"
+            "color:#8b949e;font-size:11px;padding:2px 8px;}"
+            "QPushButton:hover{background:#30363d;color:#c9d1d9;}"
+        )
+        self._think_btn.clicked.connect(self._toggle_thinking_window)
+        btn_col.addWidget(self._think_btn)
 
         self._btn_run = QPushButton(_t("btn_send"))
         self._btn_run.setToolTip(_t("tip_send"))
@@ -9190,6 +9312,9 @@ class GanggeDesktop(QMainWindow):
             os.environ["GANGGE_WORKSPACE"] = workspace
 
     def _execute_single(self, llm: BaseLLM, task: str, batch_index: int = 0, batch_total: int = 1):
+        # 新任务：清掉上一个任务留在实时思考窗口里的内容
+        if self._thinking_window is not None:
+            self._thinking_window.clear()
         workspace = self._ensure_workspace() or str(Path.cwd())
         # 手动输入的新路径可能还不存在 → 自动建出来
         try:
@@ -9429,6 +9554,9 @@ class GanggeDesktop(QMainWindow):
 
         if summary.get("error"):
             self._status_label.setText(f"❌ {summary['error']}")
+        elif summary.get("warning"):
+            r = summary.get("rounds", 0)
+            self._status_label.setText(f"⚠️ 未完成: {r} 轮（{summary['warning']}）")
         elif summary:
             r = summary.get("rounds", 0)
             c = summary.get("tool_calls", 0)
@@ -9620,8 +9748,32 @@ class GanggeDesktop(QMainWindow):
             return text
         return cls._RICH_TAG.sub("", text)
 
+    def _toggle_thinking_window(self):
+        """开/关实时思考窗口。懒创建，关掉之后增量会被直接丢弃。"""
+        if self._thinking_window is None:
+            self._thinking_window = ThinkingWindow(self)
+            self._thinking_window.closed.connect(
+                lambda: self._think_btn.setText("🧠 思考")
+            )
+        if self._thinking_window.isVisible():
+            self._thinking_window.hide()
+            self._think_btn.setText("🧠 思考")
+        else:
+            self._thinking_window.show()
+            self._thinking_window.raise_()
+            self._thinking_window.activateWindow()
+            self._think_btn.setText("🧠 思考 · 开")
+
     def _append_output(self, text: str, role: str = ""):
         """Render message as a styled bubble card."""
+        if role == "thinking-live":
+            # 实时思考只进独立窗口；窗口没开就什么都不做。不建卡片、不重排，
+            # 所以主界面完全不受影响（这是"手动点开才展示"的关键）。
+            win = getattr(self, "_thinking_window", None)
+            if win is not None and win.isVisible():
+                win.append(text)
+            return
+
         # Rich markup ([dim]…[/dim]) is a terminal-UI detail; inside this HTML
         # card it would be shown literally.
         text = self._strip_rich_markup(text)
