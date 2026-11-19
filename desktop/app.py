@@ -1483,6 +1483,16 @@ class GanggeWorker(QThread):
                                           result.total_tokens.get("output", 0))
         except Exception:
             pass
+        # ── 超时/失败必须透出到 UI ──
+        # 以前 summary 只带 rounds/tokens，completion_reason 被丢掉，界面于是
+        # 一律显示"✅ 完成"——用户等了 10 分钟，以为任务做完了，实际一行没改。
+        reason = str(getattr(result, "completion_reason", "") or "")
+        error_text = ""
+        if reason == "llm_timeout":
+            error_text = "LLM 调用超时，任务未完成（可加大 LLM_TIMEOUT 或检查网络）"
+        elif reason == "llm_error":
+            error_text = "LLM 调用失败，任务未完成"
+
         summary = {
             "rounds": result.total_rounds,
             "tool_calls": len(result.tool_executions),
@@ -1490,6 +1500,8 @@ class GanggeWorker(QThread):
             "final_response": result.final_response,
             "memory_bank_update": mb_update,
             "cost": cost_display,
+            "completion_reason": reason,
+            "error": error_text,
             "shadow_checkpoint_before": result.extra.get("shadow_checkpoint_before", ""),
             "shadow_checkpoint_after": result.extra.get("shadow_checkpoint_after", ""),
         }
@@ -1501,13 +1513,17 @@ class GanggeWorker(QThread):
         inp = result.total_tokens.get("input", 0)
         out = result.total_tokens.get("output", 0)
         cost_part = f" | 费用: {cost_display}" if cost_display else ""
-        self.text_block.emit(
-            _t("execution_done", rounds=result.total_rounds, tools=len(result.tool_executions), input=inp, output=out, cost=cost_part),
-            "system",
-        )
+        if error_text:
+            # 超时/失败只报错误，不再打一行"执行完成"让结论自相矛盾。
+            self.text_block.emit(f"\n❌ {error_text}\n", "error")
+        else:
+            self.text_block.emit(
+                _t("execution_done", rounds=result.total_rounds, tools=len(result.tool_executions), input=inp, output=out, cost=cost_part),
+                "system",
+            )
         # The answer already streamed into its bubble; emitting the assembled
         # text again printed every response twice.
-        if result.final_response and not getattr(self, "_streamed_text_chars", 0):
+        if not error_text and result.final_response and not getattr(self, "_streamed_text_chars", 0):
             self.text_block.emit(f"\n{result.final_response}\n", "assistant")
 
         try:
@@ -5625,6 +5641,20 @@ def _parse_token_count(text: str, default: int) -> int:
     return value if value >= 256 else default
 
 
+#: 上下文/输出预设：(标签, (上下文窗口, 输出上限, 历史轮数, 工具输出截断字符))
+#: 判定依据不是"模型多少钱"，而是"它的窗口和听话程度"：小模型窗口小、容易
+#: 在噪声里跑偏，所以历史短、截断狠；旗舰模型反过来。
+CTX_PRESETS: tuple[tuple[str, tuple[int, int, int, int]], ...] = (
+    ("小模型 / 免费额度（GLM-Flash、7B-8B）", (131_072, 8_192, 6, 4_000)),
+    ("通用编程（DeepSeek / Qwen-Max）", (131_072, 16_384, 12, 8_000)),
+    ("长上下文（200K 级：Claude / GPT）", (262_144, 32_768, 24, 16_000)),
+    # 300K：窗口够大、又不至于让注意力被噪声摊薄的折中区间，长任务里最容易
+    # 保持稳定输出。历史轮数与截断按 200K ↔ 512K 之间插值取整。
+    ("300K 级（长任务舒适区）", (307_200, 32_768, 28, 20_000)),
+    ("超大窗口（512K–1M：旗舰模型）", (1_048_576, 65_536, 40, 40_000)),
+)
+
+
 def _format_token_count(value: int) -> str:
     """131072 → "128K"，1048576 → "1M"，其它原样显示。"""
     if value >= 1024 * 1024 and value % (1024 * 1024) == 0:
@@ -5723,6 +5753,46 @@ class ExperimentalPanel(QWidget):
         self._graph_text.setStyleSheet(self._mono_style())
         self._tabs.addTab(self._graph_text, "调用图")
 
+        # 7. 任务列表（TodoWrite 实时镜像）
+        #    TodoState 是进程内全局单例，工具写入、loop 读取、这里只读，
+        #    所以不需要额外事件通道：定时比对快照即可做到准实时。
+        todo_tab = QWidget()
+        todo_lay = QVBoxLayout(todo_tab)
+        todo_lay.setContentsMargins(6, 6, 6, 6)
+        todo_lay.setSpacing(4)
+
+        self._todo_stat = QLabel("还没有任务列表 — 模型尚未调用 TodoWrite")
+        self._todo_stat.setStyleSheet("color:#8b949e;font-size:11px;")
+        self._todo_stat.setWordWrap(True)
+        todo_lay.addWidget(self._todo_stat)
+
+        self._todo_table = QTableWidget(0, 4)
+        self._todo_table.setHorizontalHeaderLabels(["状态", "任务内容", "优先级", "ID"])
+        self._todo_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self._todo_table.setColumnWidth(0, 44)
+        self._todo_table.setColumnWidth(2, 66)
+        self._todo_table.setColumnWidth(3, 56)
+        self._todo_table.verticalHeader().setVisible(False)
+        self._todo_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._todo_table.setAlternatingRowColors(True)
+        self._todo_table.setStyleSheet(self._table_style())
+        todo_lay.addWidget(self._todo_table, 3)
+
+        self._todo_hint = QLabel("")
+        self._todo_hint.setStyleSheet("color:#d29922;font-size:11px;")
+        self._todo_hint.setWordWrap(True)
+        todo_lay.addWidget(self._todo_hint)
+
+        self._todo_raw = QTextBrowser()
+        self._todo_raw.setStyleSheet(self._mono_style())
+        self._todo_raw.setMinimumHeight(110)
+        self._todo_raw.setToolTip("模型每轮实际看到的任务清单（与注入 system 的文本一致）")
+        todo_lay.addWidget(self._todo_raw, 2)
+
+        self._tabs.addTab(todo_tab, "任务")
+
         layout.addWidget(self._tabs)
 
         # ── State ──
@@ -5730,6 +5800,15 @@ class ExperimentalPanel(QWidget):
         self._compression_events: list[dict] = []
         self._prompt_dump: str = ""  # latest full prompt text
         self._static_system: str = ""
+        self._todo_snapshot: str = ""   # 上次渲染的任务列表快照（变了才重绘）
+        self._todo_raw_text: str = ""
+
+        from PyQt6.QtCore import QTimer
+
+        self._todo_timer = QTimer(self)
+        self._todo_timer.setInterval(500)   # 500ms 足够"实时"，又不抢 UI 线程
+        self._todo_timer.timeout.connect(self._refresh_todo_view)
+        self._todo_timer.start()
 
     @staticmethod
     def _mono_style() -> str:
@@ -5764,6 +5843,84 @@ class ExperimentalPanel(QWidget):
         self._attention_text.clear()
         self._graph_text.clear()
         self._round_label.setText("0 轮")
+        # 只重置渲染快照（任务本身属于模型状态，不随"清空"丢掉）
+        self._todo_snapshot = ""
+        self._todo_raw_text = ""
+
+    # ── TodoWrite mirror ─────────────────────────────────────
+
+    @staticmethod
+    def _read_todo_state() -> tuple[list[dict], str]:
+        """读取 agent 的全局 todo 单例（工具写、loop 读、这里只读）。"""
+        try:
+            from gangge.layer3_agent.tools.todo import get_todo_state
+        except Exception:  # 包不在 sys.path 时别连累实验面板其它页
+            return [], ""
+        state = get_todo_state()
+        return state.get_all(), state.format_for_injection()
+
+    def _refresh_todo_view(self):
+        """把当前 todo 列表镜像到"任务"页；内容没变就直接返回。"""
+        todos, injection = self._read_todo_state()
+        snapshot = json.dumps(todos, ensure_ascii=False, sort_keys=True, default=str)
+        if snapshot == self._todo_snapshot and injection == self._todo_raw_text:
+            return
+        self._todo_snapshot = snapshot
+        self._todo_raw_text = injection
+
+        done = sum(1 for t in todos if t.get("status") == "completed")
+        doing = sum(1 for t in todos if t.get("status") == "in_progress")
+
+        self._todo_table.setRowCount(len(todos))
+        for row, todo in enumerate(todos):
+            status = str(todo.get("status") or "pending")
+            icon = {"completed": "✅", "in_progress": "▶", "pending": "⬜"}.get(status, "?")
+            fg = {"completed": "#8b949e", "in_progress": "#58a6ff"}.get(status, "#c9d1d9")
+            cells = (
+                (icon, "#3fb950" if status == "completed" else fg),
+                (str(todo.get("content") or ""), fg),
+                ({"high": "高", "medium": "中", "low": "低"}.get(
+                    str(todo.get("priority") or "").lower(), "-"), "#8b949e"),
+                (str(todo.get("id") or ""), "#8b949e"),
+            )
+            for col, (text, color) in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setForeground(QColor(color))
+                if status == "completed":
+                    font = item.font()
+                    font.setStrikeOut(True)
+                    item.setFont(font)
+                self._todo_table.setItem(row, col, item)
+
+        if todos:
+            self._todo_stat.setText(
+                f"共 {len(todos)} 个 · ✅ 已完成 {done} · ▶ 进行中 {doing} · "
+                f"⬜ 待办 {len(todos) - done - doing}　更新于 "
+                f"{datetime.now().strftime('%H:%M:%S')}"
+            )
+        else:
+            self._todo_stat.setText("还没有任务列表 — 模型尚未调用 TodoWrite")
+
+        self._todo_hint.setText("　".join(self._todo_quality_warnings(todos, done, doing)))
+        self._todo_raw.setPlainText(injection or "（模型尚未写入任务，无注入文本）")
+
+    def _todo_quality_warnings(self, todos: list[dict], done: int, doing: int) -> list[str]:
+        """几条一眼能看出"这份计划不对劲"的检查，最多显示 3 条。"""
+        if not todos:
+            return []
+        warns: list[str] = []
+        blank = sum(1 for t in todos if not str(t.get("content") or "").strip())
+        if blank:
+            warns.append(f"⚠ {blank} 个任务内容为空")
+        if len(todos) > 15:
+            warns.append(f"⚠ 任务数 {len(todos)} 偏多，计划可能拆得太碎")
+        contents = [str(t.get("content") or "").strip() for t in todos]
+        dup = sum(1 for c in set(contents) if c and contents.count(c) > 1)
+        if dup:
+            warns.append(f"⚠ {dup} 条内容重复")
+        if len(self._metrics_history) >= 3 and done == 0 and doing == 0:
+            warns.append(f"⚠ 已 {len(self._metrics_history)} 轮无 in_progress，模型可能没在推进")
+        return warns[:3]
 
     def update_metrics(self, data: dict):
         """Receive a metrics dict emitted by AgenticLoop.
@@ -6917,9 +7074,16 @@ class GanggeDesktop(QMainWindow):
         cf = QFormLayout(ctx_g)
         cf.setSpacing(6)
 
+        _preset = QComboBox()
+        _preset.addItem("自定义（手动调下面四项）", None)
+        for _label, _values in CTX_PRESETS:
+            _preset.addItem(_label, _values)
+        _preset.setToolTip("按模型能力一键填好下面四项；选完还能继续手改")
+        cf.addRow("预设", _preset)
+
         _ctx = QComboBox()
         _ctx.setEditable(True)      # 也可以直接填 300000 / 1M
-        for _v in (131_072, 204_800, 262_144, 524_288, 1_048_576):
+        for _v in (131_072, 204_800, 262_144, 307_200, 524_288, 1_048_576):
             _ctx.addItem(_format_token_count(_v), _v)
         _ctx.setCurrentText(_format_token_count(self._ctx_window_tokens()))
         _ctx.setToolTip("模型上下文窗口。只影响“用到 92% 就压缩”的触发点和占用率显示。")
@@ -6945,6 +7109,18 @@ class GanggeDesktop(QMainWindow):
         _trunc.setValue(self._tool_result_chars())
         _trunc.setToolTip("单条工具输出最多保留多少字符（超出会截掉中间、保留头尾）。")
         cf.addRow("工具输出截断 (字符)", _trunc)
+
+        def _apply_ctx_preset(_index: int) -> None:
+            values = _preset.currentData()
+            if not values:
+                return
+            ctx_v, out_v, hist_v, trunc_v = values
+            _ctx.setCurrentText(_format_token_count(ctx_v))
+            _out.setCurrentText(_format_token_count(out_v))
+            _hist.setValue(hist_v)
+            _trunc.setValue(trunc_v)
+
+        _preset.currentIndexChanged.connect(_apply_ctx_preset)
 
         _ctx_hint = QLabel("窗口写大只是更晚触发压缩，不会让模型变强；写小了会频繁压缩、丢上下文。")
         _ctx_hint.setWordWrap(True)

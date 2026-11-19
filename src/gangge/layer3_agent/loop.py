@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,6 +23,8 @@ from gangge.layer3_agent.tools.registry import ToolRegistry
 from gangge.layer3_agent.tools.base import ToolResult
 from gangge.layer3_agent.prompts.system import build_system_prompt, build_dynamic_state_text, detect_empty_workspace
 from gangge.layer3_agent.progress_emitter import ProgressEmitter, EventType
+from gangge.runtime.intent import classify
+from gangge.runtime.intent import last_user_text as _last_user_text
 from gangge.i18n import t
 from gangge.layer4_tools.mcp_client import MCPClientManager
 from gangge.layer4_permission.guard import (
@@ -88,6 +91,67 @@ class TurnBuffer:
 
     def is_empty(self) -> bool:
         return not self.text_parts and not self.tool_uses and not self.tool_results
+
+
+# ── Verification detection ───────────────────────────────────────────────
+# "跑过一次 bash" 不等于"验证过"：`bash ls` 也能让 verified_after_write 为真。
+# 这里按命令内容判定，避免弱模型用无意义命令冒充"已验证"。
+_VERIFY_CMD_RE = re.compile(
+    r"(?:^|[\s;&|])(?:"
+    r"pytest|py\.test|unittest|-m\s+(?:py_compile|compileall|pytest|unittest|mypy|ruff)|"
+    r"ruff\s+check|pyright|mypy|tsc|eslint|"
+    r"npm\s+(?:run\s+)?test|yarn\s+test|pnpm\s+(?:run\s+)?test|"
+    r"go\s+(?:test|vet|build)|cargo\s+(?:test|check|build)|"
+    r"make\s+(?:test|check)|tox"
+    r")",
+    re.IGNORECASE,
+)
+
+#: 这两个工具本身就是验证动作，``bash`` 则要看命令内容。
+_VERIFY_TOOLS = ("lint_check", "run_tests")
+
+
+def is_verification_command(command: str) -> bool:
+    """这条 shell 命令算不算"验证"（测试 / 编译 / 静态检查）？"""
+    return bool(_VERIFY_CMD_RE.search(command or ""))
+
+
+def describe_verification(tool: str, arguments: dict[str, Any] | None) -> str:
+    """一句话描述这次验证用的是什么，供动态状态注入。"""
+    args = arguments or {}
+    detail = str(args.get("command") or args.get("path") or args.get("pattern") or "")
+    detail = " ".join(detail.split())
+    if len(detail) > 80:
+        detail = detail[:77] + "..."
+    return f"`{tool} {detail}`".replace(" `", " `").strip()
+
+
+#: 从被截断的中段里"抢救"出来的行：报错、失败用例、编译器诊断。
+#: 只认明确的错误标记——``line 12`` 这种太泛，会把正常代码行也算进来。
+_ERROR_LINE_RE = re.compile(
+    r"(Traceback|FAILED|FATAL|✗|❌|File \"|"
+    r"[A-Za-z_]{2,}(?:Error|Exception)\b|"                       # ValueError / JSONDecodeError
+    r"(?<![A-Za-z])(?:error|errors|Error|ERROR|Exception|exception|failed|失败|异常)\b|"
+    r"[EWF]\d{3}\b|TS\d+\b|:\d+:\s*(?:error|warning))"
+)
+
+
+def _error_lines(text: str, budget: int) -> str:
+    """挑出报错行，最多占 ``budget`` 个字符。"""
+    if not text or budget <= 0:
+        return ""
+    picked = [ln.strip() for ln in text.splitlines() if _ERROR_LINE_RE.search(ln)]
+    if not picked:
+        return ""
+    out: list[str] = []
+    used = 0
+    for line in picked[:40]:
+        line = line[:300]
+        if used + len(line) > budget:
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)
 
 
 @dataclass
@@ -296,6 +360,8 @@ class AgenticLoop:
         self._profile: str = ""  # set by run()
         self._llm_failures: int = 0  # consecutive LLM call failures
         self._last_streamed: int = 0  # chars already shown to the UI by streaming
+        # 最近一次验证结果：滑窗/压缩会把它从历史里裁掉，所以每轮重新注入
+        self._last_verification_note: str = ""
 
     def set_stream_callback(self, callback: StreamCallback) -> None:
         """Set callback for streaming content blocks."""
@@ -629,6 +695,7 @@ class AgenticLoop:
             memory_bank_changelog=self.config.memory_bank_changelog[:200] if self.config.memory_bank_changelog else "",
             memory_bank_decisions=self.config.memory_bank_decisions[:300] if self.config.memory_bank_decisions else "",
             todo_injection=todo_injection,
+            last_verification=self._last_verification_note,
             round_warning=round_warning,
         )
 
@@ -950,6 +1017,15 @@ class AgenticLoop:
             return "; ".join(paths) if paths else "apply_patch"
         return tool_name or ""
 
+    @staticmethod
+    def _is_verification_call(tool_name: str, arguments: dict[str, Any] | None) -> bool:
+        """这次调用算不算"验证"？``bash`` 要看命令内容，其余按工具名。"""
+        if tool_name in _VERIFY_TOOLS:
+            return True
+        if tool_name == "bash":
+            return is_verification_command(str((arguments or {}).get("command") or ""))
+        return False
+
     async def _auto_lint_check(self, file_path: str) -> str:
         """Run a quick lint check on a modified file. Returns summary or empty string."""
         try:
@@ -987,7 +1063,6 @@ class AgenticLoop:
         from gangge.runtime import events as runtime_events
 
         write_tools = ("write_file", "edit_file", "create_tool")
-        verify_tools = ("bash", "lint_check")
         last_write = max(
             (i for i, e in enumerate(executions) if e.tool_name in write_tools),
             default=-1,
@@ -998,9 +1073,12 @@ class AgenticLoop:
             "user_task": user_task or "",
             "is_empty_dir": is_empty_dir,
             "has_modified_files": last_write >= 0,
+            # 只认"真的验证过"：lint_check / run_tests，或 bash 里跑的是
+            # pytest / tsc / ruff 这类命令。`bash ls` 不算——否则弱模型一句
+            # 列目录就能骗过 require_verification。
             "verified_after_write": (
                 any(
-                    e.tool_name in verify_tools and not e.is_error
+                    not e.is_error and self._is_verification_call(e.tool_name, e.input)
                     for e in executions[last_write + 1 :]
                 )
                 if last_write >= 0
@@ -1348,6 +1426,14 @@ class AgenticLoop:
 
             output = self._truncate_tool_output(result.output)
 
+            # 记住最后一次验证结论：历史会被滑窗裁掉，动态状态每轮重新注入。
+            if self._is_verification_call(name, arguments):
+                label = describe_verification(name, arguments)
+                if result.is_error:
+                    self._last_verification_note = f"❌ {label} 未通过\n{result.output[:300]}"
+                else:
+                    self._last_verification_note = f"✅ {label} 已通过"
+
             # File changes are recorded *before* the result is sealed into the
             # message, so the post-write lint finding travels with it. The old
             # order appended lint to a local variable after the message had been
@@ -1458,10 +1544,13 @@ class AgenticLoop:
         return await self.tools.execute(name, arguments)
 
     def _truncate_tool_output(self, output: str) -> str:
-        """Cap long output, keeping the head *and* the tail.
+        """Cap long output, keeping the head, the tail, **and every error line**.
 
         Errors and summaries live at the end; truncating from the front alone
-        was hiding exactly the part the model needed.
+        was hiding exactly the part the model needed. Head/tail alone is still
+        wrong for a 2000-line pytest run — the failing assertions sit in the
+        middle. So part of the budget goes to error-looking lines first, and
+        the rest is filled with head + tail.
         """
         if (
             not self.config.enable_tool_result_truncation
@@ -1470,12 +1559,16 @@ class AgenticLoop:
             return output
         max_len = self.config.tool_result_max_chars
         head_len = max_len * 2 // 5
-        tail_len = max_len - head_len - 30
-        return (
-            output[:head_len]
-            + f"\n...(中间截断，共{len(output)}字符)...\n"
-            + output[-tail_len:]
-        )
+        tail_len = max(0, max_len - head_len - 160)
+        middle_end = len(output) - tail_len if tail_len else len(output)
+        hot = _error_lines(output[head_len:middle_end], budget=max_len // 3)
+        parts = [output[:head_len]]
+        if hot:
+            parts.append(f"\n...(中间省略，以下为报错行)...\n{hot}")
+        parts.append(f"\n...(中间截断，共{len(output)}字符)...\n")
+        if tail_len:
+            parts.append(output[-tail_len:])
+        return "".join(parts)
 
     async def _record_file_change(
         self,
@@ -1491,6 +1584,9 @@ class AgenticLoop:
 
         if path:
             lint_note = await self._auto_lint_check(path) or ""
+            if lint_note:
+                # 自动检查失败 = 最近一次验证未通过，用它覆盖上一条"已通过"
+                self._last_verification_note = f"❌ 写入 {path} 后自动检查未通过\n{lint_note[:300]}"
             try:
                 source = Path(path)
                 classes: list[str] = []
@@ -1706,22 +1802,10 @@ class AgenticLoop:
         logger.info(f"[Loop] Agent profile: {profile} ({profile_desc})")
 
         # ── Quick Q&A pre-check: skip tool loop for pure explanation questions ──
-        # Questions like "解释一下你刚才做了什么" don't need tool execution.
-        # Key words that indicate Q&A: 解释/说明/为什么/怎么回事/explain/what/why/describe
-        # Key words that indicate task: 创建/修改/写/优化/改/add/create/write/edit/fix
-        last_user_text = ""
-        for msg in reversed(messages):
-            if msg.role == Role.USER:
-                t = msg.get_text().strip()
-                if t and not t.startswith("[系统提示]") and not t.startswith("##"):
-                    last_user_text = t
-                    break
-        _qa_words = ["解释", "说明", "为什么", "怎么回事", "什么意思", "explain", "what is", "why did", "describe"]
-        _task_words = ["创建", "修改", "写", "优化", "改", "加", "增加", "实现", "重构",
-                        "add", "create", "write", "edit", "fix", "implement", "refactor", "update"]
-        _is_qa = any(w in last_user_text.lower() for w in _qa_words)
-        _has_task = any(w in last_user_text.lower() for w in _task_words)
-        if _is_qa and not _has_task:
+        # 判定统一走 gangge.runtime.intent：loop 与 stop_guard 共用一份词表，
+        # 否则"创建一个 HTML"会在两条路径上得到相反结论（这里算任务、护栏算闲聊）。
+        last_user_text = _last_user_text(messages)
+        if classify(last_user_text) == "answer":
             await self._emit(ContentBlock(
                 type=ContentType.TEXT,
                 text="📋 检测到问答请求，直接回答\n",
@@ -1757,14 +1841,9 @@ class AgenticLoop:
         from gangge.layer3_agent.tools.todo import get_todo_state
         todo_state = get_todo_state()
         # Clear previous task's todos unless user explicitly says "继续"
-        _should_keep_todos = False
-        for msg in messages:
-            if msg.role == Role.USER:
-                text = msg.get_text().strip()
-                if text and ("继续" in text or "continue" in text.lower()):
-                    _should_keep_todos = True
-                    break
+        _should_keep_todos = "继续" in last_user_text or "continue" in last_user_text.lower()
         self._is_new_task = False  # set below
+        self._last_verification_note = ""   # 新任务：上一次的验证结论作废
         if not _should_keep_todos:
             todo_state.clear()
             self._is_new_task = True  # new task: don't exit until model creates at least one todo
@@ -1773,13 +1852,9 @@ class AgenticLoop:
         self._ensure_memory_bank()
 
         # ── Extract user task description for commit messages ──
-        user_task_desc = ""
-        for msg in messages:
-            if msg.role == Role.USER:
-                text = msg.get_text().strip()
-                if text and not text.startswith("[系统提示]"):
-                    user_task_desc = text[:80].replace("\n", " ")
-                    break
+        # 取"最后一条"用户消息：多轮对话里第一条是最初的任务，用它会让提交信息、
+        # 意图判定和进度记录一直停在旧任务上（三次 checkpoint 同一个标题就是这么来的）。
+        user_task_desc = last_user_text[:80].replace("\n", " ")
 
         # ── Shadow Git: auto-checkpoint before AI starts ──
         shadow_checkpoint = await self._git_checkpoint(

@@ -116,7 +116,11 @@ class OpenAICompatLLM(BaseLLM):
                 texts: list[str] = []
                 tool_calls: list[dict[str, Any]] = []
                 for block in msg.content:
-                    if block.type in (ContentType.TEXT, ContentType.THINKING):
+                    # 只回传正文，reasoning 不进 content：
+                    # 1) 协议上不该回传（DeepSeek 明确禁止 reasoning_content 回传）；
+                    # 2) 实测同一段 9 万字符的思考在后续请求里被重发了 13 次，
+                    #    既浪费输入 token，又让模型以为"自己已经答过了"而不动手。
+                    if block.type == ContentType.TEXT:
                         if block.text:
                             texts.append(block.text)
                     elif block.type == ContentType.TOOL_USE and block.tool_call_id:

@@ -75,6 +75,21 @@ class AnthropicLLM(BaseLLM):
     ) -> list[dict[str, Any]]:
         return [t.to_anthropic_schema() for t in tools]
 
+    @staticmethod
+    def _system_param(system: str) -> list[dict[str, Any]]:
+        """system 带上 cache_control：缓存断点覆盖它之前的全部内容。
+
+        Anthropic 的缓存前缀顺序是 tools → system → messages，所以标在 system
+        上就等于把"工具定义 + 静态 system"整块缓存住（每次请求都一模一样，
+        正好是 loop 里刻意保持字节一致的那部分）。命中后这部分按约 1/10 计价，
+        首 token 延迟也明显下降。静态段太短时 API 只是不缓存，不会报错。
+        """
+        return [{
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }]
+
     def _parse_response(self, raw: AnthropicMessage) -> LLMResponse:
         blocks = []
         for block in raw.content:
@@ -120,7 +135,7 @@ class AnthropicLLM(BaseLLM):
             "messages": self._convert_messages(messages),
         }
         if system:
-            kwargs["system"] = system
+            kwargs["system"] = self._system_param(system)
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
         if self.temperature is not None:
@@ -173,7 +188,7 @@ class AnthropicLLM(BaseLLM):
             "messages": self._convert_messages(messages),
         }
         if system:
-            kwargs["system"] = system
+            kwargs["system"] = self._system_param(system)
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
         if self.temperature is not None:

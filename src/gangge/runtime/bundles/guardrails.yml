@@ -21,20 +21,25 @@
 
     # 2) 结果裁剪：去 ANSI / 压缩空行 / 头尾截断。
     #    只改模型看到的内容，metadata['value'] 保留完整真值。
+    #    max_chars: 0 = 只清洗不截断——截断由 loop 统一做（会额外保留报错行，
+    #    比这里纯粹的头尾更聪明），两处同时截只会把信息切碎两次。
     - id: result-pruner
       name: gangge.runtime.plugins.result_pruner
       config:
-        max_chars: 8000
+        max_chars: 0
         head_ratio: 0.4
         strip_ansi: true
         collapse_blank: true
 
     # 3) 重复调用熔断：同参同工具第 3 次起，在结果尾部追加"换参数/换工具/直接用"。
+    #    error_limit: 同一个错误（同文件同错误码）出现 2 次就劝停——换个参数
+    #    重试同一个错误是弱模型最典型的死循环，同参计数抓不到它。
     - id: repeat-guard
       name: gangge.runtime.plugins.repeat_guard
       config:
         limit: 3
         hint_once: false
+        error_limit: 2
 
     # 4) 下一步提示：每种工具每回合只提示一次，一行以内。
     #    "read 完该 edit"、"改完该 verify" —— 强模型不需要，弱模型全靠这个。

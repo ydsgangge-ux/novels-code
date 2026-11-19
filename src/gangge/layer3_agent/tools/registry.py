@@ -65,6 +65,7 @@ TOOL_PHASES: dict[str, int] = {
     # Phase 3: Run
     "bash":           PHASE_RUN,
     "lint_check":     PHASE_RUN,
+    "run_tests":      PHASE_RUN,  # 跑测试，只回传失败摘要
     "browser_debug":  PHASE_RUN,  # 浏览器调试验证 — 前端代码改完后验证页面
     # Phase 4: Special
     "ask_user":       PHASE_SPECIAL,
@@ -127,7 +128,7 @@ AGENT_PROFILES = {
             # Discovery (always visible even though it is listed here)
             "tool_search",
             # Phase 3: Run
-            "bash", "lint_check", "browser_debug",
+            "bash", "lint_check", "run_tests", "browser_debug",
             # Always available
             "ask_user",
             "vision",
@@ -265,6 +266,7 @@ PROFILE_CORE: dict[str, set[str]] = {
         "apply_patch",
         "bash",
         "lint_check",
+        "run_tests",
         "TodoWrite",
         "ask_user",
         "chat_log",
@@ -541,6 +543,7 @@ def create_tool_registry(
     from gangge.layer3_agent.tools.web import UsageController, WebFetchTool, WebSearchTool
     from gangge.layer3_agent.tools.ask_user import AskUserTool
     from gangge.layer3_agent.tools.lint_check import LintCheckTool
+    from gangge.layer3_agent.tools.run_tests import RunTestsTool
     from gangge.layer3_agent.tools.create_tool import CreateToolTool
     from gangge.layer3_agent.tools.symbol import FindSymbolTool, FindReferencesTool
     from gangge.layer3_agent.tools.todo import TodoWriteTool, get_todo_state
@@ -566,6 +569,7 @@ def create_tool_registry(
     except Exception as e:  # a broken patch tool must not block booting
         logger.debug("[Registry] apply_patch skipped: %s", e)
     registry.register(LintCheckTool(workspace=workspace))
+    registry.register(RunTestsTool(workspace=workspace))
     for cls in [GrepTool, GlobTool, ListDirTool, EverythingSearchTool]:
         registry.register(cls(workspace=workspace))
     registry.register(WebFetchTool(usage=usage))

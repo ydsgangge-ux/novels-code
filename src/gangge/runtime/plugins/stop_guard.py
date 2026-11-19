@@ -33,6 +33,7 @@ from typing import Any
 
 from gangge.runtime import events
 from gangge.runtime.context import Context, Inject
+from gangge.runtime.intent import classify
 from gangge.runtime.seams import TurnDirective
 
 logger = logging.getLogger(__name__)
@@ -40,19 +41,7 @@ logger = logging.getLogger(__name__)
 name = "stop_guard"
 inject = Inject()
 
-# Words that mean "change my project", as opposed to "explain something".
-CHANGE_WORDS = (
-    "修复", "修改", "改成", "改一下", "优化", "重构", "实现", "添加", "增加", "新增",
-    "删除", "移除", "重命名", "调整", "补上", "加上", "写一个", "写个", "做个",
-    "fix", "change", "refactor", "implement", "add ", "create ", "write ", "update ",
-    "remove", "rename", "optimi", "build ",
-)
-
-# Words that mean the user only wants an answer.
-QUESTION_WORDS = (
-    "解释", "为什么", "怎么理解", "是什么", "什么意思", "说明一下", "分析一下",
-    "explain", "why ", "what is", "describe", "how does",
-)
+# 词表统一在 gangge.runtime.intent，见该模块开头关于两套词表不一致的说明。
 
 # Read-only tools: a turn made only of these changed nothing.
 READ_TOOLS = ("read_file", "grep", "glob", "list_dir", "find_symbol",
@@ -91,8 +80,8 @@ class StopGuard:
             return None
 
         user_task = str(state.get("user_task") or "")
-        if not _wants_change(user_task):
-            return None  # the user asked a question; stopping is correct
+        if classify(user_task) != "change":
+            return None  # 用户在提问（或意图不明）；此时停下是正确的
 
         if self.require_action:
             verdict = self._check_action(state)
@@ -166,20 +155,6 @@ class StopGuard:
         self.trips += 1
         logger.info("[stop] refusing stop: changes unverified (round %s)", state.get("round"))
         return TurnDirective.keep_going(message, "改了文件但未验证，要求验证")
-
-
-def _wants_change(text: str) -> bool:
-    """Does this request ask for a code change rather than an explanation?"""
-    lowered = (text or "").lower()
-    if not lowered.strip():
-        return False
-    if any(word in lowered for word in CHANGE_WORDS):
-        return True
-    if any(word in lowered for word in QUESTION_WORDS):
-        return False
-    # Ambiguous requests ("看看这个项目") are treated as no-change: the cost of
-    # nagging on a question is worse than the cost of missing one change.
-    return False
 
 
 def apply(ctx: Context, config: dict[str, Any]) -> None:

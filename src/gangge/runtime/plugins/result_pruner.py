@@ -47,6 +47,8 @@ class ResultPruner:
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         config = config or {}
+        # max_chars=0 表示"只清洗不截断"：截断统一交给 loop 的结构化裁剪
+        # （保留报错行 + 头尾），两处各截一次只会互相打架。
         self.max_chars = int(config.get("max_chars", 8000))
         self.head_ratio = float(config.get("head_ratio", 0.4))
         self.strip_ansi = bool(config.get("strip_ansi", True))
@@ -56,7 +58,7 @@ class ResultPruner:
     def prune(self, outcome: Any, next: Any) -> Any:
         text = outcome.rendered or ""
         cleaned = self._clean(text)
-        if len(cleaned) > self.max_chars:
+        if self.max_chars > 0 and len(cleaned) > self.max_chars:
             cleaned = self._truncate(cleaned)
             self.pruned += 1
             outcome.metadata["pruned"] = True

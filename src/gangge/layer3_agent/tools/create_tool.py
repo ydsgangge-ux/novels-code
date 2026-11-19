@@ -182,7 +182,7 @@ class CreateToolTool(BaseTool):
         builtin_names = {
             "bash", "read_file", "write_file", "edit_file",
             "grep", "glob", "list_dir", "web_fetch", "web_search",
-            "ask_user", "lint_check", "create_tool",
+            "ask_user", "lint_check", "run_tests", "create_tool",
         }
         if tool_name in builtin_names:
             return f"built-in tool '{tool_name}'"

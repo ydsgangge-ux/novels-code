@@ -210,6 +210,7 @@ def build_dynamic_state_text(
     memory_bank_decisions: str = "",
     todo_injection: str = "",
     round_warning: str = "",
+    last_verification: str = "",
 ) -> str:
     """Build dynamic state text that changes between rounds.
 
@@ -229,6 +230,10 @@ def build_dynamic_state_text(
         parts.append(f"### 历史决策\n{memory_bank_decisions[:300]}")
     if todo_injection:
         parts.append(todo_injection)
+    # 最后一次验证结果单独重注入：滑窗/压缩会把它从历史里裁掉，模型于是
+    # 以为"还没验证"或"已经通过"，两种都会让它反复踩同一个坑。
+    if last_verification:
+        parts.append(f"### 最后一次验证\n{last_verification[:600]}")
     if round_warning:
         parts.append(round_warning)
 

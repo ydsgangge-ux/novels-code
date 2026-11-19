@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from pathlib import Path
 from typing import Any
 
 from gangge.runtime import events
@@ -37,6 +39,11 @@ inject = Inject()
 
 MAX_LEDGER = 512
 
+#: 错误指纹：同一处报错换个参数重试，旧逻辑抓不到，弱模型就会卡在这上面。
+_ERR_WORD_RE = re.compile(r"(error|Error|ERROR|Exception|Traceback|FAILED|失败|✗|❌)")
+_CODE_RE = re.compile(r"\b([EWF]\d{3}|TS\d{4}|[A-Za-z_]{3,}Error|[A-Za-z_]{3,}Exception)\b")
+_PATH_RE = re.compile(r"([\w./\\-]+\.(?:py|pyi|js|jsx|ts|tsx|go|rs|java|c|cc|cpp|h))")
+
 
 class RepeatGuard:
     """Detect identical repeated calls and append a corrective hint."""
@@ -45,9 +52,14 @@ class RepeatGuard:
         config = config or {}
         self.limit = int(config.get("limit", 3))
         self.hint_once = bool(config.get("hint_once", False))
+        # 同一个"错误指纹"出现几次就劝停（0 关闭）
+        self.error_limit = int(config.get("error_limit", 2))
         self.ledger: dict[str, int] = {}
         self.hinted: set[str] = set()
+        self.error_counts: dict[str, int] = {}
+        self.error_hinted: set[str] = set()
         self.trips = 0
+        self.error_trips = 0
 
     # -- pipeline ----------------------------------------------
 
@@ -64,6 +76,12 @@ class RepeatGuard:
         return next(invoke)
 
     def annotate(self, outcome: Any, next: Any) -> Any:
+        # ① 同一处报错反复出现（参数不同也拦得住）
+        error_hint = self._error_hint(outcome)
+        if error_hint:
+            outcome.rendered = (outcome.rendered or "") + error_hint
+
+        # ② 完全相同的调用
         key = outcome.metadata.get("call_key")
         count = outcome.metadata.get("repeat_count", 0)
         if not key or count < self.limit:
@@ -78,11 +96,60 @@ class RepeatGuard:
         outcome.metadata["repeat_blocked"] = True
         return next(outcome)
 
+    # -- error fingerprint -------------------------------------
+
+    def _error_hint(self, outcome: Any) -> str:
+        """同一处错误第 N 次出现时，劝它停下来换策略。"""
+        if self.error_limit <= 0:
+            return ""
+        text = outcome.rendered or ""
+        if not text:
+            return ""
+        fingerprint = self._fingerprint(outcome.tool, text)
+        if not fingerprint:
+            return ""
+        count = self.error_counts.get(fingerprint, 0) + 1
+        self.error_counts[fingerprint] = count
+        if count < self.error_limit or fingerprint in self.error_hinted:
+            return ""
+        self.error_hinted.add(fingerprint)
+        self.error_trips += 1
+        logger.info("[repeat] same error %s seen %d times", fingerprint, count)
+        return (
+            f"\n\n⚠ 同一个错误已经出现 {count} 次（{fingerprint}）。"
+            "继续用同样的方式重试不会有不同结果。请从下面选一个动作：\n"
+            "1. 完整读一遍报错涉及的函数/文件，别只看报错那一行；\n"
+            "2. 换一种修复思路（改调用方而不是被调用方，或反过来）；\n"
+            "3. 用 ask_user 说明卡在哪里，请用户给一个方向。"
+        )
+
+    @staticmethod
+    def _fingerprint(tool: str, text: str) -> str:
+        code = ""
+        match = _CODE_RE.search(text)
+        if match:
+            code = match.group(1)
+        if not code:
+            for line in text.splitlines():
+                if _ERR_WORD_RE.search(line):
+                    # 去掉行号/数字，避免"第 12 行"和"第 40 行"算两个错误
+                    code = re.sub(r"\d+", "N", line.strip())[:80]
+                    break
+        if not code:
+            return ""
+        path = ""
+        path_match = _PATH_RE.search(text)
+        if path_match:
+            path = Path(path_match.group(1)).name
+        return f"{tool}|{path}|{code}"
+
     # -- lifecycle ---------------------------------------------
 
     def reset(self, *_args: Any) -> None:
         self.ledger.clear()
         self.hinted.clear()
+        self.error_counts.clear()
+        self.error_hinted.clear()
 
     # -- helpers ----------------------------------------------
 
