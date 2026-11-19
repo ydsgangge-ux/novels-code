@@ -41,6 +41,9 @@ class ContentBlock:
     media_type: str = ""
     media_data: str = ""
     usage: dict[str, int] = field(default_factory=dict)
+    #: True = 流式增量片段（只用于"实时思考"窗口）；
+    #: False = 本次调用结束后的完整块（用于主界面的折叠卡片）。
+    partial: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"type": self.type.value}

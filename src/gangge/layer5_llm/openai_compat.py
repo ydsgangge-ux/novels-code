@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any, AsyncIterator
 
@@ -60,6 +61,13 @@ class OpenAICompatLLM(BaseLLM):
         if supports_vision is None:
             supports_vision = self._guess_vision(self.model)
         self.supports_vision = supports_vision
+        # 流式看门狗：首个 chunk / 相邻 chunk 之间允许的最长静默（秒），0 = 关闭。
+        # 思考型模型只要还在吐 reasoning 增量就不会被判定为卡死——旧实现用的是
+        # loop 层的 600s 总时长，思考久的请求会被整轮误杀。
+        self._first_byte_timeout = float(os.environ.get("LLM_FIRST_BYTE_TIMEOUT", "180") or 0)
+        self._idle_timeout = float(
+            os.environ.get("LLM_IDLE_TIMEOUT", os.environ.get("LLM_TIMEOUT", "600")) or 0
+        )
 
     @classmethod
     def _guess_vision(cls, model: str) -> bool:
@@ -344,7 +352,29 @@ class OpenAICompatLLM(BaseLLM):
             return blocks
 
         stream = await self._open_stream(kwargs)
-        async for chunk in stream:
+        iterator = stream.__aiter__()
+        got_first = False
+        while True:
+            # 按 chunk 间隔计时，而不是给整次调用设总时长：只要服务端还在发
+            # （包括 reasoning 增量），就不算卡死。
+            budget = self._first_byte_timeout if not got_first else self._idle_timeout
+            try:
+                if budget and budget > 0:
+                    async with asyncio.timeout(budget):
+                        chunk = await iterator.__anext__()
+                else:
+                    chunk = await iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            except TimeoutError as exc:
+                # "200 + SSE 头都回来了、body 一个字节没有"是真实故障：
+                # 同一条请求原样复刻后 2.2s 就有首包，那次却静默了整整 600s。
+                raise TimeoutError(
+                    f"模型 {budget:.0f}s 没有任何输出（"
+                    f"{'首包未到' if not got_first else '输出中断'}），已中止"
+                ) from exc
+            got_first = True
+
             usage = getattr(chunk, "usage", None)
             if usage:
                 yield ContentBlock(
