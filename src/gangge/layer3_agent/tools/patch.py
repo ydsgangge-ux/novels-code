@@ -28,6 +28,12 @@ import difflib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from gangge.layer3_agent.tools.file_ops import (
+    TextEncodingError,
+    read_text_preserving,
+    write_text_preserving,
+)
 from typing import Any
 
 from gangge.layer3_agent.tools.base import BaseTool, ToolResult
@@ -283,7 +289,11 @@ def _apply_add(op: FileOp, target: Path) -> dict[str, Any]:
 def _apply_delete(op: FileOp, target: Path) -> dict[str, Any]:
     if not target.exists():
         raise PatchError(f"要删除的文件不存在: {op.path}")
-    before = target.read_text(encoding="utf-8", errors="replace")
+    try:
+        before, *_ = read_text_preserving(target)
+    except TextEncodingError:
+        # 只读路径，只为算行数和 diff；退化成宽松解码不影响删除本身
+        before = target.read_text(encoding="utf-8", errors="replace")
     target.unlink()
     return {
         "path": op.path,
@@ -301,7 +311,10 @@ def _apply_update(op: FileOp, target: Path, workspace: Path) -> dict[str, Any]:
         raise PatchError(
             f"要修改的文件不存在: {op.path}（如需新建请用 `*** Add File:`）"
         )
-    original = target.read_text(encoding="utf-8", errors="replace")
+    try:
+        original, _enc, _nl, _bom = read_text_preserving(target)
+    except TextEncodingError as exc:
+        raise PatchError(f"{op.path} 无法安全编辑: {exc}") from exc
     trailing_newline = original.endswith("\n")
     lines = original.split("\n")
     if trailing_newline:
@@ -334,7 +347,7 @@ def _apply_update(op: FileOp, target: Path, workspace: Path) -> dict[str, Any]:
             raise PatchError(f"移动目标已存在: {op.move_to}")
         final_path.parent.mkdir(parents=True, exist_ok=True)
 
-    final_path.write_text(new_content, encoding="utf-8")
+    write_text_preserving(final_path, new_content, _enc, _nl, _bom)
     if op.move_to:
         target.unlink()
 

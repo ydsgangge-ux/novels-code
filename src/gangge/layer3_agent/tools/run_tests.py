@@ -142,7 +142,7 @@ class RunTestsTool(BaseTool):
 
         output = ((proc.stdout or "") + (proc.stderr or "")).strip()
         passed = proc.returncode == 0
-        report = self._format(label, cmd, output, passed)
+        report = self._format(label, cmd, output, passed, proc.returncode)
         result = ToolResult(output=report, is_error=not passed)
         result.metadata = {"command": " ".join(cmd), "returncode": proc.returncode,
                            "output": output[:20000]}
@@ -174,7 +174,13 @@ class RunTestsTool(BaseTool):
         return [], ""
 
     @staticmethod
-    def _format(label: str, cmd: list[str], output: str, passed: bool) -> str:
+    def _format(
+        label: str,
+        cmd: list[str],
+        output: str,
+        passed: bool,
+        exit_code: int | None = None,
+    ) -> str:
         header = f"$ {' '.join(cmd)}"
         if passed:
             tail = "\n".join(output.splitlines()[-3:])
@@ -199,4 +205,13 @@ class RunTestsTool(BaseTool):
                 lines[-1] += f" 等 {len(failures)} 个"
         body = output[-MAX_REPORT_CHARS:] if len(output) > MAX_REPORT_CHARS else output
         lines.append("\n" + body)
-        return "\n".join(lines)[: MAX_REPORT_CHARS + 600]
+
+        # 原生扩展崩掉时 pytest 一行都不输出，只剩一个 0xC0000005。不解释清楚，
+        # 模型会以为是自己参数写错，然后一轮一轮地猜。
+        from gangge.layer3_agent.tools.bash import describe_abnormal_exit
+
+        diagnosis = describe_abnormal_exit(exit_code)
+        if diagnosis:
+            lines.append(diagnosis)
+
+        return "\n".join(lines)[: MAX_REPORT_CHARS + 900]

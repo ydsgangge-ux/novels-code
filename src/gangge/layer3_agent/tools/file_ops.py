@@ -4,10 +4,92 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from gangge.layer3_agent.tools.base import BaseTool, ToolResult
+
+# ── 文本读写：保留编码、BOM 和换行风格 ─────────────────────────
+#
+# edit_file / apply_patch 原来用 read_text(encoding="utf-8", errors="replace")
+# 读、write_text(encoding="utf-8") 写。两个后果，都不报错：
+#
+# 1. GBK 文件里的中文在读取时变成 U+FFFD（""），再以 UTF-8 写回去 —— 文件既坏
+#    了，编码也从 GBK 变成了 UTF-8。
+# 2. read_text 会把换行统一成 "\n"，write_text 再按 os.linesep 写回。于是 LF
+#    文件在 Windows 上被写成 CRLF，整个文件在 git 里显示为全量改动。
+#
+# 现在按字节读写：能无损解码才允许编辑，写回时还原原编码、BOM 与换行风格。
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+_UTF16_BOMS = ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be"))
+_FIRST_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
+
+
+class TextEncodingError(ValueError):
+    """文件无法在无损前提下解码，拒绝编辑。"""
+
+
+def read_text_preserving(path: Path) -> tuple[str, str, str, bytes]:
+    """Read text without losing its encoding, BOM or newline style.
+
+    Returns ``(text, encoding, newline, bom)`` where ``text`` has ``\\n`` line
+    endings so callers can match on it normally. Raises :class:`TextEncodingError`
+    rather than guessing: a silent wrong guess corrupts the file.
+    """
+    raw = path.read_bytes()
+
+    bom = b""
+    encoding = ""
+    body = raw
+    if raw.startswith(_UTF8_BOM):
+        bom, body, encoding = _UTF8_BOM, raw[len(_UTF8_BOM):], "utf-8"
+    else:
+        for prefix, enc in _UTF16_BOMS:
+            if raw.startswith(prefix):
+                bom, body, encoding = prefix, raw[len(prefix):], enc
+                break
+
+    if encoding:
+        try:
+            text = body.decode(encoding)
+        except UnicodeDecodeError as exc:
+            raise TextEncodingError(f"文件带 {encoding} BOM 但无法解码: {exc}") from exc
+    else:
+        if b"\x00" in raw:
+            raise TextEncodingError("文件含 NUL 字节，看起来是二进制文件，拒绝按文本编辑")
+        for candidate in ("utf-8", "gb18030"):
+            try:
+                text = raw.decode(candidate)
+            except UnicodeDecodeError:
+                continue
+            encoding = candidate
+            break
+        else:
+            raise TextEncodingError(
+                "无法可靠解码（既不是 UTF-8 也不是 GB18030），拒绝编辑以免损坏文件"
+            )
+
+    match = _FIRST_NEWLINE_RE.search(text)
+    newline = match.group(0) if match else "\n"
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 无损校验：把归一化文本按原编码 / 原换行还原，必须得到一模一样的字节。
+    # 这一条把"猜错编码"从"静默损坏"变成"拒绝编辑"。
+    if normalized.replace("\n", newline).encode(encoding) != body:
+        raise TextEncodingError("解码后无法无损还原原文件，拒绝编辑")
+
+    return normalized, encoding, newline, bom
+
+
+def write_text_preserving(
+    path: Path, text: str, encoding: str, newline: str, bom: bytes
+) -> None:
+    """Write ``text`` (with ``\\n`` endings) back in the original style."""
+    data = text.replace("\n", newline) if newline != "\n" else text
+    path.write_bytes(bom + data.encode(encoding))
 
 
 class ReadFileTool(BaseTool):
@@ -83,7 +165,11 @@ class ReadFileTool(BaseTool):
                     output=f"[图片文件] {path}\n格式: {ext}\n大小: {size} bytes",
                 )
 
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            try:
+                content, *_ = read_text_preserving(file_path)
+            except TextEncodingError:
+                # 只读路径：退化成宽松解码，让用户至少能看见内容
+                content = file_path.read_text(encoding="utf-8", errors="replace")
             lines = content.splitlines()
 
             start = max(0, offset - 1)
@@ -179,7 +265,10 @@ class WriteFileTool(BaseTool):
             # ── Snapshot before content for diff ──
             before_content = ""
             if file_path.exists():
-                before_content = file_path.read_text(encoding="utf-8", errors="replace")
+                try:
+                    before_content, *_ = read_text_preserving(file_path)
+                except TextEncodingError:
+                    before_content = file_path.read_text(encoding="utf-8", errors="replace")
 
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
@@ -282,7 +371,7 @@ class EditFileTool(BaseTool):
                     is_error=True,
                 )
 
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            content, _enc, _nl, _bom = read_text_preserving(file_path)
 
             if old_str not in content:
                 # Try stripping common whitespace differences
@@ -310,7 +399,7 @@ class EditFileTool(BaseTool):
                 )
 
             new_content = content.replace(old_str, new_str, 1)
-            file_path.write_text(new_content, encoding="utf-8")
+            write_text_preserving(file_path, new_content, _enc, _nl, _bom)
 
             old_lines = old_str.count("\n") + 1
             new_lines = new_str.count("\n") + 1

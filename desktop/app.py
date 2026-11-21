@@ -520,7 +520,7 @@ class SessionDB:
         self._migrate_if_needed()
 
     def _migrate_if_needed(self):
-        """为旧库补上 content_type / tool_use_id / is_error 字段。"""
+        """为旧库补上后加的字段（messages 与 turns）。"""
         try:
             self._conn.execute(
                 "ALTER TABLE messages ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"
@@ -536,6 +536,14 @@ class SessionDB:
         try:
             self._conn.execute(
                 "ALTER TABLE messages ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
+        # 早期版本的 turns 表没有 assistant_text，而跨会话恢复现在会读它。
+        # 缺列会让整条摘要查询抛异常（被上层吞掉 → 静默失忆）。
+        try:
+            self._conn.execute(
+                "ALTER TABLE turns ADD COLUMN assistant_text TEXT DEFAULT ''"
             )
         except Exception:
             pass
@@ -726,11 +734,16 @@ class SessionDB:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role == "user":
+                # 一轮里可能有多条 user 消息（用户中途补一句"别动 X"）。
+                # 以前是覆盖，只留下最后一条，中途的约束连库都进不去。
+                _txt = ""
                 if isinstance(content, str):
-                    user_text = content
+                    _txt = content
                 elif isinstance(content, list):
                     texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-                    user_text = " ".join(texts)
+                    _txt = " ".join(texts)
+                if _txt.strip():
+                    user_text = f"{user_text}\n{_txt}".strip() if user_text else _txt
             elif role == "assistant":
                 if isinstance(content, str):
                     assistant_text = content
@@ -742,10 +755,14 @@ class SessionDB:
                             assistant_text += b["text"]
                         elif b.get("type") == "tool_use":
                             inp = b.get("input", {})
-                            inp_str = json.dumps(inp, ensure_ascii=False)[:200] if inp else ""
+                            # 300 而不是 200：路径 + 关键参数常常刚好越过 200，
+                            # 结果搜索/恢复时只剩一个被切断的路径。
+                            inp_str = json.dumps(inp, ensure_ascii=False)[:300] if inp else ""
                             tools_used.append({"name": b.get("name", ""), "input": inp_str})
 
-        summary = assistant_text[:300] + ("..." if len(assistant_text) > 300 else "")
+        # 600 而不是 300：摘要也用于 FTS5 检索和跨会话回放，
+        # 300 字经常只覆盖开场白，具体改了哪些文件反而被切掉。
+        summary = assistant_text[:600] + ("..." if len(assistant_text) > 600 else "")
         tools_json = json.dumps(tools_used, ensure_ascii=False)
 
         now = datetime.now().isoformat()
@@ -810,7 +827,15 @@ class SessionDB:
 
         exclude_recent: 排除最近 N 条（这些会用完整消息恢复）。
         """
-        sql = "SELECT turn_num, user_text, summary, tools_used, created_at FROM turns WHERE session_id = ?"
+        # 带上 assistant_text：summary 是压缩版，恢复时用它比用二次截断的
+        # summary 更能还原上一轮到底做了什么。
+        #
+        # 但要在 SQL 里就截断：assistant_text 是完整回复（可能上万字），
+        # 一个几百轮的会话直接 SELECT 全文会把几百 MB 拉进内存，切会话时
+        # 界面就会明显卡住。400 字是调用方实际使用的上限。
+        sql = ("SELECT turn_num, user_text, summary, tools_used, created_at, "
+               "substr(assistant_text, 1, 400) AS assistant_text "
+               "FROM turns WHERE session_id = ?")
         params: list = [sid]
         if exclude_recent > 0:
             # 取总数，排除最近 exclude_recent 条
@@ -824,7 +849,14 @@ class SessionDB:
             params.append(total - exclude_recent)
         else:
             sql += " ORDER BY id ASC"
-        rows = self._conn.execute(sql, params).fetchall()
+        try:
+            rows = self._conn.execute(sql, params).fetchall()
+        except Exception:
+            # 旧库还没迁移出 assistant_text：退回旧字段，别让整段历史消失。
+            fallback = sql.replace(
+                ", substr(assistant_text, 1, 400) AS assistant_text", ""
+            )
+            rows = self._conn.execute(fallback, params).fetchall()
         return [dict(r) for r in rows]
 
     def increment_task_count(self, sid: str):
@@ -1321,10 +1353,17 @@ class GanggeWorker(QThread):
         # 参数修复 / 结果裁剪 / 重复调用熔断。GUI 不 boot profile，只挂流水线。
         from gangge.runtime.pipeline import attach_llm, tool_pipeline
 
+        # 工具输出截断只留一处真相：GUI 设置值 > 环境变量 > 默认 6000。
+        # 以前这里固定 8000、LoopConfig 默认 6000，同一份输出被两套阈值各裁一次，
+        # 看到的结果取决于这次调用走的是哪条路径。
+        _tool_chars = self.tool_result_chars or int(
+            os.environ.get("TOOL_RESULT_MAX_CHARS", "6000") or 6000
+        )
+
         tool_service, self._pipeline_ctx = tool_pipeline(
             registry,
             workspace=self.workspace,
-            max_chars=8000,
+            max_chars=_tool_chars,
             repeat_limit=3,
         )
         # The request hooks need a factory even though the GUI built its own
@@ -1357,7 +1396,7 @@ class GanggeWorker(QThread):
             ask_user_callback=_ask_user_callback,
             # 设置页可调：历史窗口 + 工具输出截断（0 表示沿用 LoopConfig 默认/环境变量）
             **({"max_history_rounds": self.history_rounds} if self.history_rounds else {}),
-            **({"tool_result_max_chars": self.tool_result_chars} if self.tool_result_chars else {}),
+            tool_result_max_chars=_tool_chars,
         )
 
         if self.workspace:
@@ -1503,6 +1542,9 @@ class GanggeWorker(QThread):
             warn_text = "已自动收尾，待办未完成，最后一次验证可能未通过"
         elif reason == "max_rounds":
             warn_text = "已达最大工具调用轮数，任务可能未完成"
+        elif reason == "cancelled":
+            # 用户主动停止。以前这里没有分支，取消被当成"轮数耗尽"报出去。
+            warn_text = "任务已被用户取消"
         elif reason == "consecutive_readonly":
             warn_text = "连续多轮只读，未做实际修改"
 
@@ -6343,12 +6385,16 @@ class ExperimentalPanel(QWidget):
 
     @staticmethod
     def _read_todo_state() -> tuple[list[dict], str]:
-        """读取 agent 的全局 todo 单例（工具写、loop 读、这里只读）。"""
+        """读取当前任务正在用的任务清单（工具写、loop 读、这里只读）。
+
+        注意不能用模块级单例：loop 每个实例有自己的 TodoState，工具写的是
+        那一份。读单例会永远空，右侧任务窗口就一直是"模型尚未调用 TodoWrite"。
+        """
         try:
-            from gangge.layer3_agent.tools.todo import get_todo_state
+            from gangge.layer3_agent.tools.todo import get_active_state
         except Exception:  # 包不在 sys.path 时别连累实验面板其它页
             return [], ""
-        state = get_todo_state()
+        state = get_active_state()
         return state.get_all(), state.format_for_injection()
 
     def _refresh_todo_view(self):
@@ -6709,6 +6755,9 @@ class GanggeDesktop(QMainWindow):
         self._llm: BaseLLM | None = None
         self._worker: GanggeWorker | None = None
         self._running = False
+        # 用户点了停止。取消是请求，worker 要跑到下一个检查点才退出，
+        # 它迟到的 finished 不能把收尾再走一遍（见 _on_finished）。
+        self._cancel_requested = False
         self._current_session_id: str = ""
         self._batch_tasks: list[str] = []
         self._batch_queue: list[str] = []
@@ -8335,16 +8384,39 @@ class GanggeDesktop(QMainWindow):
         except Exception as e:
             logging.getLogger("gangge").warning("加载 turn 摘要失败: %s", e)
 
+        # 几百轮的会话全量灌进上下文同样会拖慢首轮请求：只保留最近的
+        # 20 轮，更早的折成一行"另有 N 轮"（要细节可以搜历史）。
+        _SUMMARY_TURN_LIMIT = 20
+        omitted_turns = 0
+        if len(earlier_summaries) > _SUMMARY_TURN_LIMIT:
+            omitted_turns = len(earlier_summaries) - _SUMMARY_TURN_LIMIT
+            earlier_summaries = earlier_summaries[-_SUMMARY_TURN_LIMIT:]
+
         if earlier_summaries:
             summary_lines = ["[对话历史摘要 — 以下是之前几轮对话的概况]\n"]
+            if omitted_turns:
+                summary_lines.append(f"（更早的 {omitted_turns} 轮已省略，需要细节请搜索历史）\n")
             for ts in earlier_summaries:
                 turn_num = ts.get("turn_num", "?")
-                user_msg = (ts.get("user_text", "") or "")[:100]
-                asst_summary = (ts.get("summary", "") or "")[:150]
+                # 100 字装不下一条带约束的指令（"改成 X，但别动 Y 和 Z"），
+                # 400 字能保住绝大多数真实指令。
+                user_msg = (ts.get("user_text", "") or "").strip()
+                if len(user_msg) > 400:
+                    user_msg = user_msg[:400] + "…（后文已省略）"
+                # 优先用 assistant_text：summary 本身已是 300 字压缩版，
+                # 再用它截 150 字等于二次压扁。
+                asst_summary = (ts.get("assistant_text") or ts.get("summary", "") or "").strip()
+                if len(asst_summary) > 400:
+                    asst_summary = asst_summary[:400] + "…（后文已省略）"
                 tools_json = ts.get("tools_used", "[]")
                 try:
                     tools_list = json.loads(tools_json) if tools_json else []
-                    tool_names = [t.get("name", "?") for t in tools_list]
+                    # 工具名之外带上参数摘要：动过哪个文件全在参数里
+                    tool_names = [
+                        f"{t.get('name', '?')}({(t.get('input', '') or '')[:60]})"
+                        if t.get("input") else t.get("name", "?")
+                        for t in tools_list
+                    ]
                     tools_str = ", ".join(tool_names) if tool_names else "无"
                 except Exception:
                     tools_str = "无"
@@ -9890,6 +9962,7 @@ class GanggeDesktop(QMainWindow):
                 logging.getLogger("gangge").info("多模态模型已就绪，通过 vision 工具调用")
 
         self._pet_state("thinking")   # 🐟 已发送，模型还在想
+        self._cancel_requested = False
 
         self._worker = GanggeWorker(
             llm=llm, task=task, workspace=workspace,
@@ -9939,8 +10012,10 @@ class GanggeDesktop(QMainWindow):
 
     def _cancel_task(self):
         if self._worker and self._running:
+            self._cancel_requested = True
             self._worker.cancel()
             self._append_output("\n⏹ 任务已取消\n", "system")
+            self._status_label.setText("⏹ 已取消")
             self._batch_queue.clear()
             self._on_finished({}, None)
 
@@ -9965,8 +10040,17 @@ class GanggeDesktop(QMainWindow):
             self._timer_label.setText(f"⏱ {mins:02d}:{secs:02d}")
 
     def _on_finished(self, summary: dict, llm: BaseLLM | None):
+        # 取消只是请求：worker 线程要跑到下一个检查点才退出，界面在点击时
+        # 已经复位过一次（summary 为空），它迟到的这次 finished 不能再把
+        # memory bank / 自动提交 / 计划确认走一遍。
+        cancelled_late = self._cancel_requested and bool(summary)
+        if summary:
+            self._cancel_requested = False
+
         # 🐟 桌宠：空 summary = 取消 / 失败 = 出错 / 其它 = 完成
-        if not summary:
+        if cancelled_late:
+            self._pet_state("idle")
+        elif not summary:
             self._pet_state("idle")
         elif summary.get("error"):
             self._pet_state("error")
@@ -10003,7 +10087,7 @@ class GanggeDesktop(QMainWindow):
             self._stats_label.setText(f"🔄 {r} 轮 | 🔧 {c} 次 | 📥 {inp} | 📤 {out}{cost_str}")
 
         # ── Plan mode: show confirmation dialog ──
-        if summary.get("plan_mode") and summary.get("final_response"):
+        if not cancelled_late and summary.get("plan_mode") and summary.get("final_response"):
             dlg = PlanConfirmDialog(summary["final_response"], self)
             if dlg.exec() == QDialog.DialogCode.Accepted and dlg.approved:
                 plan_text = dlg.get_plan_text()
@@ -10023,7 +10107,7 @@ class GanggeDesktop(QMainWindow):
 
         # ── Memory Bank update ──
         mb_update = summary.get("memory_bank_update", "")
-        if mb_update and self._ws_input.text():
+        if not cancelled_late and mb_update and self._ws_input.text():
             workspace = self._ws_input.text().strip()
             # Split update into progress and changelog parts
             progress_part = ""
@@ -10036,7 +10120,8 @@ class GanggeDesktop(QMainWindow):
 
         # ── Git auto-commit ──
         if (
-            self._git_commit_cb.isChecked()
+            not cancelled_late
+            and self._git_commit_cb.isChecked()
             and summary
             and not summary.get("error")
             and self._ws_input.text()
@@ -10051,6 +10136,9 @@ class GanggeDesktop(QMainWindow):
 
         if summary.get("error"):
             self._status_label.setText(f"❌ {summary['error']}")
+        elif summary.get("completion_reason") == "cancelled":
+            r = summary.get("rounds", 0)
+            self._status_label.setText(f"⏹ 已取消: {r} 轮")
         elif summary.get("warning"):
             r = summary.get("rounds", 0)
             self._status_label.setText(f"⚠️ 未完成: {r} 轮（{summary['warning']}）")
@@ -10592,14 +10680,16 @@ class GanggeDesktop(QMainWindow):
             self._ws_input.setText(ws)
             self._file_browser.set_root(ws)
         else:
-            # No saved workspace → auto-create a project folder
-            from datetime import datetime
+            # 不在启动时创建项目目录。以前这里会建一个 project_<启动时间> 的空目录，
+            # 于是目录名记的是"打开应用"的时刻（13:19:57），而不是任务真正开始的
+            # 时刻（13:27），事后按目录名对齐日志会差好几分钟。目录交给
+            # _ensure_workspace 在首个任务提交时创建。
             projects_root = Path.cwd() / "gangge_projects"
-            project_name = f"project_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            auto_ws = projects_root / project_name
-            auto_ws.mkdir(parents=True, exist_ok=True)
-            self._ws_input.setText(str(auto_ws))
-            self._file_browser.set_root(str(auto_ws))
+            try:
+                projects_root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            self._file_browser.set_root(str(projects_root))
         self._max_rounds_spin.setValue(int(self._settings.value("max_rounds", 30)))
         self._plan_mode_cb.setChecked(self._settings.value("plan_mode", "false") == "true")
         self._thinking_mode_cb.setChecked(self._settings.value("thinking_mode", "false") == "true")
@@ -10668,17 +10758,23 @@ class GanggeDesktop(QMainWindow):
 # ═════════════════════════════════════════════════════════════════
 def main():
     # ── 全局日志：崩溃时写入文件 ──
+    # 按天轮转、保留 7 天。之前是每天一个新文件且从不清理：单日最大 28MB，
+    # 一个月就堆到 160MB。级别降到 INFO 是为了掐掉 openai/httpx 的全量请求
+    # DEBUG（它们既占体积又不含本项目信息）；gangge 自己的 DEBUG 单独保留。
     log_dir = Path.home() / ".gangge" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"crash_{datetime.now().strftime('%Y%m%d')}.log"
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(str(log_file), encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+    from logging.handlers import TimedRotatingFileHandler
+
+    log_file = log_dir / "gangge.log"
+    _file_handler = TimedRotatingFileHandler(
+        str(log_file), when="midnight", backupCount=7, encoding="utf-8"
     )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[_file_handler, logging.StreamHandler()],
+    )
+    logging.getLogger("gangge").setLevel(logging.DEBUG)
     logger = logging.getLogger("gangge")
 
     def global_exception_handler(exc_type, exc_value, exc_tb):

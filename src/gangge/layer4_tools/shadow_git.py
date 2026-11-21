@@ -87,7 +87,8 @@ class ShadowGit:
             diff_stat = self._run(["git", "diff", "--cached", "--stat"])
             stat_line = (diff_stat.stdout or "").strip().splitlines()[-1] if diff_stat.stdout else ""
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            short_label = label[:80].replace("\n", " ") if label else "auto checkpoint"
+            # 160 而不是 80：标签现在是"任务全貌 → 本次指令"，80 会把后半段切没。
+            short_label = label[:160].replace("\n", " ") if label else "auto checkpoint"
             msg = f"{short_label}\n\nTimestamp: {ts}"
             if stat_line:
                 msg += f"\n{stat_line}"

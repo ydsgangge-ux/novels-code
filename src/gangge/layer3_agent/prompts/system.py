@@ -190,8 +190,9 @@ def build_system_prompt(
     parts = [prompt]
 
     # Add project context (if any) — stable per session
+    # 500 字装不下项目地图（目录树 + 入口文件），放宽到 2000 且只在超限时截断。
     if project_context:
-        parts.append(f"\n## 项目信息\n\n{project_context[:500]}")
+        parts.append(f"\n## 项目信息\n\n{_clip_block(project_context, 2000)}")
 
     # Add plan mode hint
     if plan_mode:
@@ -202,6 +203,29 @@ def build_system_prompt(
         parts.append(COMFYUI_PROMPT)
 
     return "\n".join(parts)
+
+
+#: 动态状态注入的字符预算。这些数字曾经是 200/200/300——progress.md 是代码
+#: 生成的结构化文本，前 200 字只够写到“### 已完成的文件”下的第一条，等于
+#: 每轮都告诉模型“改了 10 个文件”，却只让它看见其中 1 个。
+PROGRESS_BUDGET = 1200
+CHANGELOG_BUDGET = 1200
+DECISIONS_BUDGET = 1200
+VERIFICATION_BUDGET = 800
+
+
+def _clip_block(text: str, limit: int, *, tail: bool = False) -> str:
+    """把一段状态文本裁到 ``limit`` 字符。
+
+    ``tail=True`` 时保留**末尾**：changelog / decisions 都是把新记录追加到
+    文件末尾的，取开头等于永远注入最旧的那几条，最新一轮反而看不到。
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    if tail:
+        return "…（更早的记录已省略）\n" + text[-limit:]
+    return text[:limit] + "\n…（后续内容已省略）"
 
 
 def build_dynamic_state_text(
@@ -223,17 +247,27 @@ def build_dynamic_state_text(
     parts = []
 
     if memory_bank_progress:
-        parts.append(f"### 当前进度\n{memory_bank_progress[:200]}")
+        # progress.md 每次整体重写，最新的内容在最前面
+        parts.append(f"### 当前进度\n{_clip_block(memory_bank_progress, PROGRESS_BUDGET)}")
     if memory_bank_changelog:
-        parts.append(f"### 变更日志\n{memory_bank_changelog[:200]}")
+        # 上一次异常收尾（超时/取消/轮数耗尽）写下的“未完成”记录会一直留在
+        # 文件里。它曾经被下一个任务当成当前进度读进去，模型于是以为"已经跑了
+        # 50 轮"。这里是历史，不是状态，必须说清楚。
+        note = ""
+        if (
+            "未完成的工作" in memory_bank_changelog
+            or "已达到最大工具调用轮数限制" in memory_bank_changelog
+        ):
+            note = "（注意：其中“未完成/轮数耗尽”来自上一次中断，属于历史记录，不代表当前任务进度）"
+        parts.append(f"### 变更日志{note}\n{_clip_block(memory_bank_changelog, CHANGELOG_BUDGET, tail=True)}")
     if memory_bank_decisions:
-        parts.append(f"### 历史决策\n{memory_bank_decisions[:300]}")
+        parts.append(f"### 历史决策\n{_clip_block(memory_bank_decisions, DECISIONS_BUDGET, tail=True)}")
     if todo_injection:
         parts.append(todo_injection)
     # 最后一次验证结果单独重注入：滑窗/压缩会把它从历史里裁掉，模型于是
     # 以为"还没验证"或"已经通过"，两种都会让它反复踩同一个坑。
     if last_verification:
-        parts.append(f"### 最后一次验证\n{last_verification[:600]}")
+        parts.append(f"### 最后一次验证\n{_clip_block(last_verification, VERIFICATION_BUDGET)}")
     if round_warning:
         parts.append(round_warning)
 

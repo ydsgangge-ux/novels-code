@@ -118,13 +118,33 @@ class TodoState:
                 t["status"] = "completed"
 
 
-# Module-level singleton — the loop and tool share this instance
+# Module-level singleton — fallback for callers with no running loop.
 _global_state = TodoState()
+
+#: 当前任务正在维护的清单。
+#:
+#: loop 现在是**每个实例一份** TodoState（否则取消后还在收尾的旧 worker，
+#: 会被新任务一启动就 clear 掉它正在维护的清单）。但界面仍然是按 500ms
+#: 轮询读取的：如果它还读上面的模块级单例，就会出现"工具写 A、界面读 B"，
+#: 右侧任务窗口永远是空的。所以由 loop 在构造时把这份 state 发布出来，
+#: 界面读"最新发布的那一份"。
+_active_state: TodoState | None = None
 
 
 def get_todo_state() -> TodoState:
-    """Get the global todo state instance."""
+    """Get the module-level todo state instance (fallback only)."""
     return _global_state
+
+
+def publish_active_state(state: TodoState) -> None:
+    """登记当前任务的清单，供界面镜像。后发布的覆盖先发布的。"""
+    global _active_state
+    _active_state = state
+
+
+def get_active_state() -> TodoState:
+    """界面读取用：优先正在跑的任务清单，没有就退回模块级单例。"""
+    return _active_state or _global_state
 
 
 class TodoWriteTool(BaseTool):

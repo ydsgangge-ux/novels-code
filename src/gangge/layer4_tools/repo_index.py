@@ -41,7 +41,19 @@ LANG_EXTENSIONS = {
 }
 
 
-def _should_skip(path: Path) -> bool:
+def _should_skip(path: Path, workspace: Path | None = None) -> bool:
+    """Should this file be left out of the index?
+
+    Only the part of the path *inside* the workspace counts. Matching on the
+    absolute path made every user project unindexable: projects live under
+    ``gangge_projects/``, that name is in ``EXCLUDE_DIRS``, so the check
+    tripped for every file and the index always came out empty.
+    """
+    if workspace is not None:
+        try:
+            path = path.relative_to(workspace)
+        except ValueError:
+            pass
     return any(p in EXCLUDE_DIRS for p in path.parts)
 
 
@@ -187,7 +199,7 @@ def build_index(workspace: str) -> dict[str, Any]:
     for filepath in sorted(ws.rglob("*")):
         if not filepath.is_file():
             continue
-        if _should_skip(filepath):
+        if _should_skip(filepath, ws):
             continue
         entry = scan_file(filepath, ws)
         if entry:
@@ -293,7 +305,7 @@ def incremental_update(index: dict[str, Any], workspace: str) -> dict[str, Any]:
     for filepath in sorted(ws.rglob("*")):
         if not filepath.is_file():
             continue
-        if _should_skip(filepath):
+        if _should_skip(filepath, ws):
             continue
         ext = filepath.suffix.lower()
         if ext not in LANG_EXTENSIONS:

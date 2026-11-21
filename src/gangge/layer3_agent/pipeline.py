@@ -457,9 +457,11 @@ class CodexPipeline:
         project_context = ""
         if self.config:
             if self.config.project_context:
-                project_context = self.config.project_context[:500]
+                project_context = self.config.project_context[:2000]
             if self.config.memory_bank_progress:
-                project_context += f"\n\n进度: {self.config.memory_bank_progress[:300]}"
+                # 与 build_dynamic_state_text 共用一套预算：进度是结构化文本，
+                # 300 字只够写到第一个文件，规划器拿不到完整现状。
+                project_context += f"\n\n进度: {self.config.memory_bank_progress[:1200]}"
 
         user_msg = PLANNER_USER_TEMPLATE.format(
             task=user_task,

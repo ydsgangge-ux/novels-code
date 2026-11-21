@@ -100,13 +100,19 @@ async def test_batcher_coalesces_reasoning_into_one_block():
 
     for fragment in ["思", "考", "很", "久"]:
         await batcher(ContentBlock(type=ContentType.THINKING, text=fragment))
-    assert emitter.blocks == [], "reasoning must not be emitted token by token"
+    # 实时窗口可以拿到 partial 增量，但主界面卡片必须是每次调用一个完整块。
+    assert [b for b in emitter.blocks if not b.partial] == [], (
+        "reasoning must not be emitted as full blocks token by token"
+    )
 
     await batcher(ContentBlock(type=ContentType.TEXT, text="answer"))
     await batcher.flush()
 
-    assert [b.type for b in emitter.blocks] == [ContentType.THINKING, ContentType.TEXT]
-    assert emitter.blocks[0].text == "思考很久"
+    # partial=True 的块只喂"实时思考"窗口，主界面卡片用的是 partial=False 的
+    # 完整块。两者是两条消费通道，同一个 emitter 会都收到。
+    final = [b for b in emitter.blocks if not b.partial]
+    assert [b.type for b in final] == [ContentType.THINKING, ContentType.TEXT]
+    assert final[0].text == "思考很久"
     # Reasoning must not count as "the answer was already shown", or the
     # duplicate-printing guard would swallow the real answer.
     assert batcher.thinking_chars == 4
@@ -121,7 +127,8 @@ async def test_batcher_flushes_reasoning_at_end_of_call():
     await batcher(ContentBlock(type=ContentType.THINKING, text="只在思考"))
     await batcher.flush()
 
-    assert [b.text for b in emitter.blocks] == ["只在思考"]
+    final = [b for b in emitter.blocks if not b.partial]
+    assert [b.text for b in final] == ["只在思考"]
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Awaitable
@@ -116,6 +116,23 @@ def is_verification_command(command: str) -> bool:
     return bool(_VERIFY_CMD_RE.search(command or ""))
 
 
+def _first_user_text(messages: Any) -> str:
+    """取第一条用户消息的纯文本（整个会话最初的任务）。
+
+    末条消息只是"这次要做什么"，单独拿它当任务标题，就会出现
+    "把按钮改蓝"成为整个任务提交信息的情况。
+    """
+    for msg in messages or []:
+        if getattr(msg, "role", None) != Role.USER:
+            continue
+        getter = getattr(msg, "get_text", None)
+        text = str(getter() if callable(getter) else getattr(msg, "content", "") or "").strip()
+        if not text or text.startswith("[系统提示]") or text.startswith("##"):
+            continue
+        return text
+    return ""
+
+
 def describe_verification(tool: str, arguments: dict[str, Any] | None) -> str:
     """一句话描述这次验证用的是什么，供动态状态注入。"""
     args = arguments or {}
@@ -133,6 +150,17 @@ _ERROR_LINE_RE = re.compile(
     r"[A-Za-z_]{2,}(?:Error|Exception)\b|"                       # ValueError / JSONDecodeError
     r"(?<![A-Za-z])(?:error|errors|Error|ERROR|Exception|exception|failed|失败|异常)\b|"
     r"[EWF]\d{3}\b|TS\d+\b|:\d+:\s*(?:error|warning))"
+)
+
+
+#: 压缩"被重读取代"的旧读取结果时，用它抽出文件里定义了哪些函数/类，
+#: 作为替代正文的"目录"保留下来（见 AgenticLoop._symbol_outline）。
+_SYMBOL_RE = re.compile(
+    r"^[ \t]*(?:export\s+|pub(?:\([^)]*\))?\s+|async\s+|static\s+|public\s+|"
+    r"private\s+|protected\s+|final\s+|abstract\s+)*"
+    r"(?:def|fn|class|struct|interface|enum|trait|impl|function|type)\s+"
+    r"([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
 )
 
 
@@ -160,6 +188,9 @@ class LoopConfig:
 
     max_tool_rounds: int = 30        # Max tool-call iterations (可在 .env 中通过 MAX_ROUNDS 覆盖)
     llm_timeout: float = float(os.environ.get("LLM_TIMEOUT", "600"))  # LLM response timeout in seconds (本地模型/思考型模型可能较慢，可通过 LLM_TIMEOUT 覆盖)
+    # 单次 LLM 调用的硬上限。真正判定"卡住"的是 adapter 的流式看门狗（首包 /
+    # chunk 间隔）；这里只是兜底，所以给一个远大于它的值。可用 LLM_HARD_TIMEOUT 覆盖。
+    llm_hard_timeout: float = float(os.environ.get("LLM_HARD_TIMEOUT", "3600") or 3600)
     max_tokens: int = 8192
     system_prompt: str = ""
     workspace_dir: str = "."
@@ -181,6 +212,13 @@ class LoopConfig:
     enable_summary_compression: bool = True
     summary_compression_interval: int = 5  # every N rounds
 
+    # 压缩触发线：按"上一次请求实际占了窗口多少"。不能用 92%——128K 窗口下那只
+    # 剩约 10K，而下一轮还要输出 max_tokens 并接住新的工具结果，很容易顶到边上。
+    # 80% 大约留出 25K。可用 COMPRESSION_THRESHOLD 覆盖。
+    compression_threshold: float = float(
+        os.environ.get("COMPRESSION_THRESHOLD", "0.80") or 0.80
+    )
+
     # ── Sliding window: keep only recent N rounds, discard older ──
     enable_sliding_window: bool = True
     # only keep recent N user/assistant pairs（可用 MAX_HISTORY_ROUNDS 覆盖）
@@ -190,6 +228,14 @@ class LoopConfig:
     enable_tool_result_truncation: bool = True
     # 单条工具输出保留的字符上限（可用 TOOL_RESULT_MAX_CHARS 覆盖）
     tool_result_max_chars: int = int(os.environ.get("TOOL_RESULT_MAX_CHARS", "6000") or 6000)
+
+    # ── Tool-call argument trimming ──
+    # write_file 的正文跟随着 assistant 消息留在历史里，之后每次请求都会重发。
+    # 文件已经落盘、工具结果也确认过，旧副本纯粹重复计费，read_file 可以取回。
+    enable_tool_use_arg_trim: bool = True
+    tool_use_arg_max_chars: int = int(os.environ.get("TOOL_USE_ARG_MAX_CHARS", "2000") or 2000)
+    # 最近几轮不动：模型可能正基于刚写的内容继续编辑
+    tool_use_arg_keep_rounds: int = 2
 
     # ── Lazy project map: only inject full index on first round ──
     enable_lazy_project_map: bool = True
@@ -383,10 +429,26 @@ class AgenticLoop:
         self.mcp_manager: MCPClientManager | None = None
         self._init_mcp()
         self._profile: str = ""  # set by run()
+        # ── Per-loop todo state ──
+        # 以前是模块级单例：取消只是请求，旧 worker 还会跑一段，而新任务一启动
+        # 就 clear() 掉它正在维护的清单，两个 worker 互相踩。每个 loop 一份，
+        # TodoWrite 工具绑定到同一份。
+        from gangge.layer3_agent.tools.todo import TodoState, publish_active_state
+
+        self.todo_state = TodoState()
+        for _tool in getattr(self.tools, "_tools", {}).values():
+            if getattr(_tool, "name", "") == "TodoWrite":
+                _tool._state = self.todo_state
+        # 界面按 500ms 轮询镜像任务清单。工具与 loop 现在都写这份私有 state，
+        # 不登记的话界面读到的还是模块级单例（永远空 → 任务窗口一直没内容）。
+        publish_active_state(self.todo_state)
         self._llm_failures: int = 0  # consecutive LLM call failures
         self._last_streamed: int = 0  # chars already shown to the UI by streaming
         # 最近一次验证结果：滑窗/压缩会把它从历史里裁掉，所以每轮重新注入
         self._last_verification_note: str = ""
+        # 上一个任务留下的验证结论。以前新任务直接把它清空，于是"上一次跑
+        # 测试挂了"这件事跨任务就消失了，模型换个任务继续踩同一个坑。
+        self._carryover_verification_note: str = ""
 
     def set_stream_callback(self, callback: StreamCallback) -> None:
         """Set callback for streaming content blocks."""
@@ -518,12 +580,10 @@ class AgenticLoop:
                 except Exception as e:
                     logger.warning(f"[Memory Bank] 写入 decisions.md 失败: {e}")
 
-    @staticmethod
-    def _current_todos() -> list[dict]:
+    def _current_todos(self) -> list[dict]:
         """当前任务清单（由 TodoWrite 维护）。取不到时返回空列表。"""
         try:
-            from gangge.layer3_agent.tools.todo import get_todo_state
-            return get_todo_state().get_all()
+            return self.todo_state.get_all()
         except Exception:
             logger.debug("[Memory Bank] 读取任务清单失败", exc_info=True)
             return []
@@ -649,6 +709,38 @@ class AgenticLoop:
             except Exception as e:
                 logger.warning(f"[Memory Bank] 自动保存 changelog.md 失败: {e}")
 
+    def _reclaim_background_processes(self) -> None:
+        """Kill shell commands this turn started and left running.
+
+        A turn that runs ``python app.py`` and never stops it leaves a process
+        holding a port, invisibly, after "✅ 完成". Cleaning up on the way out is
+        the only place that knows the turn is over.
+        """
+        try:
+            from gangge.layer3_agent.tools.bash import cleanup_tracked_processes
+
+            count = cleanup_tracked_processes()
+            if count:
+                logger.warning("[Loop] 任务结束，已回收 %d 个残留子进程", count)
+        except Exception:
+            logger.debug("[Loop] 回收子进程失败", exc_info=True)
+
+    async def _sleep_unless_cancelled(self, seconds: float, slice_seconds: float = 0.5) -> bool:
+        """Sleep in slices, returning True as soon as a cancel is requested.
+
+        A plain ``await asyncio.sleep(backoff)`` makes the stop button wait the
+        whole backoff out — up to 30s on the third rate-limit retry.
+        """
+        if seconds <= 0:
+            return bool(self._cancel_check and self._cancel_check())
+        waited = 0.0
+        while waited < seconds:
+            if self._cancel_check and self._cancel_check():
+                return True
+            await asyncio.sleep(min(slice_seconds, seconds - waited))
+            waited += slice_seconds
+        return bool(self._cancel_check and self._cancel_check())
+
     async def _git_checkpoint(self, label: str) -> str | None:
         """Run Shadow Git checkpoint in a thread to avoid blocking the event loop."""
         if not self.config.workspace_dir:
@@ -739,20 +831,20 @@ class AgenticLoop:
 
         return prompt
 
-    @staticmethod
-    def _build_completion_summary() -> str:
+    def _build_completion_summary(self) -> str:
         """Build a completion summary from completed todo items.
 
         Uses the actual work done (completed todos) instead of
         the user's original message, which may be negative feedback
         or a new request — not a description of what was accomplished.
         """
-        from gangge.layer3_agent.tools.todo import get_todo_state
-        todo_state = get_todo_state()
+        todo_state = self.todo_state
         all_todos = todo_state.get_all()
         completed = [t for t in all_todos if t.get("status") == "completed"]
         if completed:
-            items = "; ".join(t["content"][:40] for t in completed[:5])
+            # 40 字会把"给设置页加上深色模式开关"切成"给设置页加上深色模式"，
+            # 提交标题于是全都长得一样。80 字 + 6 项，标题才有区分度。
+            items = "; ".join(t["content"][:80] for t in completed[:6])
             return f"completed: {items}"
         return "task completed"
 
@@ -763,8 +855,7 @@ class AgenticLoop:
         Keeps the static system prompt byte-identical for API caching.
         """
         # ── TodoWrite state ──
-        from gangge.layer3_agent.tools.todo import get_todo_state
-        todo_state = get_todo_state()
+        todo_state = self.todo_state
         todo_injection = todo_state.format_for_injection()
 
         # ── Approaching max rounds warning ──
@@ -776,12 +867,18 @@ class AgenticLoop:
                 "停止调用新工具，输出当前进度和剩余工作。\n"
             )
 
+        # 长度预算统一由 build_dynamic_state_text 负责：这里再切一刀会让
+        # 上面的预算形同虚设，而且 changelog/decisions 必须保留末尾记录。
+        verification = "\n".join(
+            part for part in (self._carryover_verification_note, self._last_verification_note)
+            if part and part.strip()
+        )
         return build_dynamic_state_text(
-            memory_bank_progress=self.config.memory_bank_progress[:200] if self.config.memory_bank_progress else "",
-            memory_bank_changelog=self.config.memory_bank_changelog[:200] if self.config.memory_bank_changelog else "",
-            memory_bank_decisions=self.config.memory_bank_decisions[:300] if self.config.memory_bank_decisions else "",
+            memory_bank_progress=self.config.memory_bank_progress,
+            memory_bank_changelog=self.config.memory_bank_changelog,
+            memory_bank_decisions=self.config.memory_bank_decisions,
             todo_injection=todo_injection,
-            last_verification=self._last_verification_note,
+            last_verification=verification,
             round_warning=round_warning,
         )
 
@@ -867,60 +964,158 @@ class AgenticLoop:
             model=getattr(response, "model", "") or getattr(self.llm, "model", ""),
         )
 
+    @staticmethod
+    def _path_mentioned(path: str, text: str) -> bool:
+        """``path`` 是否作为**完整路径**出现在 ``text`` 里。
+
+        裸 ``path in text`` 会让 ``app.py`` 命中 ``myapp.py``、日志正文，或者
+        另一个目录里的同名文件，于是一段与本次读取无关的工具结果被当成
+        "重复读取"压成 80 字。这里要求路径两端都不是文件名字符。
+        """
+        if not path or not text:
+            return False
+        wordy = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        start = 0
+        while True:
+            idx = text.find(path, start)
+            if idx < 0:
+                return False
+            before = text[idx - 1] if idx > 0 else ""
+            end = idx + len(path)
+            after = text[end] if end < len(text) else ""
+            if (not before or before not in wordy) and (not after or after not in wordy):
+                return True
+            start = idx + 1
+
     def _deduplicate_reads(
         self, messages: list[Message], reads_cache: dict[str, int], current_round: int
     ) -> list[Message]:
-        """Replace repeated file reads with short summaries to save tokens.
+        """把"被后续重读取代"的旧文件读取压成提纲。
 
-        Only compresses reads from older rounds (not the current round),
-        so the latest read result is always preserved in full.
-        TOOL_RESULT blocks are never touched — they carry tool_call_id
-        and must be preserved for API correctness.
+        语义是**去重**，不是"凡是读过的都压"：同一路径在上下文里可能留下
+        多份读取结果，只有最后一份需要完整内容；更早的副本压成
+        400 字头部 + 该文件的定义清单（函数 / 类名），既省 token 又不至于
+        让模型瞎猜文件里有什么。
+
+        两个必须守住的边界：
+
+        * 标准工具输出全部落在 ``TOOL_RESULT``（``add_tool_result`` 只产出
+          这一种），压它时必须原样保留 ``tool_call_id`` 与 ``is_error``，
+          否则 API 会因为 tool_call 和 result 不配对直接报错。旧实现只处理
+          TEXT block，等于从来没生效过；
+        * 每个文件**最后一次**出现的那份永不压缩 —— 模型手里始终留着一份
+          完整正文，不会出现"读完这个文件，内容却不见了"。
+
+        ``current_round`` 保留是为了兼容调用方：本轮读取一定是最后一份，
+        位置判断已经把它排除在外。
         """
         if not reads_cache or len(messages) <= 4:
             return messages
 
+        _block_kinds = (ContentType.TEXT, ContentType.TOOL_RESULT)
+
+        # 每个文件最新一次读取落在哪条消息上：那一份必须保留全文。
+        # 倒序扫描 —— 第一次命中就是最新的一份，找到后该路径整轮跳过，
+        # 不必对每个 block 都把全部路径重扫一遍（读过几十个文件时这很贵）。
+        last_pos: dict[str, int] = {}
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.role != Role.TOOL:
+                continue
+            for block in msg.content:
+                if block.type not in _block_kinds:
+                    continue
+                text = block.text or ""
+                if len(text) <= self._DEDUP_MIN_CHARS:
+                    continue
+                for path in reads_cache:
+                    if path in last_pos:
+                        continue
+                    # `in` 是 C 层常数级否定，绝大多数 block 到这一步就结束；
+                    # 只有疑似命中才做边界校验（避免 app.py 命中 myapp.py）。
+                    if path in text and self._path_mentioned(path, text):
+                        last_pos[path] = i
+
+        if not last_pos:
+            return messages
+
         result = []
-        for msg in messages:
+        for i, msg in enumerate(messages):
             if msg.role != Role.TOOL:
                 result.append(msg)
                 continue
             new_blocks = []
             changed = False
             for block in msg.content:
-                if block.type == ContentType.TOOL_RESULT:
+                if block.type not in _block_kinds:
                     new_blocks.append(block)
                     continue
-                if block.type != ContentType.TEXT:
+                text = block.text or ""
+                if len(text) <= self._DEDUP_MIN_CHARS:
                     new_blocks.append(block)
                     continue
-                text = block.text
-                if len(text) <= 200:
-                    new_blocks.append(block)
-                    continue
-                compressed = False
-                for path, read_round in reads_cache.items():
-                    if read_round >= current_round:
+                hit = ""
+                for path in reads_cache:
+                    if last_pos.get(path, -1) <= i:
                         continue
-                    if path in text:
-                        text = (
-                            text[:80]
-                            + f"\n[文件 {path} 已在第 {read_round} 轮读取，"
-                            + f"共 {len(text)} 字符，此处省略以节省 Token]\n"
-                        )
-                        new_blocks.append(ContentBlock(
-                            type=ContentType.TEXT, text=text,
-                        ))
-                        changed = True
-                        compressed = True
+                    if path in text and self._path_mentioned(path, text):
+                        hit = path
                         break
-                if not compressed:
+                if not hit:
                     new_blocks.append(block)
+                    continue
+                new_blocks.append(self._compact_read_block(block, hit, text))
+                changed = True
             if changed:
                 result.append(Message(role=msg.role, content=new_blocks))
             else:
                 result.append(msg)
         return result
+
+    @staticmethod
+    def _compact_read_block(block: ContentBlock, path: str, text: str) -> ContentBlock:
+        """把一份过期的读取结果压成"头部 + 结构提纲"，保留协议字段。"""
+        head = text[:AgenticLoop._DEDUP_HEAD_CHARS]
+        body = head
+        if len(text) > AgenticLoop._DEDUP_HEAD_CHARS:
+            body += f"\n…[中间省略 {len(text) - AgenticLoop._DEDUP_HEAD_CHARS} 字符]"
+        outline = AgenticLoop._symbol_outline(text)
+        if outline:
+            body += f"\n该文件里定义的内容：{outline}"
+        body += (
+            f"\n\n[同一个文件 {path} 后来又重新读过，这里保留的是旧副本，已压缩。"
+            "需要完整正文请重新 read_file（会拿到最新的一份）]\n"
+        )
+        return ContentBlock(
+            type=block.type,
+            text=body,
+            tool_call_id=block.tool_call_id,
+            is_error=block.is_error,
+        )
+
+    #: 压缩收益从这里开始：保留 400 字头 + 提纲，更短的结果压了不划算。
+    _DEDUP_MIN_CHARS = 1200
+    #: 压缩后保留的头部字符数（imports / 文件头注释通常都在这段里）。
+    _DEDUP_HEAD_CHARS = 400
+
+    @staticmethod
+    def _symbol_outline(text: str, limit: int = 20) -> str:
+        """从源码里抽出定义名，作为压缩后的"目录"。
+
+        模型压缩后失去的是正文，但仍需要知道文件里有哪些函数 / 类，
+        否则只能凭文件名猜或者重新读一遍。
+        """
+        names: list[str] = []
+        seen: set[str] = set()
+        for match in _SYMBOL_RE.finditer(text or ""):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+            if len(names) >= limit:
+                break
+        return "、".join(f"`{n}`" for n in names)
 
     async def _compress_history(
         self, messages: list[Message], round_num: int
@@ -933,30 +1128,37 @@ class AgenticLoop:
         if len(messages) <= 4:
             return messages
 
-        # Find safe split point: walk backwards, don't split between
-        # an assistant(tool_calls) and its following tool messages
-        safe_idx = len(messages) - 1
-        while safe_idx > 0:
-            msg = messages[safe_idx]
-            if msg.role == Role.USER:
-                break  # USER is always a safe boundary
-            if msg.role == Role.ASSISTANT:
-                # Check if this assistant has tool_calls
-                has_tc = any(b.type == ContentType.TOOL_USE for b in msg.content)
-                if not has_tc:
-                    break  # Pure text assistant is safe
-            # If TOOL role or assistant with tool_calls, keep walking back
-            safe_idx -= 1
+        # 在"轮次边界"处切分：保留最后两轮，把更早的内容压成摘要。
+        #
+        # 原来是从尾部往回找 USER 消息。单任务里只有开头那一条 USER，于是
+        # 指针一路退到 index 0，`safe_idx < 2` 直接返回原消息 —— 压缩从来没
+        # 生效过，调用方却照样提示"已自动压缩"。
+        keep_rounds = 2
+        boundaries = self._round_boundaries(messages)
+        if len(boundaries) <= keep_rounds:
+            return messages
+        safe_idx = boundaries[-keep_rounds]
 
         # Need at least 2 messages before safe point to make compression worthwhile
         if safe_idx < 2:
             return messages
 
+        # 用户的约束（"别动 X"）常常排在长消息的后半段。以前这里对所有
+        # 消息统一取 [:500]，且 get_text() 只含 TEXT block —— 约束一旦超出
+        # 500 字就再也不会回到上下文里。assistant/tool 的正文可以压，
+        # 用户的指令必须留原文（只设一个防爆预算）。
+        _user_text_keep = 6000
         history_text = ""
         for msg in messages[:safe_idx]:
-            t = msg.get_text()[:500]
-            if t.strip():
-                history_text += f"[{msg.role.value}]: {t}\n"
+            t = msg.get_text()
+            if not t.strip():
+                continue
+            if msg.role == Role.USER:
+                if len(t) > _user_text_keep:
+                    t = t[:_user_text_keep] + "\n…（用户消息过长，后文已省略）"
+            else:
+                t = t[:500]
+            history_text += f"[{msg.role.value}]: {t}\n"
 
         try:
             summary_response = await self._chat(
@@ -964,8 +1166,10 @@ class AgenticLoop:
                     Message(
                         role=Role.USER,
                         content=(
-                            "压缩以下对话为一段 150 字以内的摘要，"
-                            "保留: 已创建/修改的文件、关键决策、当前进度\n\n"
+                            "压缩以下对话为一段 300 字以内的摘要。要求：\n"
+                            "1. 用户提出的硬性约束、禁止事项（例如“别动 X”）必须逐条保留，用原话；\n"
+                            "2. 保留已创建/修改的文件路径、关键决策、当前进度与未完成项；\n"
+                            "3. 只输出摘要，不要多余内容。\n\n"
                             + history_text
                         ),
                     )
@@ -991,77 +1195,151 @@ class AgenticLoop:
         ] + messages[safe_idx:]
         return compressed
 
+    @staticmethod
+    def _round_boundaries(messages: list[Message]) -> list[int]:
+        """Indices of messages the model can act from: a USER turn, or an
+        assistant turn that requested tools.
+
+        These are the only safe places to start a trimmed window, and they are
+        what "round" means for a *single* task. Counting USER messages alone
+        made ``max_history_rounds`` a no-op there: one USER message at the top,
+        then a dozen tool rounds.
+        """
+        boundaries: list[int] = []
+        for i, msg in enumerate(messages):
+            if msg.role == Role.USER:
+                boundaries.append(i)
+            elif msg.role == Role.ASSISTANT and any(
+                block.type == ContentType.TOOL_USE for block in msg.content
+            ):
+                boundaries.append(i)
+        return boundaries
+
     def _trim_history(self, messages: list[Message]) -> list[Message]:
         """Sliding window: keep only recent N rounds, discard older messages.
 
-        A "round" is a user/assistant pair (possibly followed by tool messages).
-        We count user messages as round boundaries and keep the last N rounds.
+        A "round" is a boundary the model can act from (see
+        :meth:`_round_boundaries`): a USER message or an assistant turn with
+        tool calls. The first USER message is always kept — it carries the
+        task itself, and a window of tool history with no goal is worse than
+        no history at all.
+
         This is simpler and more reliable than summary compression.
         """
         max_rounds = self.config.max_history_rounds
-
-        # Find all USER message indices (these are round boundaries)
-        user_indices = []
-        for i, msg in enumerate(messages):
-            if msg.role == Role.USER:
-                user_indices.append(i)
-
-        # If we have fewer rounds than max, no trimming needed
-        if len(user_indices) <= max_rounds:
+        if max_rounds <= 0:
             return messages
 
-        # Find the start index of the (len - max_rounds)-th user message
+        boundaries = self._round_boundaries(messages)
+
+        # If we have fewer rounds than max, no trimming needed
+        if len(boundaries) <= max_rounds:
+            return messages
+
+        # Find the start index of the (len - max_rounds)-th round
         # This is where we start keeping messages
-        cutoff_idx = user_indices[-max_rounds]
+        cutoff_idx = boundaries[-max_rounds]
 
-        # Walk backwards from cutoff to find a safe boundary:
-        # must not split an assistant(tool_calls) + tool messages pair.
-        safe_idx = cutoff_idx
-        while safe_idx > 0:
-            msg = messages[safe_idx]
-            if msg.role == Role.USER:
-                break
-            if msg.role == Role.ASSISTANT:
-                has_tc = any(b.type == ContentType.TOOL_USE for b in msg.content)
-                if not has_tc:
-                    break
-            safe_idx -= 1
+        # ``cutoff_idx`` is already a legal start: a round boundary is never a
+        # tool result, so it cannot land inside an assistant(tool_use) + tool
+        # results group. (The old back-and-forth walk assumed boundaries were
+        # USER messages and would retreat to index 0 for tool-heavy turns.)
+        kept = messages[cutoff_idx:]
+        dropped = cutoff_idx
 
-        # Walk forward from safe_idx to ensure we don't start in the
-        # middle of an assistant(tool_calls) + tool results group.
-        # If safe_idx lands on a TOOL message or an assistant with
-        # tool_calls, advance past the entire group.
-        fwd = safe_idx
-        while fwd < len(messages):
-            msg = messages[fwd]
-            if msg.role == Role.ASSISTANT:
-                has_tc = any(b.type == ContentType.TOOL_USE for b in msg.content)
-                if has_tc:
-                    # Skip past this assistant and its following tool results
-                    fwd += 1
-                    while fwd < len(messages) and messages[fwd].role == Role.TOOL:
-                        fwd += 1
-                    # Now fwd points to the first non-tool message after the group
-                    # If this is still before cutoff_idx, it's a valid start
-                    if fwd <= cutoff_idx:
-                        safe_idx = fwd
-                        continue
-                break
-            elif msg.role == Role.TOOL:
-                # Orphan tool result — skip past it
-                fwd += 1
-                if fwd <= cutoff_idx:
-                    safe_idx = fwd
+        anchored = dropped > 0 and messages[0].role == Role.USER
+        if anchored:
+            # Keep the task statement in front of the window.
+            kept = [messages[0], *kept]
+
+        # 被裁掉那一段里的用户指令不能跟着消失：滑窗按"轮"裁剪，工具轮
+        # 一多，用户中途说的"别动 X"会连同整段一起被丢掉，而模型之后
+        # 再也看不到它。保留原文（不是摘要），放在任务锚点之后。
+        _extra_user = [
+            m.get_text().strip()
+            for m in messages[(1 if anchored else 0):cutoff_idx]
+            if m.role == Role.USER and m.get_text().strip()
+        ]
+        if _extra_user:
+            _ctx_msg = Message(
+                role=Role.USER,
+                content=[ContentBlock(
+                    type=ContentType.TEXT,
+                    text="[先前对话里的用户指令 — 已从上下文裁剪，此处保留原文]\n"
+                         + "\n".join(f"- {t[:800]}" for t in _extra_user[-6:]),
+                )],
+            )
+            kept = [kept[0], _ctx_msg, *kept[1:]] if anchored else [_ctx_msg, *kept]
+
+        logger.info(
+            "[Loop] 历史裁剪: 丢弃 %d 条旧消息，保留最近 %d 轮%s",
+            dropped,
+            max_rounds,
+            " + 任务锚点" if anchored else "",
+        )
+        return kept
+
+    #: Tools whose arguments carry a whole file body worth compressing.
+    _BULKY_TOOL_ARGS = ("write_file", "apply_patch")
+
+    def _shrink_tool_use_args(self, messages: list[Message]) -> list[Message]:
+        """Replace file bodies inside older tool calls with a placeholder.
+
+        ``write_file`` carries the entire file as an argument, which means the
+        assistant message holds it forever and every later request re-sends it.
+        Once the tool result confirms the write and the file is on disk, the
+        copy buys nothing: ``read_file`` can bring it back when it is needed.
+
+        Only rounds older than ``tool_use_arg_keep_rounds`` are touched, so a
+        model that is actively editing what it just wrote still sees it.
+
+        The list is edited **in place**: the caller (the host, the session
+        store) holds a reference to it, and returning a fresh list would leave
+        them appending to a history the loop no longer reads.
+        """
+        limit = self.config.tool_use_arg_max_chars
+        keep_rounds = max(0, self.config.tool_use_arg_keep_rounds)
+        if not self.config.enable_tool_use_arg_trim or limit <= 0:
+            return messages
+
+        boundaries = self._round_boundaries(messages)
+        if len(boundaries) <= keep_rounds:
+            return messages
+        frozen_until = boundaries[-keep_rounds] if keep_rounds else len(messages)
+
+        shrunk = 0
+        for i in range(frozen_until):
+            msg = messages[i]
+            if msg.role != Role.ASSISTANT:
+                continue
+            blocks: list[ContentBlock] = []
+            changed = False
+            for block in msg.content:
+                body = (
+                    (getattr(block, "tool_input", None) or {}).get("content")
+                    if block.type == ContentType.TOOL_USE
+                    and getattr(block, "tool_name", "") in self._BULKY_TOOL_ARGS
+                    else None
+                )
+                if isinstance(body, str) and len(body) > limit:
+                    data = dict(block.tool_input or {})
+                    path = data.get("path", "?")
+                    data["content"] = (
+                        f"<{len(body)} 字符已省略；文件已写入，需要时用 read_file 读取 {path}>"
+                    )
+                    blocks.append(replace(block, tool_input=data))
+                    changed = True
+                    shrunk += 1
                     continue
-                break
-            else:
-                break
+                blocks.append(block)
+            if changed:
+                messages[i] = replace(msg, content=blocks)
 
-        trimmed = messages[safe_idx:]
-        dropped = len(messages) - len(trimmed)
-        if dropped > 0:
-            logger.info(f"Sliding window: dropped {dropped} old messages, keeping {len(trimmed)}")
-        return trimmed
+        if shrunk:
+            logger.debug(
+                "[Loop] 已回缩 %d 处历史工具调用正文（保留最近 %d 轮完整）", shrunk, keep_rounds
+            )
+        return messages
 
     async def _emit(self, block: ContentBlock) -> None:
         """Emit a content block to the stream callback."""
@@ -1231,7 +1509,12 @@ class AgenticLoop:
         finally:
             if batcher is not None:
                 await batcher.flush()
-                self._last_streamed = batcher.emitted_chars
+                # ``flush`` has already emitted the full thinking card, so a
+                # reasoning-only turn (thinking + tool calls, no answer text)
+                # counts as shown as well. Counting only answer characters made
+                # the caller re-emit the whole thinking block — a 92k-character
+                # reasoning appeared twice in the same round.
+                self._last_streamed = batcher.emitted_chars + batcher.thinking_chars
 
     def _emit_lifecycle(self, event: str, payload: dict) -> None:
         """Fire-and-forget lifecycle event. Never raises into the loop."""
@@ -1380,6 +1663,9 @@ class AgenticLoop:
                 runtime_events.TURN_ABORTED, {"error": type(exc).__name__, "detail": str(exc)[:300]}
             )
             raise
+        finally:
+            # 任务结束后，它启动的后台命令不该继续占着端口。
+            self._reclaim_background_processes()
 
         self._repair_message_chain(messages)
 
@@ -1440,6 +1726,88 @@ class AgenticLoop:
             completion_reason=completion_reason,
         )
 
+    def _finalize(
+        self,
+        *,
+        final_response: str,
+        executions: list[ToolExecution],
+        rounds: int,
+        total_tokens: dict[str, int],
+        completion_reason: str,
+        emit_done: bool = True,
+    ) -> LoopResult:
+        """Close a turn that does not go through ``_finish_turn``.
+
+        Every early exit (timeout, LLM error, cancel, round limit, Q&A) used to
+        build its own ``LoopResult``, and they drifted: only some emitted
+        ``DONE``, and none logged *why* the turn ended — which is precisely the
+        information missing when a run stops unexpectedly.
+        """
+        logger.info(
+            "[Loop] 结束: reason=%s rounds=%d tokens(in=%d,out=%d)",
+            completion_reason,
+            rounds,
+            total_tokens.get("input", 0),
+            total_tokens.get("output", 0),
+        )
+        if emit_done:
+            self.emitter.emit_done(total_steps=rounds)
+        return LoopResult(
+            final_response=final_response,
+            tool_executions=executions,
+            total_rounds=rounds,
+            total_tokens=total_tokens,
+            completion_reason=completion_reason,
+        )
+
+    def _describe_unfinished(self) -> str:
+        """What is still undone, in words the user can act on.
+
+        Abnormal exits (stalled / round limit / cancel) cut the model off before
+        it can write a closing summary, so the UI was left with the single
+        sentence "待办未完成" and no idea which items those were. The pending
+        list and the last verification verdict are both in memory at that
+        moment — this turns them into the delivery status.
+        """
+        lines: list[str] = []
+
+        pending = self.todo_state.get_pending()
+        if pending:
+            lines.append(f"{len(pending)} 项待办未完成：")
+            # 上限保持 5 项（这是接口契约，测试也在盯）：只放宽每项的字数，
+            # 60 字会把"给设置页加上深色模式开关"切成半句话。
+            for todo in pending[:5]:
+                content = str(todo.get("content", "")).strip() or "(未命名任务)"
+                lines.append(f"- {content[:120]}")
+            if len(pending) > 5:
+                lines.append(f"- … 等共 {len(pending)} 项")
+
+        note = (self._last_verification_note or "").strip()
+        if note:
+            # 只留首行 80 字，等于只告诉用户"未通过"，把失败用例和报错全扔掉。
+            _note_lines = [ln.strip() for ln in note.splitlines() if ln.strip()]
+            lines.append(f"最后一次验证：{_note_lines[0][:160]}")
+            for _ln in _note_lines[1:3]:
+                lines.append(f"  {_ln[:200]}")
+
+        return "\n".join(lines)
+
+    async def _emit_unfinished(self, headline: str) -> str:
+        """Emit the unfinished report into the output stream; return it as text.
+
+        Emitting matters: the host skips ``final_response`` once anything has
+        already been streamed (re-printing would double every answer), and every
+        abnormal exit is a turn that already spoke. Putting it only in
+        ``final_response`` would leave it invisible.
+        """
+        detail = self._describe_unfinished()
+        if detail:
+            await self._emit(ContentBlock(
+                type=ContentType.TEXT,
+                text=f"\n{headline}\n{detail}\n",
+            ))
+        return detail
+
     async def _execute_tool_calls(
         self,
         response: Any,
@@ -1463,8 +1831,6 @@ class AgenticLoop:
         ``executions``, ``reads_cache`` and ``file_registry`` are shared
         accumulators and are updated in place.
         """
-        from gangge.layer3_agent.tools.todo import get_todo_state
-
         results = Message(role=Role.TOOL)
         await self._emit(ContentBlock(
             type=ContentType.TEXT,
@@ -1517,7 +1883,9 @@ class AgenticLoop:
             if self._is_verification_call(name, arguments):
                 label = describe_verification(name, arguments)
                 if result.is_error:
-                    self._last_verification_note = f"❌ {label} 未通过\n{result.output[:300]}"
+                    # 800 而不是 300：测试失败的有效信息在报错尾部（失败用例 +
+                    # 断言差异），300 字常常只截到 pytest 的启动横幅。
+                    self._last_verification_note = f"❌ {label} 未通过\n{result.output[:800]}"
                 else:
                     self._last_verification_note = f"✅ {label} 已通过"
 
@@ -1553,6 +1921,20 @@ class AgenticLoop:
             ))
             self.emitter.emit_tool_end(name, not result.is_error, elapsed_ms)
 
+            # Productive = something changed on disk, a command ran, or the work was
+            # actually verified. Reads and searches never count, which is what the
+            # stall guard keys off.
+            #
+            # 进展 ≠ 成功。一次跑挂的 pytest、一个报错的 bash 同样是信息：排障时
+            # 连续几轮失败是常态，把它算成"无进展"会让 stall guard 在模型正缩小
+            # 范围的时候强行收尾（vtracer 那次就断在第 20 轮）。所以这段判定必须
+            # 在 is_error 的 continue 之前。
+            if name in (
+                "write_file", "edit_file", "apply_patch", "bash", "novel_write_chapter",
+                "run_tests", "lint_check", "browser_debug",
+            ):
+                productive = True
+
             if result.is_error:
                 await self._emit(ContentBlock(
                     type=ContentType.TEXT,
@@ -1561,19 +1943,10 @@ class AgenticLoop:
                 continue
 
             any_tool_succeeded = True
-            # Productive = something changed on disk, a command ran, or the work was
-            # actually verified. Reads and searches never count, which is what the
-            # stall guard keys off. 验证类工具必须算"有进展"——否则连续看几张截图、
-            # 跑两次测试就会被判成"数轮无进展"而提前收尾。
-            if name in (
-                "write_file", "edit_file", "apply_patch", "bash", "novel_write_chapter",
-                "run_tests", "lint_check", "browser_debug",
-            ):
-                productive = True
 
             # ── Runtime auto-advance Todo state ──
             # The system manages todo progress, not the model.
-            todo_state = get_todo_state()
+            todo_state = self.todo_state
             if todo_state.auto_advance(name, arguments, success=True):
                 current = todo_state.get_current()
                 if current:
@@ -1683,7 +2056,7 @@ class AgenticLoop:
             lint_note = await self._auto_lint_check(path) or ""
             if lint_note:
                 # 自动检查失败 = 最近一次验证未通过，用它覆盖上一条"已通过"
-                self._last_verification_note = f"❌ 写入 {path} 后自动检查未通过\n{lint_note[:300]}"
+                self._last_verification_note = f"❌ 写入 {path} 后自动检查未通过\n{lint_note[:800]}"
             try:
                 source = Path(path)
                 classes: list[str] = []
@@ -1763,8 +2136,6 @@ class AgenticLoop:
         Returns ``(result_or_None, readonly_counter, stall_counter)``. Counters
         come back because they are per-turn state that survives the round.
         """
-        from gangge.layer3_agent.tools.todo import get_todo_state
-
         write_tools = {
             "write_file", "edit_file", "apply_patch", "bash", "novel_write_chapter",
             "novel_init", "novel_setup", "novel_outline", "create_tool",
@@ -1776,7 +2147,7 @@ class AgenticLoop:
             consecutive_readonly_rounds += 1
 
         if consecutive_readonly_rounds >= 3:
-            todo_state = get_todo_state()
+            todo_state = self.todo_state
             if todo_state.get_pending():
                 consecutive_readonly_rounds = 0
                 await self._emit(ContentBlock(
@@ -1814,16 +2185,26 @@ class AgenticLoop:
         else:
             stalled_rounds += 1
             if stalled_rounds >= 4 and has_modified_files:
-                todo_state = get_todo_state()
-                if todo_state.get_pending():
-                    todo_state.mark_all_done()
+                pending = self.todo_state.get_pending()
+                if pending:
+                    # 不要替用户把待办涂成完成：界面上写着"未完成"，内部状态却是
+                    # 6/6，下一次"继续"时模型读到的是"都做完了"，真正的收尾就被跳过了。
+                    logger.warning(
+                        "[Loop] 自动收尾，%d 项待办保留未完成状态: %s",
+                        len(pending),
+                        " / ".join(str(t.get("content", ""))[:30] for t in pending[:3]),
+                    )
                     await self._emit(ContentBlock(
                         type=ContentType.TEXT,
                         text="📋 核心产出已生成，但后续待办持续数轮无进展，已自动收尾\n",
                     ))
+                    detail = await self._emit_unfinished("⚠️ 尚未完成：")
+                    stalled_response = "核心产出已生成；剩余待办因当前环境无法继续推进，已自动收尾。"
+                    if detail:
+                        stalled_response = f"{stalled_response}\n\n{detail}"
                     return (
                         await self._finish_turn(
-                            final_response="核心产出已生成；剩余待办因当前环境无法继续推进，已自动收尾。",
+                            final_response=stalled_response,
                             executions=executions,
                             round_num=round_num,
                             total_tokens=total_tokens,
@@ -1836,7 +2217,7 @@ class AgenticLoop:
                     )
                 stalled_rounds = 0
 
-        todo_state = get_todo_state()
+        todo_state = self.todo_state
         if todo_state.get_all() and not todo_state.get_pending():
             await self._emit(ContentBlock(
                 type=ContentType.TEXT,
@@ -1921,11 +2302,10 @@ class AgenticLoop:
                     if block.type in (ContentType.TEXT, ContentType.THINKING):
                         await self._emit(block)
             self._end_step(qa_step, response=response)
-            self.emitter.emit_done(total_steps=1)
-            return LoopResult(
+            return self._finalize(
                 final_response=response.text or "",
-                tool_executions=[],
-                total_rounds=1,
+                executions=[],
+                rounds=1,
                 total_tokens=response.usage,
                 completion_reason="single_turn_answer",
             )
@@ -1935,12 +2315,17 @@ class AgenticLoop:
         static_system = self._build_static_system_prompt()
 
         # ── Clear stale todo state ──
-        from gangge.layer3_agent.tools.todo import get_todo_state
-        todo_state = get_todo_state()
+        todo_state = self.todo_state
         # Clear previous task's todos unless user explicitly says "继续"
         _should_keep_todos = "继续" in last_user_text or "continue" in last_user_text.lower()
         self._is_new_task = False  # set below
-        self._last_verification_note = ""   # 新任务：上一次的验证结论作废
+        # 新任务：本任务的验证结论从零开始，但上一任务的结论要留一句话——
+        # 它往往是"这个仓库里某条测试是坏的"这类跨任务仍然成立的事实。
+        if self._last_verification_note.strip():
+            self._carryover_verification_note = (
+                "（上一任务）" + self._last_verification_note.strip()
+            )
+        self._last_verification_note = ""
         if not _should_keep_todos:
             todo_state.clear()
             self._is_new_task = True  # new task: don't exit until model creates at least one todo
@@ -1949,9 +2334,14 @@ class AgenticLoop:
         self._ensure_memory_bank()
 
         # ── Extract user task description for commit messages ──
-        # 取"最后一条"用户消息：多轮对话里第一条是最初的任务，用它会让提交信息、
-        # 意图判定和进度记录一直停在旧任务上（三次 checkpoint 同一个标题就是这么来的）。
-        user_task_desc = last_user_text[:80].replace("\n", " ")
+        # 只用末条消息会让"把按钮改蓝"变成整个任务的标题；只用首条又会
+        # 让三次 checkpoint 顶同一个标题。两个都取：任务全貌 → 本次指令。
+        _current_brief = " ".join(last_user_text.split())[:80]
+        _overall_brief = " ".join(_first_user_text(messages).split())[:80]
+        if _overall_brief and _current_brief and _overall_brief != _current_brief:
+            user_task_desc = f"{_overall_brief} → {_current_brief}"
+        else:
+            user_task_desc = _current_brief or _overall_brief
 
         # ── Shadow Git: auto-checkpoint before AI starts ──
         shadow_checkpoint = await self._git_checkpoint(
@@ -2011,6 +2401,8 @@ class AgenticLoop:
                 content=[ContentBlock(type=ContentType.TEXT, text=inject_text)],
             ))
 
+        cancelled_at_round: int | None = None
+
         for round_num in range(self.config.max_tool_rounds):
             logger.info(f"Agentic loop round {round_num + 1}")
 
@@ -2023,6 +2415,7 @@ class AgenticLoop:
 
             # ── Cancel check: allow external stop button to interrupt ──
             if self._cancel_check and self._cancel_check():
+                cancelled_at_round = round_num
                 await self._emit(ContentBlock(
                     type=ContentType.TEXT,
                     text="\n⏹ 任务已取消\n",
@@ -2056,21 +2449,26 @@ class AgenticLoop:
             current_phase = self.tools.get_current_phase()
             tool_defs = self._get_all_tool_defs(phase=current_phase)
 
-            # ── Token-based auto compression (Claude Code style: 92% threshold) ──
+            # ── Token-based auto compression ──
             # 判据是"上一次请求实际占了窗口多少"，不是全程累计 token。
             # 用累计值会得到单调上涨的比例（100%→200%→400%），于是每轮都压、
             # 把历史压没了还继续报"使用率 454%"。
             if round_num > 0:
                 if last_request_tokens > 0 and self.llm.max_context_tokens > 0:
                     usage_ratio = last_request_tokens / self.llm.max_context_tokens
-                    if usage_ratio > 0.92:
+                    if usage_ratio > self.config.compression_threshold:
                         _before = len(messages)
                         messages = await self._compress_history(messages, round_num)
                         _after = len(messages)
-                        await self._emit(ContentBlock(
-                            type=ContentType.TEXT,
-                            text=f"\n📦 上下文压缩: 使用率 {usage_ratio:.0%}，已自动压缩旧对话\n",
-                        ))
+                        if _after < _before:
+                            await self._emit(ContentBlock(
+                                type=ContentType.TEXT,
+                                text=f"\n📦 上下文压缩: 使用率 {usage_ratio:.0%}，已自动压缩旧对话\n",
+                            ))
+                        else:
+                            # 压缩没生效（历史太短或没有安全切点）：退回滑窗。
+                            # 不然这一轮会带着超窗口的请求直接去撞 API。
+                            messages = self._trim_history(messages)
                         # Experimental: record compression event
                         self.emitter.emit_metrics(
                             round=round_num,
@@ -2091,6 +2489,13 @@ class AgenticLoop:
                         type=ContentType.TEXT,
                         text=f"\n📦 历史压缩: 第 {round_num} 轮\n",
                     ))
+
+            # ── Shrink bulky tool-call bodies in older rounds ──
+            # 与压缩/裁剪独立：即使没触发压缩，写过的文件正文也不该每轮重发。
+            # 每轮都跑，包括跨会话后的第一轮 —— 上一段会话留在历史里的
+            # write_file 正文（几十个文件的全文）同样要瘦，否则"继续"一句话
+            # 的第一发就要带上整段旧历史。
+            messages = self._shrink_tool_use_args(messages)
 
             # ── Deduplicate repeated file reads to save tokens ──
             if round_num > 0 and reads_cache:
@@ -2118,7 +2523,7 @@ class AgenticLoop:
             # 真正的"卡住"判定下移到 adapter 的流式看门狗（首包 / chunk 间隔）。
             # 这里只留一个远大于它的兜底：思考型模型连续输出几分钟 reasoning
             # 是正常行为，用 llm_timeout 当总上限会把好好的请求砍掉。
-            total_budget = max(self.config.llm_timeout * 6, 3600.0)
+            total_budget = max(self.config.llm_timeout * 6, self.config.llm_hard_timeout)
             try:
                 response = await asyncio.wait_for(
                     self._chat(
@@ -2133,10 +2538,11 @@ class AgenticLoop:
                 logger.error(error_text)
                 self.emitter.emit(EventType.ERROR, error_text)
                 self._end_step(step, error="timeout")
-                return LoopResult(
-                    final_response=error_text,
-                    tool_executions=executions,
-                    total_rounds=round_num,
+                detail = await self._emit_unfinished("⚠️ 尚未完成：")
+                return self._finalize(
+                    final_response=error_text + (f"\n\n{detail}" if detail else ""),
+                    executions=executions,
+                    rounds=round_num,
                     total_tokens=total_tokens,
                     completion_reason="llm_timeout",
                 )
@@ -2157,7 +2563,13 @@ class AgenticLoop:
                             type=ContentType.TEXT,
                             text=f"⏳ API 限流，{backoff} 秒后自动重试（第 {consecutive_failures}/{max_retries} 次）...\n",
                         ))
-                        await asyncio.sleep(backoff)
+                        if await self._sleep_unless_cancelled(backoff):
+                            cancelled_at_round = round_num
+                            await self._emit(ContentBlock(
+                                type=ContentType.TEXT,
+                                text="\n⏹ 任务已取消（限流等待中）\n",
+                            ))
+                            break
                         continue  # retry this round
                     else:
                         error_text = f"LLM 调用失败（已重试 {max_retries} 次仍限流）: {e}"
@@ -2171,10 +2583,11 @@ class AgenticLoop:
                     file_registry, round_num, user_task_desc
                 )
 
-                return LoopResult(
-                    final_response=error_text,
-                    tool_executions=executions,
-                    total_rounds=round_num,
+                detail = await self._emit_unfinished("⚠️ 尚未完成：")
+                return self._finalize(
+                    final_response=error_text + (f"\n\n{detail}" if detail else ""),
+                    executions=executions,
+                    rounds=round_num,
                     total_tokens=total_tokens,
                     completion_reason="llm_error",
                 )
@@ -2198,7 +2611,8 @@ class AgenticLoop:
                     state_text=state_text,
                 )
             except Exception:
-                pass
+                # 指标不是主流程，但静默失败会让实验面板的数据缺口无从解释。
+                logger.debug("[Loop] 本轮指标上报失败", exc_info=True)
 
             # Reset consecutive failure counter on success
             self._llm_failures = 0
@@ -2270,9 +2684,11 @@ class AgenticLoop:
                 # Don't force tool use — exit normally.
                 if not todo_state.get_all() and len(text) > 100:
                     self._is_new_task = False
+                    # 前置换行：模型最后一句常常不带换行，直接追加会粘成
+                    # "🎉 任务完📋 已收到回答"，看起来像输出坏了。
                     await self._emit(ContentBlock(
                         type=ContentType.TEXT,
-                        text="📋 已收到回答\n",
+                        text="\n📋 已收到回答\n",
                     ))
 
                 # ── All other cases: model stopped calling tools ──
@@ -2369,6 +2785,20 @@ class AgenticLoop:
                     memory_bank_update=mb_extracted,
                 )
 
+            # ── Cancel check before tools ──
+            # The model may have taken a while to answer while the user pressed
+            # stop. Starting a fresh batch of side effects after that would be
+            # the worst possible reading of "stop". The assistant message that
+            # requested these tools has no results yet; ``_repair_message_chain``
+            # closes it on the way out.
+            if self._cancel_check and self._cancel_check():
+                cancelled_at_round = round_num
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="\n⏹ 任务已取消（本轮工具调用未执行）\n",
+                ))
+                break
+
             # 5. Run the tools this round asked for.
             round_io = await self._execute_tool_calls(
                 response,
@@ -2400,6 +2830,22 @@ class AgenticLoop:
             )
             if outcome is not None:
                 return outcome
+
+        # ── Cancelled: its own exit path ──
+        # ``break`` used to fall straight through to the max-rounds branch, so a
+        # user cancel was logged, saved and reported as "round limit reached".
+        if cancelled_at_round is not None:
+            logger.warning("[Loop] 用户取消任务（第 %d 轮）", cancelled_at_round + 1)
+            self.emitter.emit(EventType.WARNING, "任务已被用户取消")
+            self._auto_save_progress(file_registry, cancelled_at_round, user_task_desc)
+            detail = await self._emit_unfinished("⏹ 已取消，尚未完成：")
+            return self._finalize(
+                final_response="[任务已被用户取消]" + (f"\n\n{detail}" if detail else ""),
+                executions=executions,
+                rounds=cancelled_at_round + 1,
+                total_tokens=total_tokens,
+                completion_reason="cancelled",
+            )
 
         self.emitter.emit(EventType.WARNING, "达到最大工具调用轮数限制")
 
@@ -2440,10 +2886,11 @@ class AgenticLoop:
                 file_registry, self.config.max_tool_rounds, user_task_desc
             )
 
-        return LoopResult(
-            final_response="[达到最大工具调用轮数限制]",
-            tool_executions=executions,
-            total_rounds=self.config.max_tool_rounds,
+        detail = await self._emit_unfinished("⚠️ 轮数已用尽，尚未完成：")
+        return self._finalize(
+            final_response="[达到最大工具调用轮数限制]" + (f"\n\n{detail}" if detail else ""),
+            executions=executions,
+            rounds=self.config.max_tool_rounds,
             total_tokens=total_tokens,
             completion_reason="max_rounds",
         )

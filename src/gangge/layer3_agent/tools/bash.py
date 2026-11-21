@@ -6,15 +6,136 @@ Uses threaded reading + merged stderr to avoid Windows pipe deadlock.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import platform
 import re
+import signal
 import subprocess
 import threading
 from io import StringIO
 from typing import Any
 
 from gangge.layer3_agent.tools.base import BaseTool, ToolResult
+
+logger = logging.getLogger(__name__)
+
+#: Commands started by this process that have not exited yet. A server the
+#: agent launched should not outlive the task that needed it.
+_TRACKED_PROCS: set[subprocess.Popen] = set()
+_TRACK_LOCK = threading.Lock()
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate a command *and everything it spawned*.
+
+    ``proc.kill()`` only reaps the direct child. On Windows the direct child is
+    powershell, so anything it launched with ``Start-Process`` becomes an
+    orphan — that is how a finished task left a Flask server holding port 5000.
+    """
+    if proc.poll() is not None:
+        return
+    if platform.system() == "Windows":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+            )
+            return
+        except Exception:
+            logger.debug("[bash] taskkill 失败，退回 kill()", exc_info=True)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except Exception:
+            logger.debug("[bash] killpg 失败，退回 kill()", exc_info=True)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+#: Windows NTSTATUS codes that mean "the process died", not "the command failed".
+_WIN_CRASH_CODES = {
+    0xC0000005: "access violation（内存访问冲突）",
+    0xC00000FD: "stack overflow（栈溢出）",
+    0xC0000135: "DLL not found（缺少依赖库）",
+    0xC0000139: "DLL entry point not found（依赖库版本不匹配）",
+    0xC0000409: "stack buffer overrun（/GS 保护触发）",
+    0xC0000374: "heap corruption（堆损坏）",
+}
+
+_POSIX_SIGNALS = {6: "SIGABRT", 9: "SIGKILL", 11: "SIGSEGV（段错误）", 15: "SIGTERM"}
+
+
+def describe_abnormal_exit(code: int | None) -> str:
+    """Explain a crash-style exit code in words the model can act on.
+
+    ``3221225477`` is just ``0xC0000005`` — an access violation. Reporting it as
+    "exit 3221225477, no output" told the model nothing, so it burned six rounds
+    bisecting the parameters of a native extension that was simply incompatible
+    with the interpreter.
+    """
+    if not code:
+        return ""
+
+    if code < 0:  # POSIX: killed by a signal
+        sig = -code
+        return (
+            f"\n[进程被信号终止] signal {sig} {_POSIX_SIGNALS.get(sig, '')}。"
+            "这通常是原生扩展（C/Rust 编译的包）崩溃，而不是脚本逻辑错误。"
+        )
+
+    if code >= 0xC0000000:
+        name = _WIN_CRASH_CODES.get(code, "未知系统异常")
+        return (
+            f"\n[进程异常终止] 退出码 {code} = 0x{code:08X} — {name}。"
+            "这不是脚本逻辑错误，通常是原生扩展与当前 Python 版本不兼容；"
+            "可尝试更换 Python 版本，或改用该工具的 CLI / 独立进程方式运行。"
+        )
+
+    return ""
+
+
+_PORT_CONFLICT_HINTS = (
+    "Address already in use",
+    "WinError 10048",
+    "EADDRINUSE",
+    "通常每个套接字地址",
+)
+
+
+def describe_port_conflict(output: str) -> str:
+    """Explain a port clash and how to find the culprit.
+
+    The model once spent four rounds on "5000 is taken" with ``netstat`` and
+    manual PIDs — and the process holding the port was a server an earlier task
+    had left running. Naming the class of error up front shortens that loop.
+    """
+    if not any(hint in output for hint in _PORT_CONFLICT_HINTS):
+        return ""
+    return (
+        "\n[端口冲突] 目标端口已被其他进程占用，这不是代码错误。"
+        "先确认占用者：Windows 用 `netstat -ano | findstr :<端口>` 取 PID，"
+        "再 `tasklist /FI \"PID eq <PID>\"` 看是哪个程序；"
+        "确认无用后 `taskkill /PID <PID> /F`，或者直接给服务换一个端口。"
+        "注意：占用者可能是本会话先前启动、没有关掉的服务。"
+    )
+
+
+def cleanup_tracked_processes() -> int:
+    """Kill commands this session started and never reaped.
+
+    Called at the end of a turn. Returns how many processes were reclaimed.
+    """
+    with _TRACK_LOCK:
+        procs = [p for p in _TRACKED_PROCS if p.poll() is None]
+        _TRACKED_PROCS.clear()
+    for proc in procs:
+        _kill_process_tree(proc)
+    return len(procs)
 
 
 def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]:
@@ -61,6 +182,8 @@ def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]
             errors="replace",
             cwd=cwd,
             env=env,
+            # POSIX：单独进程组，超时时能连同子进程一起杀（见 _kill_process_tree）
+            **({} if platform.system() == "Windows" else {"start_new_session": True}),
         )
 
         # 逐行读取，不等进程结束
@@ -71,19 +194,25 @@ def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]
             except Exception:
                 pass
 
-        reader = threading.Thread(target=read_output, daemon=True)
-        reader.start()
-        reader.join(timeout=timeout)
+        with _TRACK_LOCK:
+            _TRACKED_PROCS.add(proc)
+        try:
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            reader.join(timeout=timeout)
 
-        if reader.is_alive():
-            proc.kill()
-            return (
-                f"[超时] 命令执行超过 {timeout} 秒被终止\n"
-                f"已获取输出:\n{output_buf.getvalue()[:500]}",
-                None,
-            )
+            if reader.is_alive():
+                _kill_process_tree(proc)
+                return (
+                    f"[超时] 命令执行超过 {timeout} 秒被终止\n"
+                    f"已获取输出:\n{output_buf.getvalue()[:500]}",
+                    None,
+                )
 
-        proc.wait()
+            proc.wait()
+        finally:
+            with _TRACK_LOCK:
+                _TRACKED_PROCS.discard(proc)
 
     except FileNotFoundError:
         return ("[错误] 找不到命令执行器（powershell/bash）", None)
@@ -102,6 +231,13 @@ def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]
             + f"\n\n...[输出已截断，共 {len(result)} 字符，保留首尾各 {MAX_OUTPUT // 2} 字符]...\n\n"
             + tail
         )
+
+    # 空输出 + 奇怪的退出码是最难排查的组合：模型只能反复猜。
+    diagnosis = describe_abnormal_exit(exit_code)
+    if diagnosis:
+        result = (result + diagnosis) if result else f"(无输出){diagnosis}"
+
+    result += describe_port_conflict(result)
 
     return (result or "(无输出)", exit_code)
 

@@ -57,8 +57,9 @@ class UsageController:
         self._last_call_time = 0.0
 
     def check_web_call(self) -> tuple[bool, str]:
-        self._web_count += 1
-        if self._web_count > self.max_web_calls:
+        # 计数放在所有检查之后：冷却被拒也算一次额度的话，模型重试一次
+        # 就白掉两个配额。
+        if self._web_count >= self.max_web_calls:
             return False, (
                 f"已达到本次任务网页调用上限 ({self.max_web_calls}次)。"
                 f"请基于已获取的信息继续工作，不要再搜索或抓取网页。"
@@ -66,13 +67,30 @@ class UsageController:
         now = time.monotonic()
         elapsed = now - self._last_call_time
         if self._last_call_time > 0 and elapsed < self.min_cooldown:
-            return False, f"调用间隔过短 ({(elapsed):.1f}s)，请等待 {self.min_cooldown - elapsed:.0f}s 后再试"
+            return False, (
+                f"调用间隔过短 ({elapsed:.1f}s)，"
+                f"请等待 {self.min_cooldown - elapsed:.1f}s 后再试"
+            )
+        self._web_count += 1
         self._last_call_time = now
         return True, ""
 
+    async def reserve_web_slot(self) -> tuple[bool, str]:
+        """Take a web slot, waiting out the cooldown instead of rejecting.
+
+        冷却只差 0.4 秒时把错误甩回模型，等于白烧一轮：它得重新组织一次完整
+        请求才能问同一件事。额度耗尽仍然要拒绝，那是真的不能继续。
+        """
+        ok, msg = self.check_web_call()
+        if ok or "间隔过短" not in msg:
+            return ok, msg
+        delay = self.min_cooldown - (time.monotonic() - self._last_call_time)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return self.check_web_call()
+
     def check_browser_call(self) -> tuple[bool, str]:
-        self._browser_count += 1
-        if self._browser_count > self.max_browser_calls:
+        if self._browser_count >= self.max_browser_calls:
             return False, (
                 f"已达到本次任务浏览器调用上限 ({self.max_browser_calls}次)。"
                 f"浏览器操作消耗大，请用 web_fetch 或基于已有信息继续。"
@@ -80,9 +98,23 @@ class UsageController:
         now = time.monotonic()
         elapsed = now - self._last_call_time
         if self._last_call_time > 0 and elapsed < self.min_cooldown:
-            return False, f"调用间隔过短 ({(elapsed):.1f}s)，请等待 {self.min_cooldown - elapsed:.0f}s 后再试"
+            return False, (
+                f"调用间隔过短 ({elapsed:.1f}s)，"
+                f"请等待 {self.min_cooldown - elapsed:.1f}s 后再试"
+            )
+        self._browser_count += 1
         self._last_call_time = now
         return True, ""
+
+    async def reserve_browser_slot(self) -> tuple[bool, str]:
+        """Browser counterpart of :meth:`reserve_web_slot`."""
+        ok, msg = self.check_browser_call()
+        if ok or "间隔过短" not in msg:
+            return ok, msg
+        delay = self.min_cooldown - (time.monotonic() - self._last_call_time)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return self.check_browser_call()
 
     def usage_summary(self) -> str:
         return (
@@ -213,7 +245,7 @@ class WebFetchTool(BaseTool):
                 is_error=True,
             )
 
-        ok, msg = self._usage.check_web_call()
+        ok, msg = await self._usage.reserve_web_slot()
         if not ok:
             return ToolResult(output=msg, is_error=True)
 
@@ -374,7 +406,7 @@ class WebSearchTool(BaseTool):
                 is_error=True,
             )
 
-        ok, msg = self._usage.check_web_call()
+        ok, msg = await self._usage.reserve_web_slot()
         if not ok:
             return ToolResult(output=msg, is_error=True)
 

@@ -365,7 +365,10 @@ class TestStepEvents:
         ends: list[dict] = []
         ctx.on(events.STEP_END, ends.append)
         loop = _loop(tmp_path, llm=Slow([]), context=ctx)
+        # 单次调用的上限现在是 max(llm_timeout * 6, llm_hard_timeout)：
+        # llm_timeout 单独不再能触发超时，硬上限也要一起压小。
         loop.config.llm_timeout = 0.05
+        loop.config.llm_hard_timeout = 0.05
 
         result = await loop.run([Message(role=Role.USER, content="hi")])
 
