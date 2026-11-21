@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import logging
+
 from pydantic import BaseModel, Field
 
 from ..llm import LLMProvider, LLMMessage, parse_llm_json, parse_llm_json_list, with_retry, _fix_df
@@ -13,6 +15,8 @@ from ..types.narrative import (
     Character, StoryEvent, DramaticFunction,
 )
 from ..types.state import CausalLink, AffectedDecision
+
+logger = logging.getLogger(__name__)
 
 
 # ── Pydantic Schemas ──────────────────────────────────────────────────────────
@@ -383,11 +387,41 @@ ID 格式：causal_ch{chapter_number}_001
                 LLMMessage("system", "你是叙事分析师，分析因果结构，只输出合法 JSON 数组。"),
                 LLMMessage("user", prompt),
             ])
+            counter = [0]
+
+            def _patch(item: dict) -> dict:
+                # 模型常见偏差：漏 chapter、affected_decisions 写成一句话
+                item.setdefault("chapter", chapter_number)
+                ad = item.get("affected_decisions")
+                if isinstance(ad, str):
+                    item["affected_decisions"] = (
+                        [{"character_id": "", "decision": ad}] if ad.strip() else []
+                    )
+                elif isinstance(ad, list):
+                    fixed = []
+                    for d in ad:
+                        if isinstance(d, str):
+                            fixed.append({"character_id": "", "decision": d})
+                        elif isinstance(d, dict):
+                            d.setdefault("character_id", "")
+                            d.setdefault("decision", "")
+                            fixed.append(d)
+                    item["affected_decisions"] = fixed
+                te = item.get("triggered_events")
+                if isinstance(te, str):
+                    item["triggered_events"] = [te] if te.strip() else []
+                if not item.get("id"):
+                    counter[0] += 1
+                    item["id"] = f"causal_ch{chapter_number}_{counter[0]:03d}"
+                return item
+
             return parse_llm_json_list(
-                resp.content, CausalLinkSchema, "extract_causal_links"
+                resp.content, CausalLinkSchema, "extract_causal_links", patch_fn=_patch
             )
 
         try:
             return with_retry(_call)
-        except Exception:
-            return []  # 因果链提取失败不阻塞主流程
+        except Exception as e:
+            # 失败不阻塞写作，但要留下痕迹，否则面板里的因果链永远是 0
+            logger.warning("因果链提取失败（第 %s 章）: %s", chapter_number, e)
+            return []

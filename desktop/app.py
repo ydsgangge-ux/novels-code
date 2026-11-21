@@ -1922,25 +1922,28 @@ class NovelSidebarPanel(QWidget):
         self.refresh_books()
 
     def refresh_books(self):
+        previous = self.get_selected_book_id()
+        self._book_list.blockSignals(True)
         self._book_list.clear()
         if not self._workspace:
+            self._book_list.blockSignals(False)
             return
         books_dir = Path(self._workspace) / "books"
-        if not books_dir.exists():
+        if not books_dir.exists() and not Path(self._workspace).exists():
+            self._book_list.blockSignals(False)
             return
-        for book_path in sorted(books_dir.iterdir()):
-            if book_path.is_dir():
-                config_path = book_path / "state" / "config.json"
-                if config_path.exists():
-                    try:
-                        cfg = json.loads(config_path.read_text(encoding="utf-8"))
-                        genre = cfg.get("genre", "")
-                        ch = cfg.get("target_chapters", "?")
-                        item = QListWidgetItem(f"{cfg.get('title', '?')} [{genre}] {ch}章")
-                        item.setData(Qt.ItemDataRole.UserRole, cfg.get("id", ""))
-                        self._book_list.addItem(item)
-                    except Exception:
-                        pass
+        for bid, title, genre, target_ch, _path in _discover_books(self._workspace):
+            item = QListWidgetItem(f"{title} [{genre}] {target_ch}章")
+            item.setData(Qt.ItemDataRole.UserRole, bid)
+            self._book_list.addItem(item)
+        self._book_list.blockSignals(False)
+        if previous:
+            self.select_book(previous)
+
+    def select_latest(self):
+        """选中书架中最后添加的一本书（通常是最新建的）。"""
+        if self._book_list.count() > 0:
+            self._book_list.setCurrentRow(self._book_list.count() - 1)
 
     def get_selected_book_id(self) -> str:
         items = self._book_list.selectedItems()
@@ -1963,6 +1966,216 @@ class NovelSidebarPanel(QWidget):
     def _emit_action(self, action: str):
         book_id = self.get_selected_book_id()
         self.novel_action.emit(action, {"book_id": book_id})
+
+
+def _scan_chapter_files(chapter_dir: Path) -> dict:
+    """扫描章节目录，兼容 ch0001_final.md / chapter_001.md / 第01章_标题.md。
+
+    同一章号多条文件时：最终稿优先于草稿，ch* 命名优先于旧命名。
+    """
+    import re
+
+    found: dict[int, dict] = {}
+    if not chapter_dir.exists():
+        return found
+
+    for ch_path in sorted(chapter_dir.glob("*.md")):
+        name = ch_path.stem
+        ch_num = None
+        status = "已完成"
+
+        if name.startswith("ch") and ("_final" in name or "_draft" in name):
+            try:
+                ch_num = int(name.replace("ch", "").replace("_final", "").replace("_draft", ""))
+            except ValueError:
+                pass
+            if "_draft" in name:
+                status = "草稿"
+        elif name.startswith("chapter_"):
+            try:
+                ch_num = int(name.replace("chapter_", ""))
+            except ValueError:
+                pass
+        elif name.startswith("第"):
+            m = re.match(r"第(\d+)章", name)
+            if m:
+                ch_num = int(m.group(1))
+
+        if ch_num is None:
+            continue
+
+        prior = found.get(ch_num)
+        if prior:
+            if prior["status"] == "已完成" and status == "草稿":
+                continue
+            if prior["status"] == "草稿" and status == "已完成":
+                pass
+            elif prior["path"].name.startswith("ch") and not ch_path.name.startswith("ch"):
+                continue
+            elif not prior["path"].name.startswith("ch") and ch_path.name.startswith("ch"):
+                pass
+            else:
+                continue
+
+        try:
+            content = ch_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+        title = ""
+        for line in content.split("\n")[:5]:
+            if line.strip().startswith("#"):
+                title = line.strip().lstrip("#").strip()
+                break
+
+        found[ch_num] = {
+            "path": ch_path,
+            "status": status,
+            "title": title or name,
+            "word_count": len(content),
+        }
+
+    return found
+
+
+def _book_candidates(workspace: str, book_id: str) -> list[Path]:
+    """书籍目录可能存在的位置：标准 books/<id>、项目根 <id>、历史嵌套 books/books/<id>。"""
+    if not workspace or not book_id:
+        return []
+    ws = Path(workspace)
+    return [ws / "books" / book_id, ws / book_id, ws / "books" / "books" / book_id]
+
+
+def _resolve_book_dir(workspace: str, book_id: str, migrate: bool = False) -> Path:
+    """返回书籍真实目录；migrate=True 时把历史错位目录挪回 books/<id>。"""
+    candidates = _book_candidates(workspace, book_id)
+    if not candidates:
+        return Path(workspace) / "books" / book_id
+    target = candidates[0]
+    for p in candidates:
+        if not (p / "state" / "config.json").exists():
+            continue
+        if migrate and p != target and not target.exists():
+            try:
+                import shutil
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(target))
+                logger.info("书籍目录已归位: %s -> %s", p, target)
+                return target
+            except Exception as e:
+                logger.warning("书籍目录归位失败 %s -> %s: %s", p, target, e)
+        return p
+    return target
+
+
+def _discover_books(workspace: str) -> list[tuple[str, str, str, Any, Path]]:
+    """扫描项目下所有书籍，兼容三种历史布局。
+
+    返回 (book_id, title, genre, target_chapters, path)。
+    """
+    if not workspace:
+        return []
+    ws = Path(workspace)
+    results: list[tuple[str, str, str, Any, Path]] = []
+    seen: set[str] = set()
+    for base in (ws / "books", ws, ws / "books" / "books"):
+        if not base.is_dir():
+            continue
+        for p in sorted(base.iterdir()):
+            cfg_path = p / "state" / "config.json"
+            if not p.is_dir() or not cfg_path.exists():
+                continue
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            bid = cfg.get("id") or p.name
+            if bid in seen:
+                continue
+            seen.add(bid)
+            results.append((
+                bid,
+                cfg.get("title") or p.name,
+                cfg.get("genre", ""),
+                cfg.get("target_chapters", "?"),
+                p,
+            ))
+    return results
+
+
+def _parse_tool_kwargs(text: str) -> dict:
+    """解析 name(key=value, ...) 内的参数。
+
+    界面生成的快捷命令用的是 kwargs 写法（book_id="x", chapter_number=2），
+    不是 JSON，直接 json.loads 必然失败，会导致所有"编辑选中"回落到 LLM 慢路径。
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        else:
+            if ch in "\"'":
+                quote = ch
+                buf.append(ch)
+            elif ch in "{[(":
+                depth += 1
+                buf.append(ch)
+            elif ch in "}])":
+                depth -= 1
+                buf.append(ch)
+            elif ch == "," and depth == 0:
+                parts.append("".join(buf))
+                buf = []
+            else:
+                buf.append(ch)
+        i += 1
+    if "".join(buf).strip():
+        parts.append("".join(buf))
+
+    out: dict = {}
+    for part in parts:
+        key, sep, value = part.partition("=")
+        key, raw = key.strip(), value.strip()
+        if not sep or not key:
+            continue
+        try:
+            out[key] = json.loads(raw)
+            continue
+        except Exception:
+            pass
+        if raw[:1] in ("[", "{"):
+            try:
+                import ast
+                out[key] = ast.literal_eval(raw)
+                continue
+            except Exception:
+                pass
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            out[key] = raw[1:-1]
+        elif raw.lower() in ("true", "false"):
+            out[key] = raw.lower() == "true"
+        elif raw.lower() in ("none", "null"):
+            out[key] = None
+        else:
+            try:
+                out[key] = int(raw)
+            except ValueError:
+                try:
+                    out[key] = float(raw)
+                except ValueError:
+                    out[key] = raw
+    return out
 
 
 class NovelRightPanel(QWidget):
@@ -2082,7 +2295,7 @@ class NovelRightPanel(QWidget):
 
         row4 = QHBoxLayout()
         self._fast_mode_cb = QCheckBox("快速写作模式")
-        self._fast_mode_cb.setChecked(True)
+        self._fast_mode_cb.setChecked(False)
         self._fast_mode_cb.setToolTip("跳过建筑师规划和审计修订闭环，速度提升约50%\n关闭后使用完整五层管线")
         self._fast_mode_cb.setStyleSheet("QCheckBox{color:#58a6ff;font-size:11px;}")
         row4.addWidget(self._fast_mode_cb)
@@ -2131,6 +2344,7 @@ class NovelRightPanel(QWidget):
         self._char_table.setColumnWidth(4, 100)
         self._char_table.setColumnWidth(5, 70)
         self._char_table.setColumnWidth(6, 55)
+        self._char_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._char_table.setAlternatingRowColors(True)
         self._char_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._char_table.verticalHeader().setVisible(False)
@@ -2152,7 +2366,7 @@ class NovelRightPanel(QWidget):
         btn.clicked.connect(self._refresh_characters)
         btn_row.addWidget(btn)
         btn = QPushButton("添加角色")
-        btn.clicked.connect(lambda: self._emit_action("edit_characters"))
+        btn.clicked.connect(lambda: self._emit_action("add_character"))
         btn_row.addWidget(btn)
         btn_edit = QPushButton("编辑选中")
         btn_edit.setStyleSheet(
@@ -2255,6 +2469,7 @@ class NovelRightPanel(QWidget):
         self._arcs_table.setColumnWidth(1, 120)
         self._arcs_table.setColumnWidth(2, 160)
         self._arcs_table.setColumnWidth(3, 50)
+        self._arcs_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._arcs_table.setAlternatingRowColors(True)
         self._arcs_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._arcs_table.verticalHeader().setVisible(False)
@@ -2263,7 +2478,9 @@ class NovelRightPanel(QWidget):
         lay.addWidget(self._arcs_table)
 
         self._arc_detail = QTextBrowser()
-        self._arc_detail.setMaximumHeight(160)
+        self._arc_detail.setMaximumHeight(240)
+        self._arc_detail.setOpenExternalLinks(False)
+        self._arc_detail.anchorClicked.connect(self._on_arc_detail_link)
         self._arc_detail.setStyleSheet(
             "QTextBrowser{background:#0d1117;border:1px solid #21262d;border-radius:4px;"
             "color:#c9d1d9;font-size:11px;padding:6px;}"
@@ -2333,6 +2550,7 @@ class NovelRightPanel(QWidget):
         self._chapter_table.setColumnWidth(0, 50)
         self._chapter_table.setColumnWidth(1, 160)
         self._chapter_table.setColumnWidth(2, 60)
+        self._chapter_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._chapter_table.setAlternatingRowColors(True)
         self._chapter_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._chapter_table.verticalHeader().setVisible(False)
@@ -3003,6 +3221,8 @@ class NovelRightPanel(QWidget):
         self._workspace = workspace
         self._book_id = book_id
         if book_id:
+            # 兼容历史布局：书可能在项目根目录或 books/books 下，读取前先归位
+            _resolve_book_dir(workspace, book_id, migrate=True)
             self._refresh_all()
 
     def _refresh_all(self):
@@ -3019,9 +3239,32 @@ class NovelRightPanel(QWidget):
     def _refresh_dashboard(self):
         if not self._workspace or not self._book_id:
             return
-        sm_dir = Path(self._workspace) / "books" / self._book_id / "state"
+        book_dir = _resolve_book_dir(self._workspace, self._book_id)
+        sm_dir = book_dir / "state"
         config_path = sm_dir / "config.json"
         ws_path = sm_dir / "world_state.json"
+
+        chapters = _scan_chapter_files(book_dir / "chapters")
+        written = max(chapters) if chapters else 0
+        total_words = sum(c["word_count"] for c in chapters.values())
+
+        current_ch = 0
+        open_h = closed_h = 0
+        causal_n = thread_n = 0
+        if ws_path.exists():
+            try:
+                ws_data = json.loads(ws_path.read_text(encoding="utf-8"))
+                current_ch = ws_data.get("current_chapter", 0) or 0
+                hooks = ws_data.get("pending_hooks", [])
+                open_h = sum(1 for h in hooks if h.get("status") == "open")
+                # 状态枚举写的是 resolved，旧数据可能写 closed，两者都算已回收
+                closed_h = sum(1 for h in hooks if h.get("status") in ("resolved", "closed", "abandoned"))
+                causal_n = len(ws_data.get("causal_chain", []))
+                thread_n = len(ws_data.get("threads", []))
+            except Exception:
+                pass
+        # 进度以实际章节文件为准，避免 world_state 没推进时显示落后
+        current_ch = max(current_ch, written)
 
         if config_path.exists():
             try:
@@ -3030,50 +3273,39 @@ class NovelRightPanel(QWidget):
                 self._stat_title.setText(cfg.get("title", "--"))
                 self._stat_genre.setText(f"题材: {cfg.get('genre', '--')}")
                 target = cfg.get("target_chapters", 0)
-                target_words = cfg.get("target_words_per_chapter", 0)
-
-                current_ch = 0
-                total_words = 0
-                if ws_path.exists():
-                    ws_data = json.loads(ws_path.read_text(encoding="utf-8"))
-                    current_ch = ws_data.get("current_chapter", 0)
-                    hooks = ws_data.get("hooks", [])
-                    open_h = sum(1 for h in hooks if h.get("status") == "open")
-                    closed_h = sum(1 for h in hooks if h.get("status") == "closed")
-                    causal = ws_data.get("causal_chain", [])
-                    threads = ws_data.get("threads", [])
-                    self._stat_hooks.setText(f"伏笔: {open_h}开/{closed_h}闭")
-                    self._stat_causal.setText(f"因果链: {len(causal)}")
-                    self._stat_threads.setText(f"线程: {len(threads)}")
-
-                ch_dir = Path(self._workspace) / "books" / self._book_id / "chapters"
-                if ch_dir.exists():
-                    for f in ch_dir.glob("ch*_final.md"):
-                        total_words += len(f.read_text(encoding="utf-8"))
-
                 self._stat_chapters.setText(f"进度: {current_ch}/{target}章")
                 self._stat_words.setText(f"总字数: {total_words:,}")
+                self._stat_hooks.setText(f"伏笔: {open_h}开/{closed_h}闭")
+                self._stat_causal.setText(f"因果链: {causal_n}")
+                self._stat_threads.setText(f"线程: {thread_n}")
                 if target > 0:
-                    self._progress_bar.setValue(int(current_ch / target * 100))
+                    self._progress_bar.setValue(min(100, int(current_ch / target * 100)))
             except Exception:
                 pass
 
-        self._dashboard_log.setHtml(
-            "<p style='color:#484f58;'>操作日志将在此显示。点击左侧快捷操作开始创作。</p>"
-        )
-
-        # ── Show guidance if book is skeleton-only (no outline yet) ──
-        outline_path = sm_dir / "outline.json"
-        if not outline_path.exists():
-            self._dashboard_log.setHtml(
-                "<div style='color:#8b949e;font-size:11px;line-height:1.6;padding:12px;'>"
-                "<p style='color:#58a6ff;font-size:13px;font-weight:bold;'>📖 小说骨架已就绪</p>"
-                "<p>目前只有基本配置，还没有角色、世界观和大纲内容。</p>"
-                "<p>💬 <b>推荐方式</b>：在中间的聊天窗口描述你的故事想法，AI 会自动帮你配置。</p>"
-                "<p style='color:#484f58;'>例如：「我想写一个穿越到异世界的冒险故事，主角是个普通学生…」</p>"
-                "<p>🎨 或者点击左侧「生成大纲」按钮直接使用默认模板生成。</p>"
-                "</div>"
-            )
+        if not getattr(self, "_dashboard_logged", False):
+            outline_path = sm_dir / "outline.json"
+            if not outline_path.exists():
+                self._dashboard_log.setHtml(
+                    "<div style='color:#8b949e;font-size:11px;line-height:1.6;padding:12px;'>"
+                    "<p style='color:#58a6ff;font-size:13px;font-weight:bold;'>📖 小说骨架已就绪</p>"
+                    "<p>目前只有基本配置，还没有角色、世界观和大纲内容。</p>"
+                    "<p>💬 <b>推荐方式</b>：在中间的聊天窗口描述你的故事想法，AI 会自动帮你配置。</p>"
+                    "<p style='color:#484f58;'>例如：「我想写一个穿越到异世界的冒险故事，主角是个普通学生…」</p>"
+                    "<p>🎨 或者点击左侧「生成大纲」按钮直接使用默认模板生成。</p>"
+                    "</div>"
+                )
+            elif chapters:
+                last = chapters[written]
+                self._dashboard_log.setHtml(
+                    f"<p>最近完成：第 {written} 章《{last['title']}》（{last['word_count']:,} 字）</p>"
+                    f"<p style='color:#3fb950;'>下一步：点击「写下一章」生成第 {written + 1} 章</p>"
+                )
+            else:
+                self._dashboard_log.setHtml(
+                    "<p style='color:#484f58;'>大纲已就绪，尚未写正文。"
+                    "点击「展开章纲」生成章节大纲，再「写下一章」。</p>"
+                )
 
     def _refresh_characters(self):
         self._char_table.setRowCount(0)
@@ -3339,6 +3571,7 @@ class NovelRightPanel(QWidget):
                             seq.get("dramatic_function", ""),
                         ])
                         seq_item.setForeground(0, QColor("#58a6ff"))
+                        seq_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "sequence", "number": seq.get("number")})
                         arc_item.addChild(seq_item)
 
                         end_hook = seq.get("end_hook", "")
@@ -3358,6 +3591,7 @@ class NovelRightPanel(QWidget):
                         seq.get("dramatic_function", ""),
                     ])
                     seq_item.setForeground(0, QColor("#58a6ff"))
+                    seq_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "sequence", "number": seq.get("number")})
                     self._outline_tree.addTopLevelItem(seq_item)
 
                     end_hook = seq.get("end_hook", "")
@@ -3373,21 +3607,40 @@ class NovelRightPanel(QWidget):
         ch_outline_path = Path(self._workspace) / "books" / self._book_id / "state" / "chapter_outlines.json"
         if ch_outline_path.exists():
             try:
+                import re as _re
+
                 ch_data = json.loads(ch_outline_path.read_text(encoding="utf-8"))
+
+                # 建立「序列号 -> 树节点」映射，按章纲的 sequence_id（如 seq_01）挂载
+                seq_items: dict = {}
+
+                def _collect_seq(item):
+                    for i in range(item.childCount()):
+                        child = item.child(i)
+                        role = child.data(0, Qt.ItemDataRole.UserRole)
+                        if isinstance(role, dict) and role.get("type") == "sequence":
+                            seq_items[role.get("number")] = child
+                        _collect_seq(child)
+
+                _collect_seq(self._outline_tree.invisibleRootItem())
+
+                seen_chapters = set()
                 for co in ch_data:
+                    num = co.get("chapter_number")
+                    if num in seen_chapters:
+                        continue
+                    seen_chapters.add(num)
                     ch_item = QTreeWidgetItem([
-                        f"第{co.get('chapter_number', '?')}章",
+                        f"第{num}章",
                         "",
                         co.get("title", ""),
                         co.get("summary", "")[:60],
                     ])
                     ch_item.setForeground(0, QColor("#3fb950"))
-                    root = self._outline_tree.invisibleRootItem()
-                    for i in range(root.childCount()):
-                        seq_item = root.child(i)
-                        if co.get("sequence_id", "") in seq_item.text(0):
-                            seq_item.addChild(ch_item)
-                            break
+                    m = _re.search(r"(\d+)$", str(co.get("sequence_id", "")))
+                    parent = seq_items.get(int(m.group(1))) if m else None
+                    if parent is not None:
+                        parent.addChild(ch_item)
                     else:
                         self._outline_tree.addTopLevelItem(ch_item)
             except Exception:
@@ -3406,23 +3659,33 @@ class NovelRightPanel(QWidget):
         if not self._workspace or not self._book_id:
             return
 
-        from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
-        item_text = item.text(0)
+        meta = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(meta, dict):
+            if meta.get("type") == "arc":
+                self._edit_arc_data(meta.get("data") or {})
+                return
+            if meta.get("type") == "sequence":
+                seqs = self._flat_sequences()
+                for idx, seq in enumerate(seqs):
+                    if str(seq.get("number")) == str(meta.get("number")):
+                        self._edit_sequence_dialog(idx, item)
+                        return
+                return
 
-        if item_text.startswith("第") and "章" in item_text:
-            ch_num_str = item_text.replace("第", "").replace("章", "")
-            try:
-                ch_num = int(ch_num_str)
-            except ValueError:
-                return
-            self._edit_chapter_outline_dialog(ch_num)
-        elif item_text.startswith("序列"):
-            seq_id_str = item_text.replace("序列", "")
-            try:
-                seq_idx = int(seq_id_str) - 1
-            except ValueError:
-                return
-            self._edit_sequence_dialog(seq_idx, item)
+        item_text = item.text(0).strip()
+        import re as _re
+        m = _re.match(r"^第(\d+)章", item_text)
+        if m:
+            self._edit_chapter_outline_dialog(int(m.group(1)))
+            return
+        m = _re.match(r"^序列\s*(\d+)", item_text)
+        if m:
+            number = int(m.group(1))
+            seqs = self._flat_sequences()
+            for idx, seq in enumerate(seqs):
+                if int(seq.get("number", idx + 1) or idx + 1) == number:
+                    self._edit_sequence_dialog(idx, item)
+                    return
 
     def _edit_chapter_outline_dialog(self, ch_num):
         from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
@@ -3480,31 +3743,50 @@ class NovelRightPanel(QWidget):
             self._send_command(cmd)
             self._refresh_outline()
 
-    def _edit_sequence_dialog(self, seq_idx, tree_item):
-        from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
+    def _flat_sequences(self) -> list[dict]:
+        """把大纲里的序列摊平成与树/后端一致的顺序（arcs 结构需要逐篇展开）。"""
+        outline_path = Path(self._workspace) / "books" / self._book_id / "state" / "outline.json"
+        if not outline_path.exists():
+            return []
+        try:
+            outline = json.loads(outline_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        sequences = outline.get("sequences") or outline.get("acts") or []
+        if not sequences:
+            for arc in outline.get("arcs", []):
+                sequences.extend(arc.get("sequences", []))
+        return sequences
+
+    def _edit_sequence_dialog(self, seq_idx, tree_item=None):
+        from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox, QSpinBox
         outline_path = Path(self._workspace) / "books" / self._book_id / "state" / "outline.json"
         if not outline_path.exists():
             return
 
-        outline = json.loads(outline_path.read_text(encoding="utf-8"))
-        sequences = outline.get("sequences", outline.get("acts", []))
+        sequences = self._flat_sequences()
         if seq_idx >= len(sequences):
             return
         seq = sequences[seq_idx]
 
+        seq_number = seq.get("number", seq_idx + 1)
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"编辑序列 {seq_idx + 1}")
-        dlg.setMinimumWidth(400)
+        dlg.setWindowTitle(f"编辑序列 {seq_number}")
+        dlg.setMinimumWidth(420)
         dlg.setStyleSheet("QDialog{background:#161b22;color:#c9d1d9;} QLabel{color:#c9d1d9;} "
-                          "QLineEdit,QTextEdit{background:#0d1117;border:1px solid #30363d;border-radius:4px;"
+                          "QLineEdit,QTextEdit,QSpinBox{background:#0d1117;border:1px solid #30363d;border-radius:4px;"
                           "color:#c9d1d9;padding:4px;}")
         form = QFormLayout(dlg)
 
+        sb_act = QSpinBox()
+        sb_act.setRange(1, 9)
+        sb_act.setValue(int(seq.get("act", 1) or 1))
+        form.addRow("第几幕", sb_act)
         le_title = QLineEdit(seq.get("title", ""))
         form.addRow("标题", le_title)
         te_summary = QTextEdit()
         te_summary.setPlainText(seq.get("summary", ""))
-        te_summary.setMaximumHeight(80)
+        te_summary.setMinimumHeight(90)
         form.addRow("摘要", te_summary)
         le_func = QLineEdit(seq.get("dramatic_function", ""))
         form.addRow("戏剧功能", le_func)
@@ -3517,6 +3799,7 @@ class NovelRightPanel(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             edit_data = {
                 "sequence_index": seq_idx,
+                "act": sb_act.value(),
                 "title": le_title.text(),
                 "summary": te_summary.toPlainText(),
                 "dramatic_function": le_func.text(),
@@ -3524,10 +3807,13 @@ class NovelRightPanel(QWidget):
             cmd = f'novel_edit(book_id="{self._book_id}", edit_type="update_outline", data={json.dumps(edit_data, ensure_ascii=False)})'
             self._send_command(cmd)
             self._refresh_outline()
+            self._refresh_arcs()
 
     def _refresh_arcs(self):
+        prev_row = self._arcs_table.currentRow()
         self._arcs_table.setRowCount(0)
         self._arc_data_cache = []
+        self._arc_detail.setHtml("<p style='color:#484f58;'>选择上方篇章查看详情</p>")
         if not self._workspace or not self._book_id:
             return
 
@@ -3584,19 +3870,88 @@ class NovelRightPanel(QWidget):
         except Exception:
             self._arcs_info.setText("大纲加载失败")
 
+        # 保持原来的选中行，避免编辑完跳回第一篇
+        rows = self._arcs_table.rowCount()
+        if rows:
+            target = prev_row if 0 <= prev_row < rows else 0
+            self._arcs_table.setCurrentCell(target, 1)
+
     def _on_arc_selected(self, row, col, prev_row, prev_col):
-        if 0 <= row < len(self._arc_data_cache):
-            arc = self._arc_data_cache[row]
-            html = f"<h4>{arc.get('name', '')}（第{arc.get('order', '?')}篇）</h4>"
-            html += f"<p><b>目标:</b> {arc.get('goal', '未设定')}</p>"
-            html += f"<p><b>概要:</b> {arc.get('summary', '无')}</p>"
-            html += f"<p><b>状态:</b> {arc.get('status', 'pending')}</p>"
-            seqs = arc.get("sequences", [])
-            if seqs:
-                html += f"<p><b>包含 {len(seqs)} 个序列:</b></p>"
-                for s in seqs:
-                    html += f"<p style='margin-left:12px;'>• {s.get('name', s.get('id', '?'))}</p>"
-            self._arc_detail.setHtml(html)
+        if not (0 <= row < len(self._arc_data_cache)):
+            return
+        arc = self._arc_data_cache[row]
+        seqs = arc.get("sequences", [])
+        html = [f"<h4>{arc.get('name', '')}（第{arc.get('order', '?')}篇）"
+                f"　<a href='arc' style='color:#58a6ff;font-size:11px;'>编辑篇章</a></h4>"]
+        html.append(
+            f"<p><b>状态</b>：{arc.get('status', 'pending')}　"
+            f"<b>序列</b>：{len(seqs)} 个　<b>章纲</b>：{self._arc_chapter_count(seqs)} 章</p>"
+        )
+        goal = arc.get("goal") or "<span style='color:#8b949e;'>未填写，点击上方「编辑篇章」补充</span>"
+        summary = arc.get("summary") or "<span style='color:#8b949e;'>未填写，点击上方「编辑篇章」补充</span>"
+        html.append(f"<p><b>目标</b>：{goal}</p>")
+        html.append(f"<p><b>概要</b>：{summary}</p>")
+        if seqs:
+            html.append("<p><b>序列明细</b>（点「编辑」可直接改）：</p>")
+            for s in seqs:
+                title = s.get("title") or s.get("name") or s.get("id") or "未命名"
+                number = s.get("number", "?")
+                line = (f"<p style='margin-left:10px;'>• 第{s.get('act', '?')}幕 · "
+                        f"序列{number} · {title}"
+                        f"　<a href='seq:{number}' style='color:#58a6ff;'>编辑</a>")
+                if s.get("summary"):
+                    line += f"<br><span style='color:#8b949e;'>{s['summary']}</span>"
+                if s.get("dramatic_function"):
+                    line += f"<br><span style='color:#6e7681;'>戏剧功能：{s['dramatic_function']}</span>"
+                html.append(line + "</p>")
+        else:
+            html.append("<p style='color:#8b949e;'>该篇章还没有序列，点击「生成大纲」生成三幕结构。</p>")
+        self._arc_detail.setHtml("".join(html))
+
+    def _on_arc_detail_link(self, url):
+        href = url.toString()
+        if href == "arc":
+            row = self._arcs_table.currentRow()
+            if 0 <= row < len(self._arc_data_cache):
+                self._edit_arc_data(self._arc_data_cache[row])
+            return
+        if href.startswith("seq:"):
+            try:
+                number = int(href.split(":", 1)[1])
+            except ValueError:
+                return
+            for idx, seq in enumerate(self._flat_sequences()):
+                try:
+                    if int(seq.get("number")) == number:
+                        self._edit_sequence_dialog(idx)
+                        return
+                except (TypeError, ValueError):
+                    continue
+
+    def _arc_chapter_count(self, seqs: list[dict]) -> int:
+        """统计该篇章下已展开的章纲数量（按 sequence_id 末位数字匹配）。"""
+        co_path = Path(self._workspace) / "books" / self._book_id / "state" / "chapter_outlines.json"
+        if not co_path.exists() or not seqs:
+            return 0
+        numbers = set()
+        for s in seqs:
+            try:
+                numbers.add(int(s.get("number")))
+            except (TypeError, ValueError):
+                continue
+        if not numbers:
+            return 0
+        try:
+            co_data = json.loads(co_path.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        import re as _re
+        count = 0
+        for item in co_data:
+            m = _re.search(r"(\d+)$", str(item.get("sequence_id", "")))
+            if m and int(m.group(1)) in numbers:
+                count += 1
+        return count
 
     def _add_arc_dialog(self):
         if not self._workspace or not self._book_id:
@@ -3630,7 +3985,10 @@ class NovelRightPanel(QWidget):
             }
             if not edit_data["arc_name"]:
                 return
-            cmd = f'novel_new_arc(book_id="{self._book_id}", arc_name="{edit_data["arc_name"]}", arc_goal="{edit_data["arc_goal"]}", arc_summary="{edit_data["arc_summary"]}")'
+            cmd = (f'novel_new_arc(book_id={json.dumps(self._book_id, ensure_ascii=False)}, '
+                   f'arc_name={json.dumps(edit_data["arc_name"], ensure_ascii=False)}, '
+                   f'arc_goal={json.dumps(edit_data["arc_goal"], ensure_ascii=False)}, '
+                   f'arc_summary={json.dumps(edit_data["arc_summary"], ensure_ascii=False)})')
             self._send_command(cmd)
             self._refresh_arcs()
 
@@ -3638,7 +3996,9 @@ class NovelRightPanel(QWidget):
         row = self._arcs_table.currentRow()
         if row < 0 or row >= len(self._arc_data_cache):
             return
-        arc = self._arc_data_cache[row]
+        self._edit_arc_data(self._arc_data_cache[row])
+
+    def _edit_arc_data(self, arc):
         from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
         dlg = QDialog(self)
         dlg.setWindowTitle(f"编辑篇章 - {arc.get('name', '')}")
@@ -3654,6 +4014,15 @@ class NovelRightPanel(QWidget):
         te_summary.setMaximumHeight(120)
         te_summary.setPlainText(arc.get("summary", ""))
         form.addRow("篇章概要", te_summary)
+
+        from PyQt6.QtWidgets import QComboBox
+        cb_status = QComboBox()
+        cb_status.addItems(["pending", "outlined", "writing", "done"])
+        cur_status = arc.get("status", "pending")
+        if cb_status.findText(cur_status) < 0:
+            cb_status.addItem(cur_status)
+        cb_status.setCurrentText(cur_status)
+        form.addRow("状态", cb_status)
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
@@ -3664,6 +4033,7 @@ class NovelRightPanel(QWidget):
                 "new_name": le_name.text().strip(),
                 "arc_goal": le_goal.text().strip(),
                 "arc_summary": te_summary.toPlainText().strip(),
+                "arc_status": cb_status.currentText(),
             }
             cmd = f'novel_edit(book_id="{self._book_id}", edit_type="update_arc", data={json.dumps(edit_data, ensure_ascii=False)})'
             self._send_command(cmd)
@@ -3696,7 +4066,8 @@ class NovelRightPanel(QWidget):
         arc_name = arc.get("name", f"第{arc.get('order', '?')}篇")
         arc_goal = arc.get("goal", "")
         arc_summary = arc.get("summary", "")
-        cmd = f'novel_outline(book_id="{self._book_id}", arc_name="{arc_name}")'
+        cmd = (f'novel_outline(book_id={json.dumps(self._book_id, ensure_ascii=False)}, '
+               f'arc_name={json.dumps(arc_name, ensure_ascii=False)})')
         self._append_system_msg(
             f"📝 正在为篇章「{arc_name}」生成3幕结构大纲...\n"
             f"目标：{arc_goal}\n"
@@ -3720,7 +4091,8 @@ class NovelRightPanel(QWidget):
             QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            cmd = f'novel_chapter_outlines(book_id="{self._book_id}", arc_name="{arc_name}")'
+            cmd = (f'novel_chapter_outlines(book_id={json.dumps(self._book_id, ensure_ascii=False)}, '
+                   f'arc_name={json.dumps(arc_name, ensure_ascii=False)})')
             self._append_system_msg(f"📋 正在为篇章「{arc_name}」展开章节大纲...")
             self._send_command(cmd)
 
@@ -3728,77 +4100,36 @@ class NovelRightPanel(QWidget):
         self._chapter_table.setRowCount(0)
         if not self._workspace or not self._book_id:
             return
-        chapter_dir = Path(self._workspace) / "books" / self._book_id / "chapters"
-        if not chapter_dir.exists():
-            return
+        chapters_found = _scan_chapter_files(
+            Path(self._workspace) / "books" / self._book_id / "chapters"
+        )
 
-        # 兼容多种章节文件名格式：
-        # ch0001_final.md, ch0001_draft.md, chapter_001.md, 第01章_标题.md
-        import re
-        chapters_found: dict[int, dict] = {}
-
-        for ch_path in sorted(chapter_dir.glob("*.md")):
-            name = ch_path.stem
-            ch_num = None
-            status = "已完成"
-
-            if name.startswith("ch") and ("_final" in name or "_draft" in name):
-                num_str = name.replace("ch", "").replace("_final", "").replace("_draft", "")
-                try:
-                    ch_num = int(num_str)
-                except ValueError:
-                    pass
-                if "_draft" in name:
-                    status = "草稿"
-            elif name.startswith("chapter_"):
-                num_str = name.replace("chapter_", "")
-                try:
-                    ch_num = int(num_str)
-                except ValueError:
-                    pass
-            elif name.startswith("第"):
-                m = re.match(r"第(\d+)章", name)
-                if m:
-                    ch_num = int(m.group(1))
-
-            if ch_num is None:
-                continue
-
-            if ch_num in chapters_found:
-                existing = chapters_found[ch_num]
-                if existing["status"] == "已完成" and status == "草稿":
-                    continue
-                if existing["status"] == "草稿" and status == "已完成":
-                    pass
-                else:
-                    continue
-
+        # 已生成章纲但还没写正文的章节也列出来，状态标为「待写」
+        outlines: dict[int, dict] = {}
+        co_path = Path(self._workspace) / "books" / self._book_id / "state" / "chapter_outlines.json"
+        if co_path.exists():
             try:
-                content = ch_path.read_text(encoding="utf-8")
+                for co in json.loads(co_path.read_text(encoding="utf-8")):
+                    num = co.get("chapter_number")
+                    if num and int(num) not in outlines:
+                        outlines[int(num)] = co
             except Exception:
-                continue
-            word_count = len(content)
-            title = ""
-            for line in content.split("\n")[:5]:
-                if line.strip().startswith("#"):
-                    title = line.strip().lstrip("#").strip()
-                    break
+                pass
 
-            chapters_found[ch_num] = {
-                "path": ch_path,
-                "status": status,
-                "title": title or name,
-                "word_count": word_count,
-            }
-
-        for ch_num in sorted(chapters_found.keys()):
-            info = chapters_found[ch_num]
+        for ch_num in sorted(set(chapters_found) | set(outlines)):
+            info = chapters_found.get(ch_num)
+            outline = outlines.get(ch_num, {})
             row = self._chapter_table.rowCount()
             self._chapter_table.insertRow(row)
             self._chapter_table.setItem(row, 0, QTableWidgetItem(str(ch_num)))
-            self._chapter_table.setItem(row, 1, QTableWidgetItem(info["title"]))
-            self._chapter_table.setItem(row, 2, QTableWidgetItem(f"{info['word_count']:,}"))
-            self._chapter_table.setItem(row, 3, QTableWidgetItem(info["status"]))
+            if info:
+                title, words, status = info["title"], f"{info['word_count']:,}", info["status"]
+            else:
+                title = outline.get("title") or f"第{ch_num}章"
+                words, status = "-", "待写"
+            self._chapter_table.setItem(row, 1, QTableWidgetItem(title))
+            self._chapter_table.setItem(row, 2, QTableWidgetItem(words))
+            self._chapter_table.setItem(row, 3, QTableWidgetItem(status))
 
     def _find_chapter_file(self, ch_num: int) -> Path | None:
         """查找章节文件，兼容多种命名格式。优先级：final > draft > chapter_N > 第N章"""
@@ -3825,6 +4156,31 @@ class NovelRightPanel(QWidget):
                 return f
         return None
 
+    def log_action(self, text: str):
+        """把最近一次操作追加到仪表盘日志，避免刷新时被清空。"""
+        if not text:
+            return
+        import time as _time
+
+        first_line = next((l for l in text.splitlines() if l.strip()), "")[:120]
+        if not first_line:
+            return
+        self._dashboard_logged = True
+        self._dashboard_log.append(f"[{_time.strftime('%H:%M:%S')}] {first_line}")
+
+    def selected_chapter_number(self) -> int:
+        """返回章节表中选中行的章号，未选中返回 0。"""
+        row = self._chapter_table.currentRow()
+        if row < 0:
+            return 0
+        item = self._chapter_table.item(row, 0)
+        if not item:
+            return 0
+        try:
+            return int(item.text())
+        except ValueError:
+            return 0
+
     def _on_chapter_selected(self, row, col, prev_row, prev_col):
         item = self._chapter_table.item(row, 0)
         if not item:
@@ -3840,6 +4196,10 @@ class NovelRightPanel(QWidget):
             if len(content) > 2000:
                 preview += "\n\n...(点击导出查看完整内容)"
             self._chapter_preview.setPlainText(preview)
+            return
+        status_item = self._chapter_table.item(row, 3)
+        if status_item and status_item.text() == "待写":
+            self._chapter_preview.setPlainText(f"第{ch_num}章尚未写作，可点击左侧「写下一章」生成正文。")
             return
         self._chapter_preview.setPlainText("章节内容不存在")
 
@@ -3857,6 +4217,14 @@ class NovelRightPanel(QWidget):
 
         ch_path = self._find_chapter_file(ch_num)
         if not ch_path:
+            # 尚未写正文时，退化为编辑该章的章纲，而不是毫无反应
+            co_path = Path(self._workspace) / "books" / self._book_id / "state" / "chapter_outlines.json"
+            if co_path.exists():
+                self._edit_chapter_outline_dialog(ch_num)
+            else:
+                self._chapter_preview.setPlainText(
+                    f"第{ch_num}章还没有正文，也没有章纲。请先「展开章纲」再编辑。"
+                )
             return
 
         content = ch_path.read_text(encoding="utf-8")
@@ -3964,12 +4332,18 @@ class NovelRightPanel(QWidget):
         if setup_path.exists():
             try:
                 setup = json.loads(setup_path.read_text(encoding="utf-8"))
-                world = setup.get("world", {})
+                # setup_state.json 中 locations / factions 是顶层字典（兼容旧版列表结构）
+                locations = setup.get("locations", {})
+                if isinstance(locations, dict):
+                    locations = list(locations.values())
+                factions = setup.get("factions", {})
+                if isinstance(factions, dict):
+                    factions = list(factions.values())
 
                 loc_parent = QTreeWidgetItem(["地点", "分类"])
                 loc_parent.setForeground(0, QColor("#f78166"))
                 self._world_tree.addTopLevelItem(loc_parent)
-                for loc in world.get("locations", []):
+                for loc in locations:
                     loc_item = QTreeWidgetItem(loc_parent, [loc.get("name", loc.get("id", "?")), "地点"])
                     loc_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "location", "id": loc.get("id", ""), "data": loc})
                     loc_item.setForeground(0, QColor("#c9d1d9"))
@@ -3977,7 +4351,7 @@ class NovelRightPanel(QWidget):
                 fac_parent = QTreeWidgetItem(["势力", "分类"])
                 fac_parent.setForeground(0, QColor("#d2a8ff"))
                 self._world_tree.addTopLevelItem(fac_parent)
-                for fac in world.get("factions", []):
+                for fac in factions:
                     fac_item = QTreeWidgetItem(fac_parent, [fac.get("name", fac.get("id", "?")), "势力"])
                     fac_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "faction", "id": fac.get("id", ""), "data": fac})
                     fac_item.setForeground(0, QColor("#c9d1d9"))
@@ -4197,17 +4571,25 @@ class NovelRightPanel(QWidget):
         self._tracking_text.clear()
         if not self._workspace or not self._book_id:
             return
-        state_path = Path(self._workspace) / "books" / self._book_id / "state" / "world_state.json"
+        book_dir = _resolve_book_dir(self._workspace, self._book_id)
+        state_path = book_dir / "state" / "world_state.json"
+        chapters = _scan_chapter_files(book_dir / "chapters")
+        written = max(chapters) if chapters else 0
         if not state_path.exists():
-            self._tracking_text.setHtml("<p style='color:#484f58;'>尚无状态数据</p>")
+            # 有正文但没 world_state 时，至少显示实际进度
+            if written:
+                self._tracking_text.setHtml(f"<h4>当前进度：第 {written} 章</h4><p>尚无状态数据</p>")
+            else:
+                self._tracking_text.setHtml("<p style='color:#484f58;'>尚无状态数据</p>")
             return
         try:
             data = json.loads(state_path.read_text(encoding="utf-8"))
-            html_parts = [f"<h4>当前进度：第 {data.get('current_chapter', 0)} 章</h4>"]
+            current_ch = max(data.get("current_chapter", 0) or 0, written)
+            html_parts = [f"<h4>当前进度：第 {current_ch} 章</h4>"]
 
-            hooks = data.get("hooks", [])
+            hooks = data.get("pending_hooks", [])
             open_hooks = [h for h in hooks if h.get("status") == "open"]
-            closed_hooks = [h for h in hooks if h.get("status") == "closed"]
+            closed_hooks = [h for h in hooks if h.get("status") in ("resolved", "closed", "abandoned")]
             html_parts.append(f"<p><b>伏笔</b>: {len(open_hooks)} 未闭合 / {len(closed_hooks)} 已闭合</p>")
             for h in open_hooks:
                 html_parts.append(f"<p style='margin-left:12px;'>{h.get('id', '?')}: {h.get('description', '')}</p>")
@@ -4250,7 +4632,7 @@ class NovelRightPanel(QWidget):
             return
 
         data = json.loads(state_path.read_text(encoding="utf-8"))
-        open_hooks = [h for h in data.get("hooks", []) if h.get("status") == "open"]
+        open_hooks = [h for h in data.get("pending_hooks", []) if h.get("status") == "open"]
         if not open_hooks:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.information(self, "提示", "没有未闭合的伏笔")
@@ -4287,6 +4669,79 @@ class NovelRightPanel(QWidget):
             cmd = f'novel_edit(book_id="{self._book_id}", edit_type="resolve_hook", data={json.dumps(edit_data, ensure_ascii=False)})'
             self._send_command(cmd)
             self._refresh_tracking()
+
+    def _add_character_dialog(self):
+        if not self._workspace or not self._book_id:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "提示", "请先选择一本书")
+            return
+
+        from PyQt6.QtWidgets import (
+            QDialog, QFormLayout, QLineEdit, QComboBox, QCheckBox, QDialogButtonBox,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("添加角色")
+        dlg.setMinimumWidth(400)
+        dlg.setStyleSheet("QDialog{background:#161b22;color:#c9d1d9;} QLabel{color:#c9d1d9;} "
+                          "QLineEdit,QComboBox{background:#0d1117;border:1px solid #30363d;border-radius:4px;"
+                          "color:#c9d1d9;padding:4px;}")
+        form = QFormLayout(dlg)
+
+        name_edit = QLineEdit()
+        form.addRow("姓名", name_edit)
+
+        role_combo = QComboBox()
+        for label, value in (("主角", "protagonist"), ("配角", "supporting"), ("反派", "antagonist")):
+            role_combo.addItem(label, value)
+        role_combo.setCurrentIndex(1)
+        form.addRow("定位", role_combo)
+
+        profile_edit = QLineEdit()
+        profile_edit.setPlaceholderText("一句话人设")
+        form.addRow("人设", profile_edit)
+
+        backstory_edit = QLineEdit()
+        form.addRow("背景", backstory_edit)
+
+        goal_edit = QLineEdit()
+        form.addRow("外部目标", goal_edit)
+
+        inner_edit = QLineEdit()
+        form.addRow("内在需求", inner_edit)
+
+        main_cast_cb = QCheckBox("主要角色")
+        form.addRow("", main_cast_cb)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = name_edit.text().strip()
+        if not name:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "提示", "角色姓名不能为空")
+            return
+
+        import re as _re
+        import time as _time
+
+        char_id = "char_" + (_re.sub(r"\W+", "_", name) or str(int(_time.time())))
+        edit_data = {
+            "character_id": char_id,
+            "name": name,
+            "role": role_combo.currentData(),
+            "profile": profile_edit.text().strip(),
+            "backstory": backstory_edit.text().strip(),
+            "need_external": goal_edit.text().strip(),
+            "need_internal": inner_edit.text().strip(),
+            "is_main_cast": main_cast_cb.isChecked(),
+        }
+        cmd = f'novel_edit(book_id="{self._book_id}", edit_type="update_character", data={json.dumps(edit_data, ensure_ascii=False)})'
+        self._send_command(cmd)
 
     def _adjust_relationship_dialog(self):
         if not self._workspace or not self._book_id:
@@ -6805,8 +7260,8 @@ class GanggeDesktop(QMainWindow):
         #  RIGHT PANEL — Preview + Tool Calls (VSCode-style side panel)
         # ════════════════════════════════════════
         right_panel = QWidget()
-        right_panel.setMinimumWidth(280)
-        right_panel.setMaximumWidth(600)
+        right_panel.setMinimumWidth(360)
+        right_panel.setMaximumWidth(900)
         right_lay = QVBoxLayout(right_panel)
         right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.setSpacing(0)
@@ -6884,7 +7339,7 @@ class GanggeDesktop(QMainWindow):
         main_sp.addWidget(sidebar)
         main_sp.addWidget(center)
         main_sp.addWidget(right_panel)
-        main_sp.setSizes([220, 600, 320])
+        main_sp.setSizes([220, 580, 460])
         main_sp.setStretchFactor(0, 0)
         main_sp.setStretchFactor(1, 1)
         main_sp.setStretchFactor(2, 0)
@@ -8559,17 +9014,58 @@ class GanggeDesktop(QMainWindow):
         if not src.is_dir():
             self._append_system_msg("选择的路径不是文件夹")
             return
+
+        # 兼容：选了工作区根目录或 books 目录时，自动向下找到唯一一本书
+        if not (src / "state" / "config.json").exists():
+            candidates = []
+            for base in (src / "books", src):
+                if base.is_dir():
+                    candidates = [
+                        p for p in base.iterdir()
+                        if p.is_dir() and (p / "state" / "config.json").exists()
+                    ]
+                    if candidates:
+                        break
+            if len(candidates) == 1:
+                src = candidates[0]
+            else:
+                self._append_system_msg("❌ 该文件夹不是一本书（缺少 state/config.json），请选择具体书籍文件夹")
+                return
+
         books_dir = Path(workspace) / "books"
         books_dir.mkdir(parents=True, exist_ok=True)
         dst = books_dir / src.name
+
+        # 防呆：选中的目录是项目根（books 位于其下）时，复制会无限自我嵌套
+        if dst == src or src in dst.parents:
+            self._append_system_msg(
+                "⚠️ 该文件夹本身就是项目根目录，无需导入。\n"
+                "请把「工作目录」直接设成它，或选择其中具体的书籍文件夹。"
+            )
+            self._novel_sidebar.refresh_books()
+            return
+
+        def _config_book_id(path: Path) -> str:
+            try:
+                cfg = json.loads((path / "state" / "config.json").read_text(encoding="utf-8"))
+                return cfg.get("id") or path.name
+            except Exception:
+                return path.name
+
         if dst.exists():
+            book_id = _config_book_id(dst)
             self._append_system_msg(f"小说文件夹已存在: {dst}")
             self._novel_sidebar.refresh_books()
+            self._novel_sidebar.select_book(book_id)
+            self._novel_right.set_workspace(str(workspace), book_id)
             return
         try:
             shutil.copytree(str(src), str(dst))
             self._append_system_msg(f"✅ 已载入小说: {src.name}")
             self._novel_sidebar.refresh_books()
+            book_id = _config_book_id(dst)
+            self._novel_sidebar.select_book(book_id)
+            self._novel_right.set_workspace(str(workspace), book_id)
         except Exception as e:
             self._append_system_msg(f"❌ 载入失败: {e}")
 
@@ -8589,7 +9085,10 @@ class GanggeDesktop(QMainWindow):
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 d = dlg.get_data()
                 if d["title"]:
-                    cmd = f'novel_init(title="{d["title"]}", genre="{d["genre"]}", target_chapters={d["target_chapters"]}, words_per_chapter={d["words_per_chapter"]})'
+                    cmd = (f'novel_init(title={json.dumps(d["title"], ensure_ascii=False)}, '
+                           f'genre={json.dumps(d["genre"], ensure_ascii=False)}, '
+                           f'target_chapters={int(d["target_chapters"])}, '
+                           f'words_per_chapter={int(d["words_per_chapter"])})')
                     ideas = d.get("ideas", "").strip()
                     if ideas:
                         cmd += (
@@ -8644,25 +9143,13 @@ class GanggeDesktop(QMainWindow):
                 self._append_system_msg("章纲尚未展开，正在自动展开章纲...")
                 cmd = f'novel_chapter_outlines(book_id="{book_id}")'
             else:
-                ws_path = sm_dir / "world_state.json"
-                ch = 1
-                if ws_path.exists():
-                    try:
-                        ws_data = json.loads(ws_path.read_text(encoding="utf-8"))
-                        ch = ws_data.get("current_chapter", 0) + 1
-                    except Exception:
-                        pass
+                # 以磁盘上已有章节为准推导下一章，避免 world_state 滞后导致重复覆盖
+                chapters = _scan_chapter_files(Path(ws) / "books" / book_id / "chapters")
+                ch = (max(chapters) + 1) if chapters else 1
                 cmd = f'novel_write_chapter(book_id="{book_id}", chapter_number={ch}, fast_mode={self._novel_right._fast_mode_cb.isChecked()})'
         elif action == "audit_latest":
-            sm_dir = Path(ws) / "books" / book_id / "state"
-            ws_path = sm_dir / "world_state.json"
-            ch = 1
-            if ws_path.exists():
-                try:
-                    ws_data = json.loads(ws_path.read_text(encoding="utf-8"))
-                    ch = ws_data.get("current_chapter", 1)
-                except Exception:
-                    pass
+            chapters = _scan_chapter_files(Path(ws) / "books" / book_id / "chapters")
+            ch = max(chapters) if chapters else 1
             cmd = f'novel_audit(book_id="{book_id}", chapter_number={ch})'
         elif action == "export":
             cmd = f'novel_export(book_id="{book_id}")'
@@ -8675,16 +9162,14 @@ class GanggeDesktop(QMainWindow):
             self._task_input.setPlainText(cmd)
             return
         elif action == "audit_selected":
-            sm_dir = Path(ws) / "books" / book_id / "state"
-            ws_path = sm_dir / "world_state.json"
-            ch = 1
-            if ws_path.exists():
-                try:
-                    ws_data = json.loads(ws_path.read_text(encoding="utf-8"))
-                    ch = ws_data.get("current_chapter", 1)
-                except Exception:
-                    pass
+            ch = self._novel_right.selected_chapter_number()
+            if not ch:
+                chapters = _scan_chapter_files(Path(ws) / "books" / book_id / "chapters")
+                ch = max(chapters) if chapters else 1
             cmd = f'novel_audit(book_id="{book_id}", chapter_number={ch})'
+        elif action == "add_character":
+            self._novel_right._add_character_dialog()
+            return
         elif action == "edit_characters":
             cmd = f'novel_status(book_id="{book_id}", detail="all")'
         elif action == "custom_command":
@@ -8705,7 +9190,7 @@ class GanggeDesktop(QMainWindow):
                 self, "选择参考小说文件", "", "文本文件 (*.txt *.md);;所有文件 (*)"
             )
             if file_path:
-                cmd = f'novel_import(book_id="{book_id}", file_path="{file_path}")'
+                cmd = f'novel_import(book_id={json.dumps(book_id, ensure_ascii=False)}, file_path={json.dumps(file_path, ensure_ascii=False)})'
             else:
                 return
         elif action == "imitate_write_next":
@@ -8714,14 +9199,8 @@ class GanggeDesktop(QMainWindow):
             if not ref_dir.exists():
                 self._append_system_msg("尚未导入参考小说，请先点击「导入参考小说」按钮")
                 return
-            ws_path = sm_dir / "world_state.json"
-            ch = 1
-            if ws_path.exists():
-                try:
-                    ws_data = json.loads(ws_path.read_text(encoding="utf-8"))
-                    ch = ws_data.get("current_chapter", 0) + 1
-                except Exception:
-                    pass
+            chapters = _scan_chapter_files(Path(ws) / "books" / book_id / "chapters")
+            ch = (max(chapters) + 1) if chapters else 1
             cmd = f'novel_imitate_write(book_id="{book_id}", chapter_number={ch}, fast_mode={self._novel_right._fast_mode_cb.isChecked()})'
         else:
             cmd = f'novel_status(book_id="{book_id}", detail="basic")'
@@ -8737,7 +9216,8 @@ class GanggeDesktop(QMainWindow):
         if not book_id or not workspace:
             return ""
 
-        sm_dir = Path(workspace) / "books" / book_id / "state"
+        book_dir = _resolve_book_dir(workspace, book_id, migrate=True)
+        sm_dir = book_dir / "state"
         if not (sm_dir / "config.json").exists():
             return ""
 
@@ -8765,7 +9245,9 @@ class GanggeDesktop(QMainWindow):
         if setup_path.exists():
             try:
                 setup = json.loads(setup_path.read_text(encoding="utf-8"))
-                chars = setup.get("characters", [])
+                chars = setup.get("characters", {})
+                if isinstance(chars, dict):
+                    chars = list(chars.values())
                 if chars:
                     characters_text = "\n".join(
                         f"  - {c.get('name', '?')}（{c.get('role', '?')}）：{c.get('personality', '')[:50]}"
@@ -8792,7 +9274,7 @@ class GanggeDesktop(QMainWindow):
 
         hooks_text = ""
         try:
-            hooks = ws_data.get("hooks", [])
+            hooks = ws_data.get("pending_hooks", [])
             open_hooks = [h for h in hooks if h.get("status") == "open"]
             if open_hooks:
                 hooks_text = "\n".join(
@@ -8802,11 +9284,11 @@ class GanggeDesktop(QMainWindow):
         except Exception:
             pass
 
-        ch_dir = Path(workspace) / "books" / book_id / "chapters"
-        existing_chapters = []
-        if ch_dir.exists():
-            for f in sorted(ch_dir.glob("chapter_*.md")):
-                existing_chapters.append(f.name)
+        ch_dir = book_dir / "chapters"
+        chapters_found = _scan_chapter_files(ch_dir)
+        if chapters_found:
+            current_ch = max(current_ch, max(chapters_found))
+        existing_chapters = [c["path"].name for c in chapters_found.values()]
 
         context = f"""## 📖 小说创作模式
 
@@ -8816,7 +9298,7 @@ class GanggeDesktop(QMainWindow):
 - 书名：《{title}》
 - 题材：{genre}
 - 目标：{target_ch} 章，每章 {cfg.get('target_words_per_chapter', '?')} 字
-- 当前进度：已写至第 {current_ch} 章
+- 当前进度：已写至第 {current_ch} 章（共 {len(existing_chapters)} 个章节文件）
 
 ### 角色
 {characters_text or '  （尚未配置）'}
@@ -8841,7 +9323,7 @@ class GanggeDesktop(QMainWindow):
       pending_hooks.md     ← 未闭合伏笔
       current_state.md     ← 当前世界状态
   chapters/
-    chapter_001.md ~ chapter_{current_ch:03d}.md  ← 已写章节
+    ch0001_final.md ~ ch{current_ch:04d}_final.md  ← 已写章节（兼容 第01章_标题.md）
 ```
 
 ### 可用的小说工具
@@ -9146,7 +9628,7 @@ class GanggeDesktop(QMainWindow):
         "novel_audit", "novel_revise", "novel_status",
         "novel_edit", "novel_export", "novel_list_books",
         "novel_graph_query", "novel_consistency_check", "novel_graph_rebuild",
-        "novel_navigate",
+        "novel_navigate", "novel_new_arc", "novel_import", "novel_imitate_write",
     ])
 
     def _parse_novel_tool_call(self, task: str) -> tuple[str, dict] | None:
@@ -9159,10 +9641,16 @@ class GanggeDesktop(QMainWindow):
             return None
         try:
             if args_str:
-                args = json.loads(f"{{{args_str}}}")
+                try:
+                    args = json.loads(f"{{{args_str}}}")
+                except json.JSONDecodeError:
+                    # 界面生成的是 kwargs 形式，JSON 解析必然失败，用专用解析器
+                    args = _parse_tool_kwargs(args_str)
+                    if not args:
+                        return None
             else:
                 args = {}
-        except json.JSONDecodeError:
+        except Exception:
             return None
         return tool_name, args
 
@@ -9263,11 +9751,20 @@ class GanggeDesktop(QMainWindow):
 
         ws = self._ws_input.text().strip()
         book_id = result.get("book_id", "")
-        if book_id:
-            self._novel_right.set_workspace(ws, book_id)
         self._novel_sidebar.refresh_books()
+        if not book_id:
+            book_id = self._novel_sidebar.get_selected_book_id()
+        if not book_id:
+            # 新建小说等场景返回值里没有 book_id，自动选中最新一本
+            self._novel_sidebar.select_latest()
+            book_id = self._novel_sidebar.get_selected_book_id()
         if book_id:
             self._select_sidebar_book(book_id)
+            self._novel_right.set_workspace(ws, book_id)
+            if result.get("error"):
+                self._novel_right.log_action(f"❌ {result['error']}")
+            else:
+                self._novel_right.log_action(result.get("output", ""))
 
     def _run_batch(self):
         if self._running:
@@ -9566,9 +10063,13 @@ class GanggeDesktop(QMainWindow):
         if self._ws_input.text():
             ws = self._ws_input.text().strip()
             book_id = self._novel_sidebar.get_selected_book_id()
-            if book_id:
-                self._novel_right.set_workspace(ws, book_id)
             self._novel_sidebar.refresh_books()
+            if not book_id:
+                self._novel_sidebar.select_latest()
+                book_id = self._novel_sidebar.get_selected_book_id()
+            if book_id:
+                self._select_sidebar_book(book_id)
+                self._novel_right.set_workspace(ws, book_id)
 
         self._worker = None
 

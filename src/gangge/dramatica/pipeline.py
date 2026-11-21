@@ -294,6 +294,15 @@ class WritingPipeline:
         self.sm.save_final(ch, current_content)
         log(f"最终稿保存（{len(current_content)} 字）")
 
+        # 立即推进进度：即使后续结算/摘要失败，也不会出现“有正文但进度没涨”
+        try:
+            progress_ws = self.sm.read_world_state()
+            if progress_ws.current_chapter < ch:
+                progress_ws.current_chapter = ch
+                self.sm.write_world_state(progress_ws)
+        except Exception as e:
+            log(f"更新章节进度失败: {e}")
+
         # ── 6+7. 因果链提取 + 摘要生成（并行） ─────────────────────────────────
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -373,15 +382,21 @@ class WritingPipeline:
 
         # ── 8. 应用结算表到世界状态 ───────────────────────────────────────────
         log("应用结算表...")
-        self._apply_settlement(ch, writer_output, blueprint)
+        try:
+            self._apply_settlement(ch, writer_output, blueprint)
+        except Exception as e:
+            log(f"应用结算表失败: {e}")
 
         # ── 9. 记录时间轴事件 + 更新线程状态 ─────────────────────────────────
         log("更新时间轴和线程状态...")
-        self._record_timeline_events(ch, writer_output, blueprint, thread_id, ws)
+        try:
+            self._record_timeline_events(ch, writer_output, blueprint, thread_id, ws)
+        except Exception as e:
+            log(f"更新时间轴/线程状态失败: {e}")
 
         # ── 10. 更新 current_chapter + current_state.md ───────────────────────
         ws = self.sm.read_world_state()
-        ws.current_chapter = ch
+        ws.current_chapter = max(ws.current_chapter, ch)
         self.sm.write_world_state(ws)
         self.sm.update_current_state_md()
         log("current_state.md 已更新")
@@ -741,8 +756,15 @@ class WritingPipeline:
             except Exception:
                 pass  # 关系变化解析失败静默跳过
 
-        # 新开伏笔
+        # 新开伏笔（每章限量并去重，避免伏笔无限膨胀撑爆状态文件）
+        _ws = self.sm.read_world_state()
+        known_desc = {h.description.strip() for h in _ws.pending_hooks
+                      if getattr(h, "status", None) == HookStatus.OPEN}
+        added = 0
         for hook_desc in s.new_hooks:
+            key = (hook_desc or "").strip()
+            if not key or key in known_desc or added >= 3:
+                continue
             hook = Hook(
                 id=f"hook_{uuid.uuid4().hex[:8]}",
                 type=HookType.FORESHADOW,
@@ -752,23 +774,42 @@ class WritingPipeline:
                 status=HookStatus.OPEN,
             )
             self.sm.open_hook(hook)
+            known_desc.add(key)
+            added += 1
 
         # 建筑师计划埋下的伏笔（blueprint.hooks_to_plant）
+        planted = 0
         for hook_desc in blueprint.hooks_to_plant:
-            if hook_desc and hook_desc not in s.new_hooks:
-                hook = Hook(
-                    id=f"hook_{uuid.uuid4().hex[:8]}",
-                    type=HookType.FORESHADOW,
-                    description=hook_desc,
-                    planted_in_chapter=chapter,
-                    expected_resolution_range=(chapter + 5, chapter + 30),
-                    status=HookStatus.OPEN,
-                )
-                self.sm.open_hook(hook)
+            key = (hook_desc or "").strip()
+            if not key or key in known_desc or planted >= 2:
+                continue
+            hook = Hook(
+                id=f"hook_{uuid.uuid4().hex[:8]}",
+                type=HookType.FORESHADOW,
+                description=hook_desc,
+                planted_in_chapter=chapter,
+                expected_resolution_range=(chapter + 5, chapter + 30),
+                status=HookStatus.OPEN,
+            )
+            self.sm.open_hook(hook)
+            known_desc.add(key)
+            planted += 1
 
-        # 回收伏笔
-        for hook_id in s.resolved_hooks:
-            self.sm.resolve_hook(hook_id, chapter)
+        # 回收伏笔：模型可能返回 id，也可能只返回描述片段，两种都尝试匹配
+        for raw in s.resolved_hooks:
+            hid = str(raw or "").strip()
+            if not hid:
+                continue
+            state = self.sm.read_world_state()
+            if any(h.id == hid for h in state.pending_hooks):
+                self.sm.resolve_hook(hid, chapter)
+                continue
+            for h in state.pending_hooks:
+                if h.status != HookStatus.OPEN:
+                    continue
+                if hid in h.description or h.description in hid:
+                    self.sm.resolve_hook(h.id, chapter)
+                    break
 
         # 信息揭示
         for info in s.info_revealed:

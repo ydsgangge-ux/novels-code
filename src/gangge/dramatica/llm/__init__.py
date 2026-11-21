@@ -5,6 +5,7 @@ DeepSeek 走 OpenAI 兼容接口，支持多 Provider 路由
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -15,6 +16,8 @@ from typing import Any, Callable, TypeVar
 from pydantic import BaseModel, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
+
+logger = logging.getLogger(__name__)
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
@@ -372,6 +375,13 @@ def parse_llm_json_list(
             ctx = f" ({context})" if context else ""
             raise LLMParseError(f"JSON 列表解析失败{ctx}: {e}", raw_output=raw)
 
+    if isinstance(data_list, dict):
+        # 模型有时会多包一层，如 {"causal_links": [...]} / {"items": [...]}
+        for value in data_list.values():
+            if isinstance(value, list):
+                data_list = value
+                break
+
     if not isinstance(data_list, list):
         ctx = f" ({context})" if context else ""
         raise LLMParseError(
@@ -411,6 +421,8 @@ def parse_llm_json_list(
                     continue
                 except ValidationError:
                     pass
+            # 单条校验失败会静默丢弃，至少要留下日志，否则上层只能看到空结果
+            logger.warning("JSON 列表第 %d 项校验失败(%s): %s", i, context, e.errors()[:2])
             continue
     return results
 

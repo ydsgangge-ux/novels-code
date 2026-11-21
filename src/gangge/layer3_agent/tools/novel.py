@@ -125,6 +125,25 @@ def _ensure_default_arc(sm, title: str = ""):
     )
 
 
+def _ensure_main_thread(sm, protagonist_id: str = "") -> None:
+    """确保存在主线线程；否则面板的「叙事线程」永远是 0，线程状态更新也无处可写。"""
+    try:
+        from gangge.dramatica.types.narrative import NarrativeThread
+        ws = sm.read_world_state()
+        if ws.threads:
+            return
+        sm.create_thread(NarrativeThread(
+            id="thread_main",
+            name="主线",
+            pov_character_id=protagonist_id or "",
+            goal="",
+            weight=1.0,
+            start_chapter=1,
+        ))
+    except Exception as e:
+        logger.warning("初始化主线线程失败: %s", e)
+
+
 def _ensure_setup(workspace: str, book_id: str, genre: str = "", title: str = "") -> SetupLoader | None:
     """确保 setup_state.json 存在。如果不存在，自动用模板初始化。"""
     sm = StateManager(workspace, book_id)
@@ -629,6 +648,8 @@ class NovelChapterOutlinesTool(BaseTool):
             if not loader:
                 return ToolResult(output="配置未加载，请先使用 novel_setup", is_error=True)
 
+        _ensure_main_thread(sm, getattr(loader.config, "protagonist_id", "") or "")
+
         from gangge.layer3_agent.tools.dramatica_adapter import DramaticaLLMAdapter
         df_llm = DramaticaLLMAdapter(self._llm)
         engine = NarrativeEngine(df_llm)
@@ -698,8 +719,30 @@ class NovelChapterOutlinesTool(BaseTool):
             else:
                 return ToolResult(output=f"序列索引 {seq_idx} 超出范围（0-{len(sequences)-1}）", is_error=True)
 
+        existing_path = sm.state_dir / "chapter_outlines.json"
+        existing = []
+        if existing_path.exists():
+            try:
+                existing = json.loads(existing_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        existing_by_num: dict[int, dict] = {}
+        for item in existing:
+            try:
+                existing_by_num[int(item.get("chapter_number"))] = item
+            except (TypeError, ValueError):
+                continue
+
+        # 接续已有章号：取「已有章纲」与「已写章节文件」的最大章号，避免重复编号
+        chapter_start = max(existing_by_num) + 1 if existing_by_num else 1
+        import re as _re
+        if sm.chapter_dir.exists():
+            for f in sm.chapter_dir.glob("*.md"):
+                m = _re.match(r"(?:ch|chapter_|第)(\d+)", f.stem)
+                if m:
+                    chapter_start = max(chapter_start, int(m.group(1)) + 1)
+
         all_outlines = []
-        chapter_start = 1
         for seq in sequences:
             chapter_outlines = engine.generate_chapter_outlines(
                 sequence=seq,
@@ -711,16 +754,11 @@ class NovelChapterOutlinesTool(BaseTool):
             all_outlines.extend(chapter_outlines)
             chapter_start += len(chapter_outlines)
 
-        existing_path = sm.state_dir / "chapter_outlines.json"
-        existing = []
-        if existing_path.exists():
-            try:
-                existing = json.loads(existing_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        existing.extend([co.model_dump() for co in all_outlines])
+        for co in all_outlines:
+            existing_by_num[co.chapter_number] = co.model_dump()
+        merged = [existing_by_num[k] for k in sorted(existing_by_num)]
         existing_path.write_text(
-            json.dumps(existing, ensure_ascii=False, indent=2),
+            json.dumps(merged, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -918,6 +956,8 @@ class NovelWriteChapterTool(BaseTool):
             loader = _ensure_setup(self.workspace, book_id)
             if not loader:
                 return ToolResult(output="配置未加载", is_error=True)
+
+        _ensure_main_thread(sm, getattr(loader.config, "protagonist_id", "") or "")
 
         from gangge.layer3_agent.tools.dramatica_adapter import DramaticaLLMAdapter
         df_llm = DramaticaLLMAdapter(self._llm)
@@ -1710,19 +1750,27 @@ class NovelImitateWriteTool(BaseTool):
         writer = WriterAgent(df_llm, style_guide=enhanced_style, genre=loader.config.genre)
 
         pipeline = WritingPipeline(
-            architect=ArchitectAgent(df_llm, genre=loader.config.genre),
+            state_manager=sm,
+            architect=ArchitectAgent(df_llm),
             writer=writer,
             auditor=AuditorAgent(df_llm),
             reviser=ReviserAgent(df_llm),
-            summarizer=SummaryAgent(df_llm),
-            workspace=self.workspace,
-            book_id=book_id,
+            narrative_engine=NarrativeEngine(df_llm),
+            summary_agent=SummaryAgent(df_llm),
+            validator=PostWriteValidator(loader.config.custom_forbidden_words),
+            protagonist=protagonist,
+            all_characters=all_characters,
         )
-        pipeline.all_characters = all_characters
 
-        ne = NarrativeEngine(self.workspace, book_id)
-        co_list = ne.load_chapter_outlines()
-        target_co = next((co for co in co_list if co.chapter_number == ch), None)
+        co_path = sm.state_dir / "chapter_outlines.json"
+        if not co_path.exists():
+            return ToolResult(output="章纲不存在，请先生成章纲", is_error=True)
+        from gangge.dramatica.narrative import ChapterOutlineSchema
+        target_co = None
+        for item in json.loads(co_path.read_text(encoding="utf-8")):
+            if item.get("chapter_number") == ch:
+                target_co = ChapterOutlineSchema.model_validate(item)
+                break
         if not target_co:
             return ToolResult(output=f"第 {ch} 章的章纲不存在，请先生成章纲", is_error=True)
 
@@ -2338,12 +2386,32 @@ class NovelEditTool(BaseTool):
 
         setup = json.loads(setup_path.read_text(encoding="utf-8"))
         chars = setup.get("characters", {})
-        if char_id not in chars:
-            return ToolResult(output=f"角色 {char_id} 不存在", is_error=True)
+        if not isinstance(chars, dict):
+            chars = {c.get("id", f"char_{i}"): c for i, c in enumerate(chars or [])}
+
+        is_new = char_id not in chars
+        if is_new:
+            chars[char_id] = {
+                "id": char_id,
+                "name": data.get("name", char_id),
+                "role": data.get("role", "supporting"),
+                "need": {"external": "", "internal": ""},
+                "obstacles": [],
+                "worldview": {"power": "seeks", "trust": "selective", "coping": "fight"},
+                "arc": "",
+                "profile": "",
+                "behavior_lock": [],
+                "personality": [],
+                "backstory": "",
+                "current_goal": "",
+                "hidden_agenda": "",
+                "faction": "",
+                "is_main_cast": False,
+            }
 
         char = chars[char_id]
-        updated_fields = []
-        for key in ("name", "arc", "profile", "backstory", "personality", "behavior_lock", "faction"):
+        updated_fields = ["created"] if is_new else []
+        for key in ("name", "role", "arc", "profile", "backstory", "personality", "behavior_lock", "faction", "current_goal", "hidden_agenda"):
             if key in data:
                 char[key] = data[key]
                 updated_fields.append(key)
@@ -2363,8 +2431,9 @@ class NovelEditTool(BaseTool):
             updated_fields.append("need_internal")
         char["need"] = need
 
+        setup["characters"] = chars
         setup_path.write_text(json.dumps(setup, ensure_ascii=False, indent=2), encoding="utf-8")
-        return ToolResult(output=f"角色 {char_id} 已更新：{', '.join(updated_fields)}")
+        return ToolResult(output=f"角色 {char_id} 已{'新增' if is_new else '更新'}：{', '.join(updated_fields)}")
 
     def _delete_character(self, sm: StateManager, data: dict) -> ToolResult:
         char_id = data.get("character_id", "")
@@ -2450,6 +2519,10 @@ class NovelEditTool(BaseTool):
             return ToolResult(output="请提供 sequence_index", is_error=True)
 
         sequences = outline if isinstance(outline, list) else outline.get("sequences", outline.get("acts", []))
+        if not sequences and isinstance(outline, dict):
+            # arcs 结构：把所有篇章下的序列摊平，索引与大纲树展示顺序一致
+            for arc in outline.get("arcs", []):
+                sequences.extend(arc.get("sequences", []))
         if sequence_idx >= len(sequences):
             return ToolResult(output=f"序列索引 {sequence_idx} 超出范围", is_error=True)
 
@@ -2457,6 +2530,11 @@ class NovelEditTool(BaseTool):
         for key in ("title", "summary", "dramatic_function"):
             if key in data:
                 seq[key] = data[key]
+        if "act" in data:
+            try:
+                seq["act"] = int(data["act"])
+            except (TypeError, ValueError):
+                pass
 
         outline_path.write_text(json.dumps(outline, ensure_ascii=False, indent=2), encoding="utf-8")
         return ToolResult(output=f"大纲序列 {sequence_idx} 已更新")
@@ -2500,16 +2578,22 @@ class NovelEditTool(BaseTool):
             return ToolResult(output="配置文件不存在", is_error=True)
 
         setup = json.loads(setup_path.read_text(encoding="utf-8"))
-        world = setup.get("world", {})
-        locations = world.get("locations", [])
-
-        target = None
-        for loc in locations:
-            if loc.get("id") == loc_id:
-                target = loc
-                break
-        if not target:
-            return ToolResult(output=f"地点 {loc_id} 不存在", is_error=True)
+        locations = setup.get("locations", {})
+        if isinstance(locations, dict):
+            target = locations.get(loc_id)
+            is_new = target is None
+            if is_new:
+                target = {"id": loc_id}
+                locations[loc_id] = target
+            setup["locations"] = locations
+        else:
+            locations = locations or []
+            target = next((loc for loc in locations if loc.get("id") == loc_id), None)
+            is_new = target is None
+            if is_new:
+                target = {"id": loc_id}
+                locations.append(target)
+            setup["locations"] = locations
 
         for key in ("name", "description", "dramatic_potential"):
             if key in data:
@@ -2518,7 +2602,7 @@ class NovelEditTool(BaseTool):
             target["connections"] = data["connections"]
 
         setup_path.write_text(json.dumps(setup, ensure_ascii=False, indent=2), encoding="utf-8")
-        return ToolResult(output=f"地点 {loc_id} 已更新")
+        return ToolResult(output=f"地点 {loc_id} 已{'新增' if is_new else '更新'}")
 
     def _delete_location(self, sm: StateManager, data: dict) -> ToolResult:
         loc_id = data.get("location_id", "")
@@ -2530,12 +2614,16 @@ class NovelEditTool(BaseTool):
             return ToolResult(output="配置文件不存在", is_error=True)
 
         setup = json.loads(setup_path.read_text(encoding="utf-8"))
-        world = setup.get("world", {})
-        locations = world.get("locations", [])
-        before = len(locations)
-        world["locations"] = [l for l in locations if l.get("id") != loc_id]
+        locations = setup.get("locations", {})
+        if isinstance(locations, dict):
+            removed = 1 if locations.pop(loc_id, None) is not None else 0
+        else:
+            locations = locations or []
+            before = len(locations)
+            locations = [l for l in locations if l.get("id") != loc_id]
+            removed = before - len(locations)
+        setup["locations"] = locations
         setup_path.write_text(json.dumps(setup, ensure_ascii=False, indent=2), encoding="utf-8")
-        removed = before - len(world["locations"])
         return ToolResult(output=f"已删除 {removed} 个地点：{loc_id}")
 
     def _update_faction(self, sm: StateManager, data: dict) -> ToolResult:
@@ -2548,16 +2636,22 @@ class NovelEditTool(BaseTool):
             return ToolResult(output="配置文件不存在", is_error=True)
 
         setup = json.loads(setup_path.read_text(encoding="utf-8"))
-        world = setup.get("world", {})
-        factions = world.get("factions", [])
-
-        target = None
-        for f in factions:
-            if f.get("id") == faction_id:
-                target = f
-                break
-        if not target:
-            return ToolResult(output=f"势力 {faction_id} 不存在", is_error=True)
+        factions = setup.get("factions", {})
+        if isinstance(factions, dict):
+            target = factions.get(faction_id)
+            is_new = target is None
+            if is_new:
+                target = {"id": faction_id}
+                factions[faction_id] = target
+            setup["factions"] = factions
+        else:
+            factions = factions or []
+            target = next((f for f in factions if f.get("id") == faction_id), None)
+            is_new = target is None
+            if is_new:
+                target = {"id": faction_id}
+                factions.append(target)
+            setup["factions"] = factions
 
         for key in ("name", "description", "core_interest"):
             if key in data:
@@ -2566,7 +2660,7 @@ class NovelEditTool(BaseTool):
             target["relations"] = data["relations"]
 
         setup_path.write_text(json.dumps(setup, ensure_ascii=False, indent=2), encoding="utf-8")
-        return ToolResult(output=f"势力 {faction_id} 已更新")
+        return ToolResult(output=f"势力 {faction_id} 已{'新增' if is_new else '更新'}")
 
     def _delete_faction(self, sm: StateManager, data: dict) -> ToolResult:
         faction_id = data.get("faction_id", "")
@@ -2578,12 +2672,16 @@ class NovelEditTool(BaseTool):
             return ToolResult(output="配置文件不存在", is_error=True)
 
         setup = json.loads(setup_path.read_text(encoding="utf-8"))
-        world = setup.get("world", {})
-        factions = world.get("factions", [])
-        before = len(factions)
-        world["factions"] = [f for f in factions if f.get("id") != faction_id]
+        factions = setup.get("factions", {})
+        if isinstance(factions, dict):
+            removed = 1 if factions.pop(faction_id, None) is not None else 0
+        else:
+            factions = factions or []
+            before = len(factions)
+            factions = [f for f in factions if f.get("id") != faction_id]
+            removed = before - len(factions)
+        setup["factions"] = factions
         setup_path.write_text(json.dumps(setup, ensure_ascii=False, indent=2), encoding="utf-8")
-        removed = before - len(world["factions"])
         return ToolResult(output=f"已删除 {removed} 个势力：{faction_id}")
 
     def _update_arc(self, sm: StateManager, data: dict) -> ToolResult:
@@ -2592,7 +2690,7 @@ class NovelEditTool(BaseTool):
         if not arc_name:
             return ToolResult(output="请提供 arc_name（要编辑的篇章名）", is_error=True)
 
-        outline_path = sm.state_dir / "outline_state.json"
+        outline_path = sm.state_dir / "outline.json"
         if not outline_path.exists():
             return ToolResult(output="大纲文件不存在", is_error=True)
 
@@ -2607,6 +2705,8 @@ class NovelEditTool(BaseTool):
                     arc["goal"] = data["arc_goal"]
                 if "arc_summary" in data:
                     arc["summary"] = data["arc_summary"]
+                if "arc_status" in data:
+                    arc["status"] = data["arc_status"]
                 updated = True
                 break
 
@@ -2621,7 +2721,7 @@ class NovelEditTool(BaseTool):
         if not arc_name:
             return ToolResult(output="请提供 arc_name", is_error=True)
 
-        outline_path = sm.state_dir / "outline_state.json"
+        outline_path = sm.state_dir / "outline.json"
         if not outline_path.exists():
             return ToolResult(output="大纲文件不存在", is_error=True)
 
