@@ -252,6 +252,7 @@ def create_vision_llm() -> BaseLLM | None:
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            thinking_level="default",
         )
 
     if provider not in _VISION_BASE_URLS:
@@ -281,4 +282,7 @@ def create_vision_llm() -> BaseLLM | None:
         max_tokens=max_tokens,
         temperature=temperature,
         supports_vision=True,
+        provider=provider,
+        # 识图任务不需要扩展思考：钉死 default，避免继承主模型的档位。
+        thinking_level="default",
     )

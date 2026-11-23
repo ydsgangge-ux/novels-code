@@ -7,7 +7,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-blue?logo=python" />
   <img src="https://img.shields.io/badge/license-MIT-green" />
-  <img src="https://img.shields.io/badge/LLM-DeepSeek%20%7C%20Claude%20%7C%20OpenAI%20%7C%20Ollama-orange" />
+  <img src="https://img.shields.io/badge/LLM-14%20providers%20%7C%20Ollama%20local-orange" />
 </p>
 
 📖 小说引擎 · 🎬 视频出片 · 🤝 任务外包 · 💻 编程助手
@@ -25,9 +25,9 @@
 | 你给 | 它出 | 怎么做到的 |
 |---|---|---|
 | 「把第三章写出来」 | 一章正文 + 审计报告 | 五层流水线：规划 → 撰写 → 校验 → 审计 → 修订，自动跑完 |
-| 一段口播稿 | 带配音、字幕的 mp4 | 五种视觉风格 + 竖屏 + 3D 展示页 + 人物纪录片，技能里点一下就开始 |
+| 一段口播稿 | 带配音、字幕的 mp4 | 5 种视觉风格 + 竖屏 + 6 种页面（3D 展示 / 网站 / 人物 / 时间线 / 沙盘），技能里点一下就开始 |
 | 一个网址 | 3D 展示页 / 网站展示视频 | 整页截图装进浏览器框，滚一下镜头就往前推 |
-| 一张零件图纸 | .blend + .glb + 多角度渲染图 | 内置 Blender 工具，按尺寸写 bpy 代码增量建模，装好 Blender 即可用 |
+| 一张零件图纸 | .blend 工程 + 多角度渲染图 | 内置 Blender 工具，按尺寸写 bpy 代码增量建模，装好 Blender 即可用 |
 | 一块能验证的活 | 结论 + 验收结果 + 日志 | 外包给 Qoder 独立进程，主对话只收一段结论 |
 
 这五件事在同一个桌面应用里，共用一套工具、权限和回滚机制——不是五个脚本书钉在一起。
@@ -38,22 +38,24 @@
 git clone https://github.com/ydsgangge-ux/novels-code.git
 cd novels-code
 
-pip install -e ".[gui]"          # 桌面端（推荐）
-# 要视频出片就换成：pip install -e ".[gui,video]"（playwright + edge-tts）
-playwright install chromium      # 只有 page=site 抓网页截图时才需要
+pip install -e ".[gui,office]"        # 桌面端 + Office 读写（推荐）
+# 要视频出片：pip install -e ".[gui,office,video]"（playwright + edge-tts + ffmpeg）
+# Windows 也可以直接双击 install.bat，按提示选 2
+playwright install chromium           # 只有 page=site 抓网页截图时才需要
 
-cp .env.example .env             # 填一个 API Key 即可
+cp .env.example .env                  # Windows 用 copy .env.example .env
 ```
 
 ```ini
-LLM_PROVIDER=deepseek
+LLM_PROVIDER=deepseek          # 也可用 anthropic / openai / qwen / zhipu / moonshot ...
 DEEPSEEK_API_KEY=sk-xxx
 ```
 
 ```bash
-python desktop/app.py                        # 桌面端
+python desktop/app.py                        # 桌面端（或双击 run-gui.bat）
 gangge "创建一个带用户认证的 FastAPI 项目"     # 单次任务
 gangge                                       # 交互式 REPL
+gangge --list-profiles                       # 看有哪些运行时组合
 ```
 
 不想给任何 API Key 也能跑：`LLM_PROVIDER=ollama` 指向本机模型。
@@ -79,18 +81,19 @@ AI：▶ Architect 规划 → Writer 撰写 → 审计 2 处逻辑问题 → 修
 4. **Auditor** — 查逻辑漏洞、伏笔是否收、人物行为是否合理
 5. **Reviser** — 按审计意见改，循环到过审
 
-**16 个专用工具**：`novel_init` 建书 · `novel_setup` 设定 · `novel_outline` 大纲 ·
-`novel_chapter_outlines` 拆章 · `novel_write_chapter` 写章 · `novel_audit` 审计 ·
-`novel_revise` 修订 · `novel_edit` 改任何元素（角色/关系/伏笔/大纲/正文）· `novel_status` 进度 ·
-`novel_import` 导入 · `novel_export` 导出 TXT/EPUB · `novel_consistency_check` 全书一致性 ·
-`novel_graph_query` / `novel_graph_rebuild` 叙事图谱 · `novel_navigate` 跳转 · `novel_list_books` 书单
+**19 个专用工具**：`novel_init` 建书 · `novel_setup` 设定 · `novel_outline` 大纲 ·
+`novel_chapter_outlines` 拆章 · `novel_new_arc` 开新篇章 · `novel_write_chapter` 写章 ·
+`novel_audit` 审计 · `novel_revise` 修订 · `novel_edit` 改任何元素（角色/关系/伏笔/大纲/正文）·
+`novel_status` 进度 · `novel_import` 导入 · `novel_imitate_write` 仿写续写 · `novel_export` 导出全书 Markdown ·
+`novel_consistency_check` 全书一致性 · `novel_graph_query` / `novel_graph_rebuild` 叙事图谱 ·
+`novel_navigate` 跳转 · `novel_list_books` 书单 · `novel_chat` 自然语言调度（改大纲 / 加角色 / 看进度）
 
 **仿写**：导入几十万字的 TXT，多段采样分析文风、全文抽取人物、拆情节弧线与情绪曲线，
 写作时按进度动态对齐参考文本——长篇会自动分块，不会一上来就撑爆上下文。
 
 **叙事图谱**：人物、事件、关系存成图，因果链和伏笔是否闭环可查询，续写不靠猜。
 
-**专业面板**：仪表盘 / 角色 / 大纲 / 章节 / 世界观 / 追踪 / 词库。
+**专业面板**：仪表盘 / 角色 / 篇章 / 大纲 / 章节 / 世界观 / 追踪 / 图谱 / 词库。
 
 ## 🎬 视频一键输出
 
@@ -206,6 +209,30 @@ set BLENDER_PATH=D:\Program Files\Blender Foundation\Blender 5.2\blender.exe   #
 - **中文版 Blender 会把节点名本地化成「原理化 BSDF」**，`nodes.get("Principled BSDF")` 会拿到 `None` 然后报 `AttributeError`。工具注入了 `new_material()` 和 `bsdf_of()`，按 `node.type` 查找，中英文界面都稳。
 - **场景没有相机和灯光时渲染出来是全黑**。`render` 会按包围盒自动取景，没灯就补三盏太阳光。
 
+## 📄 Office 文档：读得对，也交得出去
+
+docx / xlsx / pptx 不走 `read_file`——那只会把 zip 当正文吐出几千字乱码。
+专用工具直接读结构，写完还能自查排版：
+
+| 工具 | 用途 |
+|---|---|
+| `office_info` | 骨架摘要：段落/表格数、sheet 与行列、每页标题 |
+| `office_read` | 按范围取内容；xlsx 加 `values=true` 读公式算出来的数值 |
+| `office_check` | 结构校验 + 排版 lint：表格超版心、深色底纹配黑字、手打编号、中文缺 eastAsia 字体、公式 `#REF!` / 未计算、文本框出界 |
+| `office_recalc` | 用 LibreOffice 重算 xlsx 并另存（openpyxl 从不计算公式，脚本生成的表缓存值是空的） |
+| `office_render` | 转 PDF 再渲染 PNG，交给 `vision` 看排版——不用靠猜坐标系 |
+
+`office_recalc` / `office_render` 需要 LibreOffice。`install.bat` 会自动检测并询问是否安装，
+也可以自己装：
+
+```bash
+winget install --id TheDocumentFoundation.LibreOffice -e   # Windows
+brew install --cask libreoffice                            # macOS
+sudo apt install libreoffice                               # Linux
+```
+
+装在非默认位置时，用环境变量 `LIBREOFFICE_PATH` 指向 `soffice` 可执行文件。
+
 ## 🤝 把活外包给 Qoder
 
 有些活又长又机械：改十几个文件、重命名、补一批测试、升级依赖后跑全量验证。
@@ -252,19 +279,23 @@ AI：📋 任务清单 (0/4) → 建结构 → User 模型 → 注册/登录 API
     ✓ pytest 全部通过
 ```
 
-按场景自动切 Profile，只暴露相关工具，不让模型在 25 个工具里瞎挑：
+按场景自动切 Profile，只暴露相关工具，不让模型在几十个工具里瞎挑：
 
-| Profile | 工具数 | 触发场景 |
+| Profile | 触发场景 | 典型工具 |
 |---|---|---|
-| **Coding** | 13 个 | 创建 / 修改 / 实现 / 修复 / 构建 |
-| **Novel** | 25 个 | 小说 / 写作 / 章节 / 角色 / 大纲 |
-| **Research** | 10 个 | 搜索 / 查找 / 调研 / 联网 |
+| **Coding** | 创建 / 修改 / 实现 / 修复 / 构建 | 读写文件、bash、lint、测试、生成图片、委派 |
+| **Office** | docx / xlsx / pptx / Word / Excel | `office_*` 读写校验 + 基础文件工具 |
+| **Novel** | 小说 / 写作 / 章节 / 角色 / 大纲 | 19 个 `novel_*` + 基础读文件 |
+| **Research** | 搜索 / 查一下 / 调研 / 联网 | `web_search` / `web_fetch` + 读文件 |
+| **Media** | 视频 / 分镜 / 配音 / 3D 建模 | `demo_video` / `blender` + 读文件 |
+
+不在核心集里的工具不是消失，而是**按需揭示**：`tool_search` 搜一下就能用（解锁后本次会话一直可见）。
 
 几个真正省事的设计：
 
 - **改前打检查点**：Shadow Git 自动存档，改坏了 `git revert` 一条命令回去
-- **写完自检**：LSP 跑 pyright/ruff，语法错误当场修，不等到你发现
-- **只读就收手**：连续 3 轮只看不改 → 自动结束，不空转烧钱
+- **写完自检**：`lint_check` 按语言跑 pyright / ruff / pylint / eslint / tsc / cargo check，错误当场回灌修正
+- **只读就收手**：连续 3 轮只看不改（且没有未完成待办）→ 自动结束，不空转烧钱
 - **会自己造工具**：`create_tool` 在运行时新建工具，存进 `.gangge/plugins/`，下次自动加载
 - **能接 MCP**：stdio / SSE 两种传输，`.gangge/mcp_servers.json` 里的服务自动注册成工具
 - **联网搜索可升级**：填一个 DeepSeek Key，`web_search` 换成官方 Search（带摘要、发布时间、权威分），
@@ -275,33 +306,62 @@ AI：📋 任务清单 (0/4) → 建结构 → User 模型 → 注册/登录 API
 ## ⚙️ 配置
 
 ```ini
-LLM_PROVIDER=deepseek          # deepseek / openai / anthropic / ollama
+# ── 模型 ──
+LLM_PROVIDER=deepseek          # deepseek / openai / anthropic / qwen / zhipu / moonshot /
+                               # baichuan / yi / minimax / stepfun / siliconflow / mimo / ollama / custom
 DEEPSEEK_API_KEY=sk-xxx
 MAX_ROUNDS=30                  # 最大工具调用轮数
-LLM_TIMEOUT=300                # LLM 响应超时（秒）
+LLM_TIMEOUT=600                # 单次请求静默超时（秒），本地 / 思考型模型调大
 
+# ── 上下文与输出 ──
 MAX_TOKENS=16384               # 单次回复输出上限
-CONTEXT_WINDOW_TOKENS=128K     # 模型上下文窗口（支持 128K / 1M / 131072）
+CONTEXT_WINDOW_TOKENS=128K     # 模型上下文窗口（支持 128K / 1M / 131072；桌面端读取）
 MAX_HISTORY_ROUNDS=6           # 滑动窗口：只保留最近 N 轮
 TOOL_RESULT_MAX_CHARS=6000     # 单条工具输出字符上限
+
+# ── 思考强度 ──
+LLM_THINKING_LEVEL=default     # default / off / low / medium / high
+THINKING_CARRYOVER=1           # 把"只思考不调工具"那轮的思考带到下一轮，免得重想一遍
+MAX_IDLE_ROUNDS=2              # 连续多少轮空转后收尾（保留待办，等你回一句"继续"）
+
+# ── 运行时组合 / 联网 ──
+GANGGE_PROFILE=standard        # standard / novel / minimal / office
+WEB_SEARCH_BACKEND=auto        # auto / deepseek（强制官方）/ free（只用 DuckDuckGo + Bing）
 ```
 
-桌面端可以直接在「设置 → 上下文与输出」里改这四项（支持填 `1M`），改完立即生效，
-不用重启；`.env` 里的值只是没有设置过时的默认值。
+桌面端「设置 → 上下文与输出」可以改输出上限、上下文窗口、历史轮数和工具输出截断
+（支持填 `1M`），改完立即生效，不用重启；`.env` 里的值只是没有设置过时的默认值。
+
+**思考强度**是统一档位（桌面端「设置 → 思考强度」，选完下面会直接说明这一档在当前
+厂商/模型上是否生效），各厂商字段名完全不同，映射集中在 `layer5_llm/thinking.py`：
+OpenAI `reasoning_effort`、Anthropic `thinking.budget_tokens`（同时强制 `temperature=1`
+且预算小于输出上限）、Qwen `enable_thinking` + `thinking_budget`、GLM `thinking.type`、
+Ollama `think`。DeepSeek 没有强度参数——思考与否由 `deepseek-chat` / `deepseek-reasoner`
+决定。不支持的厂商**不会**收到任何额外字段（宁可不生效，也不换一个 400），设置页会
+直接把原因标出来。要手工传厂商参数，用 `LLM_EXTRA_BODY`（JSON，优先级最高）。
+
+运行时组合（profile + bundle + patch 覆盖）：
+`gangge --list-profiles` 看可选组合，`gangge --dump-config` 看最终生效的每一行，
+`--profile novel` / `--patch x.yml` / `--set tools.profile=novel` 按需覆盖。
 
 架构与扩展点（运行时组合、护栏、请求级 hook）见 [`docs/architecture.md`](docs/architecture.md)。
 
 ## 🗺️ Roadmap
 
 - [x] Agentic Loop + TodoWrite 自动状态管理
-- [x] Agent Profile 场景化工具动态暴露
+- [x] Agent Profile 场景化工具动态暴露（coding / office / novel / research / media + `tool_search`）
+- [x] 运行时组合：profile + bundle + patch 覆盖（`--dump-config` 可查每一行来源）
 - [x] Shadow Git Checkpoint / 回滚
-- [x] LSP 语法检查（pyright / ruff / pylint）
-- [x] Memory Bank + Decision Log
+- [x] 写后语法检查（pyright / ruff / pylint / eslint / tsc / cargo check）
+- [x] 统一思考强度（OpenAI / Anthropic / Qwen / GLM / MiMo / Ollama，不支持的厂商自动跳过）
+- [x] 流式看门狗（首包与静默分开计时，思考久的请求不会被误杀）
+- [x] Memory Bank（progress / changelog / decisions）
 - [x] AI 自建工具 + 插件系统
 - [x] MCP 协议支持（stdio + SSE）
-- [x] Dramatica-Flow 小说创作引擎
-- [x] 视频出片（五种风格 / 竖屏 / 3D 展示页 / 网站展示 / 人物纪录片）
+- [x] Dramatica-Flow 小说创作引擎（19 个专用工具 + 叙事图谱 + 仿写）
+- [x] 视频出片（5 种风格 / 竖屏 / 3D 展示页 / 网站展示 / 人物纪录片 / 时间线飞行 / 迷你沙盘）
+- [x] Office 文档读写 + 排版 lint（docx / xlsx / pptx）
+- [x] Blender 3D 建模（bpy 增量建模 + 自动取景渲染）
 - [x] Qoder 委派（scope + dod + 四态结果）
 - [x] PyQt6 桌面 GUI
 - [ ] Web UI（远程访问）

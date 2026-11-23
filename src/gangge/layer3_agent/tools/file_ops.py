@@ -26,6 +26,36 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _UTF16_BOMS = ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be"))
 _FIRST_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
 
+# ── Office 容器：不是文本，通用读写工具必须让路 ──────────────────
+#
+# read_text_preserving 会因为 NUL 字节拒绝它们，然后调用方退化成
+# errors="replace" 的宽松解码 —— 于是 zip 二进制被当成正文返回（实测一个
+# 35KB 的 docx 吐出 4 万字符乱码，is_error 还是 False）。write_file 更糟：
+# 把 UTF-8 文本写进 .docx，Word 打开直接报"内容有问题"，但它返回"已写入"。
+#
+# 所以在这里拦下来，把模型导向 office_info / office_read / office_check。
+_OFFICE_CONTAINER_EXTS = frozenset({
+    ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm",
+})
+_LEGACY_OFFICE_EXTS = frozenset({".doc", ".xls", ".ppt"})
+
+_OFFICE_READ_HINT = (
+    "read_file 不能按文本读 {ext}：这是 zip 容器，读出来是二进制乱码。\n"
+    "请改用：\n"
+    "  office_info(path)   看结构（段落 / 工作表 / 页数）\n"
+    "  office_read(...)    按范围取内容（段落区间 / 单元格区域 / 页码）\n"
+    "  office_check(path)  校验结构是否完好\n"
+    "当前模式下若没有这些工具，用 tool_search(\"office 文档\") 揭示，"
+    "或直接用 bash 跑 python-docx / openpyxl / python-pptx 脚本。"
+)
+
+_OFFICE_WRITE_HINT = (
+    "write_file 不能写 {ext}：这类文件是 zip 容器，按文本写会得到一个"
+    "Word/Excel 打不开的坏文件（返回却是“已写入”）。\n"
+    "正确做法：用 bash 跑脚本生成（python-docx / openpyxl / python-pptx），"
+    "生成后用 office_check(path) 校验结构。"
+)
+
 
 class TextEncodingError(ValueError):
     """文件无法在无损前提下解码，拒绝编辑。"""
@@ -159,6 +189,16 @@ class ReadFileTool(BaseTool):
             # Check image files
             ext = file_path.suffix.lower()
             image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+            if ext in _OFFICE_CONTAINER_EXTS:
+                return ToolResult(output=f"❌ {_OFFICE_READ_HINT.format(ext=ext)}", is_error=True)
+            if ext in _LEGACY_OFFICE_EXTS:
+                return ToolResult(
+                    output=(
+                        f"❌ {ext} 是旧版二进制格式，本工具无法解析。"
+                        f"请先另存为 {ext}x 再处理。"
+                    ),
+                    is_error=True,
+                )
             if ext in image_exts:
                 size = file_path.stat().st_size
                 return ToolResult(
@@ -262,6 +302,12 @@ class WriteFileTool(BaseTool):
             file_path = Path(path)
             if not file_path.is_absolute() and self.workspace:
                 file_path = Path(self.workspace) / path
+            write_ext = file_path.suffix.lower()
+            if write_ext in _OFFICE_CONTAINER_EXTS:
+                return ToolResult(
+                    output=f"❌ {_OFFICE_WRITE_HINT.format(ext=write_ext)}",
+                    is_error=True,
+                )
             # ── Snapshot before content for diff ──
             before_content = ""
             if file_path.exists():

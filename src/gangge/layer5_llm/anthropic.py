@@ -23,6 +23,7 @@ from gangge.layer5_llm.base import (
     Role,
     ToolDefinition,
 )
+from gangge.layer5_llm.thinking import plan_thinking
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,19 @@ class AnthropicLLM(BaseLLM):
     def __init__(self, api_key: str, **kwargs: Any):
         super().__init__(**kwargs)
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        self.thinking_plan = plan_thinking(
+            "anthropic", self.model, self.thinking_level, self.max_tokens
+        )
+
+    def _apply_thinking(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """扩展思考：thinking 与 temperature 必须一起设，否则 API 直接报错。"""
+        plan = self.thinking_plan
+        if plan.thinking:
+            kwargs["thinking"] = plan.thinking
+            kwargs["temperature"] = plan.temperature if plan.temperature is not None else 1.0
+        elif self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        return kwargs
 
     def _convert_messages(
         self, messages: list[Message]
@@ -138,8 +152,7 @@ class AnthropicLLM(BaseLLM):
             kwargs["system"] = self._system_param(system)
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
-        if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
+        self._apply_thinking(kwargs)
 
         # ── Retry with exponential backoff for 429/5xx ──
         last_error = None
@@ -191,8 +204,7 @@ class AnthropicLLM(BaseLLM):
             kwargs["system"] = self._system_param(system)
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
-        if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
+        self._apply_thinking(kwargs)
 
         current_tool_id = ""
         current_tool_name = ""

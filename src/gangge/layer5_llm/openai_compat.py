@@ -27,6 +27,7 @@ from gangge.layer5_llm.base import (
     Role,
     ToolDefinition,
 )
+from gangge.layer5_llm.thinking import deep_merge, infer_provider, plan_thinking
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,22 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2.0  # seconds
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _parse_extra_body(raw: str) -> dict[str, Any]:
+    """解析 LLM_EXTRA_BODY（JSON）。写错时只警告，不影响启动。"""
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("[LLM] LLM_EXTRA_BODY 不是合法 JSON，已忽略（%s）：%s", exc, text[:120])
+        return {}
+    if not isinstance(data, dict):
+        logger.warning("[LLM] LLM_EXTRA_BODY 必须是 JSON 对象，已忽略：%s", text[:120])
+        return {}
+    return data
 
 
 class OpenAICompatLLM(BaseLLM):
@@ -54,6 +71,7 @@ class OpenAICompatLLM(BaseLLM):
         base_url: str,
         api_key: str = "not-needed",
         supports_vision: bool | None = None,
+        provider: str = "",
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
@@ -68,6 +86,31 @@ class OpenAICompatLLM(BaseLLM):
         self._idle_timeout = float(
             os.environ.get("LLM_IDLE_TIMEOUT", os.environ.get("LLM_TIMEOUT", "600")) or 0
         )
+
+        # 厂商标识：显式传入（registry / 桌面端）优先，否则从 base_url 猜。
+        # 猜不出来就是 custom——这时不发任何厂商私有字段。
+        self.provider = (provider or infer_provider(base_url) or "custom").lower()
+        self.thinking_plan = plan_thinking(
+            self.provider, self.model, self.thinking_level, self.max_tokens
+        )
+        if self.thinking_plan.note:
+            logger.debug(
+                "[llm] thinking %s/%s level=%s supported=%s: %s",
+                self.provider,
+                self.model,
+                self.thinking_level,
+                self.thinking_plan.supported,
+                self.thinking_plan.note,
+            )
+        # 用户手写的厂商扩展参数，优先级高于自动映射。
+        # 例：LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}
+        self._extra_body = _parse_extra_body(os.environ.get("LLM_EXTRA_BODY", ""))
+
+    def _apply_provider_options(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        body = deep_merge(self.thinking_plan.extra_body, self._extra_body)
+        if body:
+            kwargs["extra_body"] = body
+        return kwargs
 
     @classmethod
     def _guess_vision(cls, model: str) -> bool:
@@ -262,6 +305,7 @@ class OpenAICompatLLM(BaseLLM):
             kwargs["tools"] = self._convert_tools(tools)
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        self._apply_provider_options(kwargs)
 
         # ── Retry with exponential backoff for 429/5xx ──
         last_error = None
@@ -321,6 +365,7 @@ class OpenAICompatLLM(BaseLLM):
             kwargs["tools"] = self._convert_tools(tools)
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        self._apply_provider_options(kwargs)
 
         # Tool calls arrive as deltas keyed by index — a model may emit several
         # in parallel, interleaved. A single accumulator (the old code) merged
@@ -415,6 +460,17 @@ class OpenAICompatLLM(BaseLLM):
             if choice.finish_reason in ("tool_calls", "stop") and pending:
                 for block in _flush():
                     yield block
+
+            if choice.finish_reason:
+                # 把末帧的结束原因带出去。截断（length）和正常结束在流式里
+                # 长得一模一样，不显式传递的话调用方会把"想到一半被截断"
+                # 当成"模型说完了"，然后从头再想一遍。
+                mapped = {
+                    "stop": "end_turn",
+                    "tool_calls": "tool_use",
+                    "length": "max_tokens",
+                }.get(choice.finish_reason, choice.finish_reason)
+                yield ContentBlock(type=ContentType.TEXT, text="", stop_reason=mapped)
 
         # Some servers end the stream without a finish_reason on the tool frame.
         for block in _flush():

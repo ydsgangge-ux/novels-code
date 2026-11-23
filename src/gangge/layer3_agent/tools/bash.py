@@ -6,6 +6,7 @@ Uses threaded reading + merged stderr to avoid Windows pipe deadlock.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import logging
 import os
 import platform
@@ -13,7 +14,10 @@ import re
 import signal
 import subprocess
 import threading
+import time
+from datetime import datetime
 from io import StringIO
+from pathlib import Path
 from typing import Any
 
 from gangge.layer3_agent.tools.base import BaseTool, ToolResult
@@ -24,6 +28,65 @@ logger = logging.getLogger(__name__)
 #: agent launched should not outlive the task that needed it.
 _TRACKED_PROCS: set[subprocess.Popen] = set()
 _TRACK_LOCK = threading.Lock()
+
+#: 命令超时的默认值与上限。
+#:
+#: 默认 120 秒对普通命令足够；模型偶尔会传 ``timeout: "5000"``（83 分钟），
+#: 于是 ``reader.join(5000)`` 把整个任务挂死——那次 ``python -m http.server``
+#: 就是这么把任务拖了 36 分钟还没结果的。任何"最多等多久"的参数都必须有
+#: 上限，否则它会被当成"要等多久"。
+DEFAULT_TIMEOUT_SECONDS = 120
+MAX_TIMEOUT_SECONDS = 600
+
+#: 常驻进程：启动成功后**不会退出**，前台等待等价于等死。
+#: 注意只匹配"服务/开发服务器"，``npm test`` / ``npm run build`` 不会被误伤。
+_SERVICE_CMD_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:"
+    r"python[0-9.]*\s+-m\s+http\.server|"
+    r"python[0-9.]*\s+-m\s+flask\s+run|"
+    r"(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:start|dev|serve)|"
+    r"npx\s+(?:vite|next\s+dev|nuxt\s+dev|serve)|"
+    r"(?:next|nuxt|vite)\s+dev|"
+    r"uvicorn|gunicorn|hypercorn|"
+    r"flask\s+run|"
+    r"manage\.py\s+runserver|"
+    r"php\s+-S\b|php\s+artisan\s+serve|"
+    r"[a-z0-9_.-]*spring-boot:run|"
+    r"rails\s+(?:server|s)|"
+    r"streamlit\s+run|"
+    r"mkdocs\s+serve|"
+    r"hugo\s+(?:server|serve)|"
+    r"jekyll\s+serve|"
+    r"docker\s+compose\s+up(?!\s+-d)|"
+    r"docker-compose\s+up(?!\s+-d)"
+    r")",
+    re.IGNORECASE,
+)
+
+#: 命令自己已经把进程丢到后台了，不要再包一层。
+_ALREADY_BACKGROUND_RE = re.compile(
+    r"\bStart-Process\b|\bnohup\b|\bstart\s+/B\b|\bsetsid\b|"
+    r"docker\s+compose\s+up\s+-d|docker-compose\s+up\s+-d|"
+    r"--daemon\b|\bdaemon\s+-d\b",
+    re.IGNORECASE,
+)
+
+
+def is_service_command(command: str) -> bool:
+    """这条命令是不是"启动后不会退出"的常驻服务？
+
+    判的是命令**内容**，不是"有没有 timeout"——模型并不知道哪些命令会常驻，
+    它只会照着目标写 ``python -m http.server``。
+    """
+    text = (command or "").strip()
+    if not text:
+        return False
+    if _ALREADY_BACKGROUND_RE.search(text):
+        return False
+    # POSIX 的结尾 & 已经是后台执行；Windows 的 & 是调用运算符，不能这么判。
+    if platform.system() != "Windows" and re.search(r"&\s*$", text):
+        return False
+    return bool(_SERVICE_CMD_RE.search(text))
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -136,6 +199,173 @@ def cleanup_tracked_processes() -> int:
     for proc in procs:
         _kill_process_tree(proc)
     return len(procs)
+
+
+def _tail_file(path: Path, limit: int = 2000) -> str:
+    """读日志尾部——服务启动失败时，唯一线索都在这里。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    text = text.strip()
+    return ("…\n" + text[-limit:]) if len(text) > limit else text
+
+
+def _service_stop_hint(pid: int) -> str:
+    if platform.system() == "Windows":
+        return f"taskkill /F /T /PID {pid}"
+    return f"kill -TERM -{pid}"
+
+
+def _guess_port(command: str) -> str:
+    """从命令里猜一个端口，给模型一条可直接运行的验证命令。"""
+    for pattern in (
+        r"http\.server\s+(\d{2,5})",
+        r"--port[=\s]+(\d{2,5})",
+        r"-p\s+(\d{2,5})",
+        r":(\d{2,5})\b",
+    ):
+        match = re.search(pattern, command or "")
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _probe_service(port: str, attempts: int = 2, interval: float = 0.4) -> tuple[bool, str]:
+    """自己敲一次门：进程活着不等于服务能用。
+
+    只确认"进程还在"时，模型拿到的是"已启动"，它会当成"已经验证过了"，
+    然后直接去写文档。真正该确认的是**这个端口有没有 HTTP 响应**。
+
+    用 http.client 而不是 urllib：后者会读系统代理设置，localhost 请求被
+    转发到代理上会直接超时——表现为"服务明明起来了却探不到"。
+    """
+    if not port:
+        return False, ""
+    host = "localhost"
+    url = f"http://{host}:{port}/"
+    last_error = ""
+    for _ in range(attempts):
+        try:
+            conn = http.client.HTTPConnection(host, int(port), timeout=1.5)
+            try:
+                conn.request("GET", "/")
+                resp = conn.getresponse()
+                code = resp.status
+                resp.read(2048)
+            finally:
+                conn.close()
+            if 200 <= code < 400:
+                return True, f"✅ 可达性检查通过：GET {url} → HTTP {code}"
+            return True, (
+                f"✅ 服务已响应：HTTP {code}（服务正常，页面/路由可能需要调整）"
+            )
+        except Exception as exc:  # 连接被拒 / 超时：可能还在初始化
+            last_error = str(exc)
+            time.sleep(interval)
+    return False, (
+        f"⚠️ 进程在跑，但 {url} 暂未响应（{last_error[:100]}），可能仍在初始化。"
+        "稍后再试，不要重复启动服务。"
+    )
+
+
+def _start_service(command: str, cwd: str) -> tuple[str, int | None]:
+    """后台启动常驻服务，确认它还活着就立刻返回。
+
+    前台等一个永不退出的进程，结果只能是等满 timeout 后报"超时"——模型拿到
+    的不是"服务起来了"，于是重试、换端口、再等一次。这里把 stdout 落到
+    ``.gangge/service.log``，1.5 秒内进程还在就判定启动成功。
+    """
+    try:
+        gangge_dir = Path(cwd) / ".gangge"
+        gangge_dir.mkdir(parents=True, exist_ok=True)
+        log_path = gangge_dir / "service.log"
+    except Exception as e:
+        return (f"[错误] 无法创建服务日志目录: {e}", None)
+
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    is_windows = platform.system() == "Windows"
+    if is_windows:
+        cmd = [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            _translate_to_powershell(command),
+        ]
+        # DETACHED_PROCESS 配 powershell 会直接退出、命令根本不执行；
+        # 必须给一个隐藏控制台（CREATE_NO_WINDOW）。
+        popen_kwargs: dict[str, Any] = {
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        }
+    else:
+        cmd = ["bash", "-c", command]
+        popen_kwargs = {"start_new_session": True}
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+            log_file.write(f"\n===== {stamp} 服务启动: {command}\n")
+            log_file.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                env=env,
+                **popen_kwargs,
+            )
+    except Exception as e:
+        return (f"[错误] 启动服务失败: {e}", None)
+
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline and proc.poll() is None:
+        time.sleep(0.1)
+
+    code = proc.poll()
+    if code is not None:
+        tail = _tail_file(log_path)
+        return (
+            f"[服务启动失败] 进程在 1.5 秒内就退出了（exit {code}）。\n"
+            f"日志尾部：\n{tail or '(无输出)'}\n"
+            "常见原因：端口被占用、命令拼写错误、依赖没装。请先修好再启动。",
+            code or 1,
+        )
+
+    with _TRACK_LOCK:
+        _TRACKED_PROCS.add(proc)
+
+    port = _guess_port(command)
+    # 进程活着只是"起来了"；敲一次门才算"能用"。
+    reachable, probe_note = _probe_service(port)
+
+    if port:
+        ui_url = f"http://localhost:{port}/"
+        next_step = (
+            "下一步（必须做，不要停在“已启动”就收尾）：\n"
+            f'  1) browser_debug(action="navigate", url="{ui_url}")  打开页面看是否真的渲染\n'
+            '  2) browser_debug(action="console_logs")  读 JS 报错\n'
+            "  3) 若 browser_debug 不可用，用 web_fetch 抓一次页面文本作为退路"
+        )
+    else:
+        next_step = (
+            "端口没从命令里识别出来：先看日志里的实际端口，"
+            "再用 browser_debug 打开对应地址验证。"
+        )
+
+    lines = [
+        "[服务已在后台启动]" if reachable else "[服务进程已启动，但端口还没响应]",
+        f"PID {proc.pid}",
+        f"日志文件: {log_path}",
+    ]
+    if probe_note:
+        lines.append(probe_note)
+    lines += [
+        f"停止命令: {_service_stop_hint(proc.pid)}",
+        "（端口取自命令；若日志里显示了别的实际端口，以日志为准）",
+        next_step,
+        "说明：该进程与当前任务绑定，任务结束时会被自动回收；"
+        "不要再把服务器命令前台跑一遍。",
+    ]
+    return ("\n".join(lines), 0)
 
 
 def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]:
@@ -256,13 +486,12 @@ class BashTool(BaseTool):
     def description(self) -> str:
         return (
             "执行 shell 命令。用于运行编译、测试、安装依赖、启动服务器等。命令在项目工作目录下执行。\n"
-            "注意：命令超时（默认 120 秒）后会被强制终止。\n"
-            "启动 Web 服务器/后台进程时必须让命令立刻返回，否则会把整条命令挂到超时：\n"
-            "  Windows（本机实际执行器是 PowerShell，cmd 的 `start /B` 在这里无效）:\n"
-            "    Start-Process -WindowStyle Hidden -FilePath python -ArgumentList 'server.py'"
-            " -RedirectStandardOutput server.log -RedirectStandardError server.err\n"
-            "  Linux: nohup python server.py > server.log 2>&1 &\n"
-            "启动后另开一条命令用 curl / Invoke-WebRequest 验证，不要把服务器前台跑在这条命令里。"
+            "注意：命令超时（默认 120 秒，上限 600 秒）后会被强制终止。\n"
+            "启动 Web 服务器时直接写普通命令即可（例如 `python -m http.server 8000`、"
+            "`npm run dev`、`uvicorn app:app`）：这类常驻命令会被自动改成后台启动，"
+            "日志写到 .gangge/service.log，并返回 PID / 验证命令 / 停止命令。\n"
+            "拿到返回值后，另起一条命令用 curl / Invoke-WebRequest 验证，不要重复前台启动服务器。\n"
+            "如果你自己已经用 Start-Process（Windows）或 nohup ... &（Linux）后台化，也会原样执行。"
         )
 
     @property
@@ -276,8 +505,12 @@ class BashTool(BaseTool):
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "超时时间（秒），默认 120",
-                    "default": 120,
+                    "description": (
+                        f"最多等待多少秒（默认 {DEFAULT_TIMEOUT_SECONDS}，"
+                        f"上限 {MAX_TIMEOUT_SECONDS}，超过按上限执行）。"
+                        "不是每次都要等这么久：命令结束就立刻返回。"
+                    ),
+                    "default": DEFAULT_TIMEOUT_SECONDS,
                 },
             },
             "required": ["command"],
@@ -285,7 +518,6 @@ class BashTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         command = kwargs.get("command") or kwargs.get("cmd") or ""
-        timeout = kwargs.get("timeout", 120)
         workdir = self.workspace or os.getcwd()
 
         if not command:
@@ -294,12 +526,37 @@ class BashTool(BaseTool):
                 is_error=True,
             )
 
+        # timeout 是"最多等多久"，不是"要等多久"。模型传过 "5000"（83 分钟），
+        # 必须封顶，否则一条常驻命令就能把整个任务挂死。
+        raw_timeout = kwargs.get("timeout", DEFAULT_TIMEOUT_SECONDS)
+        try:
+            timeout = int(float(str(raw_timeout).strip() or DEFAULT_TIMEOUT_SECONDS))
+        except (TypeError, ValueError):
+            timeout = DEFAULT_TIMEOUT_SECONDS
+        if timeout <= 0:
+            timeout = DEFAULT_TIMEOUT_SECONDS
+        capped_note = ""
+        if timeout > MAX_TIMEOUT_SECONDS:
+            capped_note = (
+                f"\n[timeout 参数 {timeout}s 超过上限，已按 {MAX_TIMEOUT_SECONDS}s 执行]"
+            )
+            timeout = MAX_TIMEOUT_SECONDS
+
         try:
             # 在默认线程池中运行同步命令，不阻塞 asyncio 事件循环
             loop = asyncio.get_running_loop()
-            output, exit_code = await loop.run_in_executor(
-                None, _run_command, command, workdir, timeout
-            )
+            if is_service_command(command):
+                # 常驻服务：分离进程 + 日志文件，确认存活就返回，
+                # 不再等一个永远不会退出的进程。
+                output, exit_code = await loop.run_in_executor(
+                    None, _start_service, command, workdir
+                )
+            else:
+                output, exit_code = await loop.run_in_executor(
+                    None, _run_command, command, workdir, timeout
+                )
+            if capped_note:
+                output += capped_note
 
             # 退出码才是"命令到底成没成功"的唯一依据。只看输出前缀会把
             # `npm test`（exit 1、输出全是 ✖）判成成功。

@@ -48,4 +48,5 @@
         browser: true
         comfyui: true
         novel: true
+        office: true          # docx/xlsx/pptx 专用读写；coding 下隐藏，tool_search 可揭示
         profile: ''           # 空 = 由 detect_agent_profile 自动判定

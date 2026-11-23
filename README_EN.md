@@ -39,25 +39,28 @@ Talk directly in the main chat window, AI understands intent and acts:
 4. **Auditor** — Checks logic gaps, foreshadowing consistency, character behavior plausibility
 5. **Reviser** — Revisions based on audit feedback, loops until passing
 
-### 🔧 16 Dedicated Tools
+### 🔧 19 Dedicated Tools
 | Tool | Function |
 |------|----------|
 | `novel_init` | Create new book project |
 | `novel_setup` | Configure characters/factions/locations/world rules |
 | `novel_outline` | Generate/regenerate story outline |
 | `novel_chapter_outlines` | Expand detailed chapter beats |
+| `novel_new_arc` | Start a new story arc |
 | `novel_write_chapter` | Write one chapter (fast mode supported) |
 | `novel_audit` | Audit written chapters |
 | `novel_revise` | Revise chapters with feedback |
 | `novel_status` | View detailed progress & status |
 | `novel_edit` | Modify any element (characters/relationships/hooks/outlines/chapters) |
-| `novel_export` | Export full book (TXT/EPUB) |
+| `novel_export` | Export full book as Markdown |
 | `novel_list_books` | List all books |
 | `novel_navigate` | Quick file navigation (chapters/characters/outlines/status) |
 | `novel_graph_query` | Query narrative knowledge graph |
 | `novel_consistency_check` | Full-book consistency check |
 | `novel_graph_rebuild` | Rebuild narrative graph |
 | `novel_import` | Import TXT novel for imitation analysis |
+| `novel_imitate_write` | Write a chapter imitating the imported reference novel |
+| `novel_chat` | Chat-style entry: routes a natural-language request to the right novel tool |
 
 ### 📚 Import & Imitation Writing
 - Supports importing TXT novels of hundreds of thousands of words
@@ -114,14 +117,16 @@ cd novels-code
 ### 2. Install (pick one)
 
 ```bash
-# Option A: Minimal (CLI + TUI + Novel Writing)
-pip install -e .
+# Option A: Minimal (CLI + TUI + Office tools)
+pip install -e ".[office]"
 
 # Option B: With Desktop GUI (Recommended)
-pip install -e ".[gui]"
+pip install -e ".[gui,office]"
 
-# Option C: Everything (GUI + dev tools)
+# Option C: Everything (GUI + Office + video + dev tools)
 pip install -e ".[all]"
+
+# Windows: install.bat does the same with prompts (and offers LibreOffice)
 ```
 
 ### 3. Configure API Key
@@ -142,7 +147,7 @@ DEEPSEEK_API_KEY=sk-xxx
 ```bash
 # Desktop GUI (Recommended, full experience)
 python desktop/app.py
-# Or on Windows: double-click desktop/run.bat
+# Or on Windows: double-click run-gui.bat
 
 # One-shot task (coding mode)
 gangge "Create a FastAPI project with user authentication"
@@ -232,8 +237,14 @@ Tech stack: FastAPI + SQLAlchemy + SQLite
 - **Context management** — Sliding window + tool result truncation + lazy file index
 - **Progress emitter** — Auto-pushes progress after every step, real-time visibility
 
-### 13+ Built-in Tools
-`bash` · `read_file` · `write_file` · `edit_file` · `grep` · `glob` · `list_dir` · `web_fetch` · `ask_user` · `lint_check` · `find_symbol` · `find_references` · `create_tool`
+### Built-in Toolset
+Profile-scoped (`coding` / `office` / `novel` / `research` / `media`): only the tools a task
+family needs stay visible, the rest are revealed on demand via `tool_search`.
+
+`bash` · `read_file` · `write_file` · `edit_file` · `apply_patch` · `grep` · `glob` · `list_dir` ·
+`web_search` · `web_fetch` · `ask_user` · `lint_check` · `run_tests` · `find_symbol` ·
+`find_references` · `create_tool` · `demo_video` · `qoder_delegate` · `office_*` ·
+`generate_image` · `vision` · `blender` (auto-enabled when Blender is installed)
 
 ### Symbol Navigation
 - **`find_symbol`** — Locate classes, functions, methods by name with file path, line number, and type
@@ -242,7 +253,7 @@ Tech stack: FastAPI + SQLAlchemy + SQLite
 
 ### Safety & Rollback
 - **Shadow Git Checkpoint** — Auto-creates Git checkpoint before AI modifications, one-click rollback
-- **LSP Syntax Check** — Auto-runs pyright/ruff after code changes, fixes errors immediately
+- **Post-edit Syntax Check** — `lint_check` runs pyright / ruff / pylint / eslint / tsc / cargo check and feeds errors back immediately
 - **Permission Control** — Rule engine + danger detection, system directory writes blocked
 - **Critic Self-Check** — Built-in self-check in System Prompt (syntax / logic / deps / style)
 
@@ -282,19 +293,23 @@ Tech stack: FastAPI + SQLAlchemy + SQLite
 | `storyboard` | plain storyboard (default) | fastest, information-only |
 | `showcase` | 3D showcase: storyboard inside a browser frame, scroll pushes the camera | product / project intro |
 | `site` | showcase with a real full-page site screenshot as the inner page | introducing your own site (`url` required) |
+| `person` | light-path documentary: one continuous shot through a life, stops at every node | biography / memorial (photos optional) |
+| `flight` | timeline flight: a 3D path through a night grid, camera follows it | company history / milestone reel (photos optional) |
+| `miniature` | miniature diorama: daylight 3D map, path from a village house to the city | brand story / travel recap (photos optional) |
 
-All three are one click away in the desktop app under **Skills → Video** (the prompt
+All of them are one click away in the desktop app under **Skills → Video** (the prompt
 already carries `page=...`). CLI equivalent:
 
 ```bash
 python -m gangge.layer4_tools.storyboard -c script.txt --page showcase --style neon
 python -m gangge.layer4_tools.storyboard -c script.txt --page site -u https://example.com
+python -m gangge.layer4_tools.storyboard -f examples/person.json --page person --photos photos/
 ```
 
 Pages are **template files**, not Python strings: `src/gangge/layer4_tools/storyboard/pages/`
-(`storyboard.html`, `showcase.html`, `site_inner.html`), resolved by name through
-`pages.py:TEMPLATES`. `page=site` needs playwright for the screenshot; the others
-are pure Python and work offline.
+(`storyboard.html`, `showcase.html`, `site_inner.html`, `person.html`, `flight.html`),
+resolved by name through `pages.py:TEMPLATES`. `page=site` needs playwright for the
+screenshot; the others are pure Python and work offline.
 
 **Not sure which look you want?** Open the style studio — three ways in:
 
@@ -373,7 +388,7 @@ UI Layer (Layer 1)
                                 │    web_fetch · ask_user · lint_check
                                 │    find_symbol · find_references · create_tool
                                 │    └── Plugin tools (.gangge/plugins/)
-                                │    └── Novel Tools (16) ← Dramatica-Flow
+                                │    └── Novel Tools (19) ← Dramatica-Flow
                                 │         novel_* series
                                 ├─ MCP Tool Layer (Layer 4)
                                 │    MCP Client (stdio/SSE) → External Servers
@@ -383,7 +398,7 @@ UI Layer (Layer 1)
                                 ├─ Permission Layer (Layer 4)
                                 │    Rules · Danger Detection · Shadow Git
                                 └─ LLM Layer (Layer 5)
-                                     DeepSeek · OpenAI · Claude · Ollama
+                                     DeepSeek · OpenAI · Claude · Qwen · Zhipu · Ollama ...
 ```
 
 ---
@@ -393,14 +408,35 @@ UI Layer (Layer 1)
 **`.env` Environment Variables**
 
 ```ini
-LLM_PROVIDER=deepseek          # deepseek / openai / anthropic / ollama
+# ── Model ──
+LLM_PROVIDER=deepseek          # deepseek / openai / anthropic / qwen / zhipu / moonshot /
+                               # baichuan / yi / minimax / stepfun / siliconflow / mimo / ollama / custom
 DEEPSEEK_API_KEY=sk-xxx
-DEEPSEEK_MODEL=deepseek-chat
-
 MAX_ROUNDS=30                  # Max tool-call rounds
-MAX_TOKENS=8192
-TEMPERATURE=0.0
+LLM_TIMEOUT=600                # Silence timeout per request (seconds)
+
+# ── Context & output ──
+MAX_TOKENS=16384               # Max output tokens per reply
+CONTEXT_WINDOW_TOKENS=128K     # Model context window (128K / 1M / 131072; read by the desktop app)
+MAX_HISTORY_ROUNDS=6           # Sliding window: keep the last N rounds
+TOOL_RESULT_MAX_CHARS=6000     # Truncate a single tool result to this many chars
+
+# ── Thinking strength ──
+LLM_THINKING_LEVEL=default     # default / off / low / medium / high
+THINKING_CARRYOVER=1           # Carry a "thinking-only" turn into the next one
+MAX_IDLE_ROUNDS=2              # Stop after N idle rounds (todos are kept)
+
+# ── Runtime / web search ──
+GANGGE_PROFILE=standard        # standard / novel / minimal / office
+WEB_SEARCH_BACKEND=auto        # auto / deepseek / free (DuckDuckGo + Bing only)
 ```
+
+Thinking strength is a single level mapped per provider in `layer5_llm/thinking.py`
+(OpenAI `reasoning_effort`, Anthropic `thinking.budget_tokens`, Qwen
+`enable_thinking` + `thinking_budget`, GLM `thinking.type`, Ollama `think`).
+DeepSeek has no strength parameter — thinking depends on `deepseek-chat` vs
+`deepseek-reasoner`. Unsupported providers receive **no** extra fields; the desktop
+settings page says why. Manual provider params go in `LLM_EXTRA_BODY` (JSON, wins).
 
 **`.ganggerules` Project Rules** (place in project root)
 
@@ -445,11 +481,11 @@ novels-code/
 │   │       ├── search.py   #   grep/glob/list_dir
 │   │       ├── web.py      #   Web content fetch
 │   │       ├── ask_user.py #   User questions
-│   │       ├── lint_check.py   #   LSP syntax check
+│   │       ├── lint_check.py   #   Post-edit syntax check
 │   │       ├── symbol.py   #   Symbol lookup + reference tracking
 │   │       ├── create_tool.py  #   AI self-built tools
 │   │       ├── comfyui_tool.py # ComfyUI image generation
-│   │       └── novel.py    #   ★ Novel toolset (16 tools)
+│   │       └── novel.py    #   ★ Novel toolset (19 tools)
 │   ├── dramatica/          # ★ Dramatica-Flow novel engine
 │   │   ├── pipeline.py     #   Five-layer writing pipeline
 │   │   ├── agents/         #   Architect/Writer/Auditor/Reviser
@@ -467,12 +503,12 @@ novels-code/
 │   │   ├── repo_index.py   #   Repo symbol index
 │   │   ├── storyboard/     #   Video & 3D showcase (pages/*.html templates)
 │   │   └── plugin_loader.py    # Plugin loader
-│   └── layer5_llm/         # LLM adapters (4 providers)
-│       ├── base.py         #   Base class + ToolDefinition
-│       ├── registry.py     #   Provider registry
-│       ├── deepseek.py     #   DeepSeek adapter
-│       ├── anthropic.py    #   Claude adapter
-│       └── openai_compat.py    # OpenAI / Ollama adapter
+│   └── layer5_llm/         # LLM adapters (14 providers)
+│       ├── base.py         #   Base class + ToolDefinition + thinking level
+│       ├── registry.py     #   Provider registry / factory
+│       ├── thinking.py     #   Thinking level → per-provider request params
+│       ├── anthropic.py    #   Claude adapter (extended thinking)
+│       └── openai_compat.py    # OpenAI-compatible adapter (OpenAI / DeepSeek / Qwen / GLM / Ollama ...)
 ├── tests/
 │   ├── test_core.py        # Core module tests
 │   ├── test_architecture.py    # Architecture layer compliance tests
@@ -513,23 +549,30 @@ pytest tests/ --cov=src/gangge --cov-report=term-missing
 ## 🗺️ Roadmap
 
 - [x] ★ Dramatica-Flow novel writing engine integrated
-- [x] ★ 16 dedicated novel tools
+- [x] ★ 19 dedicated novel tools
 - [x] ★ Chat-based natural language creation
 - [x] ★ Import & imitation (large TXT file support)
 - [x] ★ Narrative knowledge graph
 - [x] ★ Five-layer writing pipeline
-- [x] ★ Novel-specific UI panels (7 tabs)
+- [x] ★ Novel-specific UI panels (9 tabs)
 - [x] CLI / REPL / TUI / PyQt6 Desktop
+- [x] Agent profiles (coding / office / novel / research / media + `tool_search`)
+- [x] Runtime composition (profile + bundle + patch, `--dump-config`)
 - [x] Memory Bank cross-session context + Decision Log
 - [x] Shadow Git checkpoints (rollback at any step)
-- [x] LSP syntax check (pyright/ruff/pylint)
+- [x] Post-edit syntax check (pyright / ruff / pylint / eslint / tsc / cargo check)
 - [x] ask_user pause for user input
 - [x] VSCode-style desktop GUI (3-panel layout + file preview + stop button)
 - [x] Symbol lookup + reference tracking (find_symbol / find_references)
 - [x] AI self-built tools (create_tool + plugin system)
 - [x] Full MCP protocol support (stdio + SSE transports)
 - [x] ComfyUI image generation (auto-detect activation)
-- [ ] Internationalization (i18n) English language pack
+- [x] Video output (5 styles / portrait / 6 page kinds incl. person, flight, miniature)
+- [x] Office documents (docx / xlsx / pptx read + layout lint)
+- [x] Blender 3D modeling (incremental bpy + auto-framed render)
+- [x] Qoder delegation (scope + dod + four-state result)
+- [x] Unified thinking strength across providers
+- [x] Internationalization (zh / en language packs)
 - [ ] Web UI (remote access)
 - [ ] Vector index (RAG) for local context
 - [ ] EPUB export format support

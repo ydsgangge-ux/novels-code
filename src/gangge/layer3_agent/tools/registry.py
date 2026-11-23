@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 
+#: 代码动作词。和文档词同时出现时，主线是开发，文档只是输入——
+#: 不能因为"word + 文档"命中两项就把开发工具裁掉。
+_CODE_INTENT_RE = re.compile(
+    r"开发|实现|编写|写一个|写个|构建|搭建|部署|重构|修复|调试|做出来|"
+    r"\bdevelop\b|\bcreate\b|\bbuild\b|\bimplement\b|\brefactor\b|\bfix\b|\bdeploy\b",
+    re.IGNORECASE,
+)
+
 
 # ── Tool phase definitions ──
 # Tools are grouped by phase. The loop starts with phase 1 and
@@ -77,6 +85,13 @@ TOOL_PHASES: dict[str, int] = {
     "qoder_delegate": PHASE_SPECIAL,  # 外包一个可验证闭环给 Qoder CLI
     "browser":        PHASE_SPECIAL,
     "vision":         PHASE_EXPLORE,  # always visible — LLM needs it for image tasks
+    # Office 文档 — 读类工具，越早可见越好；coding profile 下隐藏，tool_search 可揭示
+    "office_info":    PHASE_EXPLORE,
+    "office_read":    PHASE_EXPLORE,
+    "office_check":   PHASE_EXPLORE,
+    # 重算/渲染要起外部进程（LibreOffice），算"运行"
+    "office_recalc":  PHASE_RUN,
+    "office_render":  PHASE_RUN,
     # Novel tools — all phase 4
     "novel_init":              PHASE_SPECIAL,
     "novel_setup":             PHASE_SPECIAL,
@@ -141,6 +156,27 @@ AGENT_PROFILES = {
             "qoder_delegate",
             # 3D 建模（装了 Blender 才注册）
             "blender",
+        },
+    },
+    "office": {
+        "description": "Office 文档处理（docx / xlsx / pptx）",
+        "detect_keywords": [
+            "docx", "xlsx", "pptx", "word", "excel", "ppt", "powerpoint",
+            "文档", "幻灯片", "工作簿", "电子表格",
+        ],
+        "tools": {
+            # 专用读写：read_file 对这类文件只会吐二进制乱码
+            "office_info", "office_read", "office_check",
+            # 公式重算 / 转 PDF 看图（要装 LibreOffice，没装时工具自己会说）
+            "office_recalc", "office_render",
+            # 基础文件工具（脚本生成产物时要用）
+            "read_file", "list_dir", "grep", "glob", "everything_search",
+            "find_symbol", "find_references", "chat_log", "recall_conversation",
+            "write_file", "edit_file", "apply_patch", "create_tool",
+            # 生成脚本要用 shell，生成后要能自查
+            "bash", "lint_check", "run_tests", "browser_debug",
+            "TodoWrite", "ask_user", "tool_search", "vision",
+            "package_info", "qoder_delegate",
         },
     },
     "novel": {
@@ -236,7 +272,7 @@ def detect_agent_profile(user_message: str) -> str:
     msg_lower = user_message.lower()
     # Order is priority: on a tie the earlier profile wins, so the narrow,
     # unambiguous families sit before the catch-all "coding".
-    profiles = ("novel", "research", "media", "coding")
+    profiles = ("novel", "office", "research", "media", "coding")
     best = "coding"
     # Starting at 0 (not -1) is what makes "no keyword at all" fall through to
     # coding: with -1 the first profile wins every empty match and a plain
@@ -247,6 +283,14 @@ def detect_agent_profile(user_message: str) -> str:
         if score > best_score:  # `>` keeps the earlier (higher-priority) profile on ties
             best_score = score
             best = p
+
+    # "按这份 word 文档开发软件" 是开发任务，文档只是输入：文档词往往一次
+    # 命中两个（word + 文档），而代码动词只命中一个，按分数会判成 office，
+    # 于是 find_symbol / browser_debug 这些开发工具被裁掉，任务跑到一半才发现
+    # 工具没了。主线是开发时一律走 coding；读文档只是开头一步，read_file 的
+    # 拒绝提示会把它导向 tool_search。
+    if best in ("office", "research") and _CODE_INTENT_RE.search(msg_lower):
+        return "coding"
     return best
 
 
@@ -291,6 +335,19 @@ PROFILE_CORE: dict[str, set[str]] = {
         "novel_import", "novel_imitate_write", "novel_chat", "novel_navigate",
         "read_file", "list_dir", "grep", "everything_search",
         "TodoWrite", "ask_user", "vision", "generate_image", "tool_search",
+    },
+    # Office 是"以文档为先"，不是"只会处理文档"：一个任务常常是
+    # "按这份需求文档开发软件"，所以开发工具必须一起在。文档读写本身
+    # 是主线，藏在 tool_search 后面只会让每一轮多一次搜索往返。
+    "office": {
+        "office_info", "office_read", "office_check",
+        "office_recalc", "office_render",
+        "read_file", "list_dir", "grep", "glob", "everything_search",
+        "find_symbol", "find_references", "chat_log", "recall_conversation",
+        "write_file", "edit_file", "apply_patch", "create_tool",
+        "bash", "lint_check", "run_tests", "browser_debug",
+        "TodoWrite", "ask_user", "tool_search", "vision",
+        "package_info", "qoder_delegate",
     },
     "research": {
         "web_search", "web_fetch", "package_info", "grep", "glob",
@@ -583,6 +640,19 @@ def create_tool_registry(
         logger.debug("[Registry] Package info tool skipped: %s", e)
     registry.register(FindSymbolTool(workspace=workspace))
     registry.register(FindReferencesTool(workspace=workspace))
+
+    # ── Office：docx / xlsx / pptx 的结构化读取与校验 ──
+    # 注册但默认隐藏（coding profile 的工具集里没有它们），模型需要时用
+    # tool_search 揭示；切到 office profile 则直接可见。这样普通编码任务
+    # 一个 token 都不多花，又不会让模型退回去用 read_file 读二进制。
+    try:
+        from gangge.layer3_agent.tools.office import register_office_tools
+
+        office_names = register_office_tools(registry, workspace=workspace)
+        if office_names:
+            logger.info("[Registry] Office tools activated — %s", ", ".join(office_names))
+    except Exception as e:  # noqa: BLE001 - 缺依赖不能拦住启动
+        logger.debug("[Registry] Office tools skipped: %s", e)
 
     # ── TodoWrite: the most important tool for task tracking ──
     todo_state = get_todo_state()

@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 chcp 65001 >nul 2>&1
 title Novels Code - Install
 
@@ -36,11 +37,13 @@ if errorlevel 1 (
 echo [OK] pip ready
 echo.
 
-:: Ask install mode
+:: Ask install mode. Office extras (docx/xlsx/pptx + pymupdf) are part of every
+:: mode: office_info/office_read/office_check/office_render are core features,
+:: and leaving them out only produces a "missing dependency" error later.
 echo Select install mode:
-echo   1. Minimal   (CLI + TUI only)
-echo   2. With GUI  (CLI + TUI + Desktop GUI)
-echo   3. Full      (GUI + Dev tools)
+echo   1. Minimal   (CLI + TUI + Office tools)
+echo   2. With GUI  (CLI + TUI + Office tools + Desktop GUI)
+echo   3. Full      (GUI + Office + Dev tools)
 echo.
 set /p MODE="Enter choice [1/2/3] (default=2): "
 if "%MODE%"=="" set MODE=2
@@ -49,11 +52,11 @@ echo.
 echo Installing...
 
 if "%MODE%"=="1" (
-    python -m pip install -e .
+    python -m pip install -e ".[office]"
 ) else if "%MODE%"=="3" (
     python -m pip install -e ".[all]"
 ) else (
-    python -m pip install -e ".[gui]"
+    python -m pip install -e ".[gui,office]"
 )
 
 if errorlevel 1 (
@@ -62,6 +65,48 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+echo.
+echo ============================================
+echo   LibreOffice (optional, for xlsx recalc / PDF render)
+echo ============================================
+echo.
+echo office_recalc and office_render need LibreOffice (soffice).
+echo Without it those two tools explain what is missing instead of failing silently.
+
+set "SOFFICE="
+where soffice >nul 2>&1 && set "SOFFICE=soffice"
+if not defined SOFFICE if exist "%ProgramFiles%\LibreOffice\program\soffice.exe" set "SOFFICE=%ProgramFiles%\LibreOffice\program\soffice.exe"
+if not defined SOFFICE if exist "%ProgramFiles(x86)%\LibreOffice\program\soffice.exe" set "SOFFICE=%ProgramFiles(x86)%\LibreOffice\program\soffice.exe"
+if not defined SOFFICE if exist "%LOCALAPPDATA%\Programs\LibreOffice\program\soffice.exe" set "SOFFICE=%LOCALAPPDATA%\Programs\LibreOffice\program\soffice.exe"
+
+if defined SOFFICE (
+    echo [OK] LibreOffice found: !SOFFICE!
+    goto :libreoffice_done
+)
+
+echo [WARN] LibreOffice not found.
+where winget >nul 2>&1
+if errorlevel 1 (
+    echo        winget is not available either. Install manually:
+    echo        https://www.libreoffice.org/download/
+    goto :libreoffice_done
+)
+
+set /p LO_INSTALL="Install LibreOffice now with winget? [y/N]: "
+if /i not "!LO_INSTALL!"=="y" goto :libreoffice_done
+
+echo.
+echo Installing LibreOffice (about 350 MB download, please wait)...
+winget install --id TheDocumentFoundation.LibreOffice -e --accept-source-agreements --accept-package-agreements
+if errorlevel 1 (
+    echo [WARN] LibreOffice install failed. Install manually:
+    echo        https://www.libreoffice.org/download/
+) else (
+    echo [OK] LibreOffice installed. Reopen the terminal so PATH updates take effect.
+)
+
+:libreoffice_done
 
 echo.
 echo ============================================

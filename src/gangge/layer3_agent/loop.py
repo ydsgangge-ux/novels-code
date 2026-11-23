@@ -143,6 +143,53 @@ def describe_verification(tool: str, arguments: dict[str, Any] | None) -> str:
     return f"`{tool} {detail}`".replace(" `", " `").strip()
 
 
+def thinking_carryover_note(response: Any, max_chars: int = 1200) -> str:
+    """把"只思考、没行动"那一轮的 reasoning 压成一条可回传的笔记。
+
+    为什么需要它：reasoning 按协议不能回放（``openai_compat`` 只回传正文），
+    所以一轮"想了 8 万字、既没正文也没工具调用"的回复，在下一轮请求里就只剩
+    一条空的 assistant 消息。模型等于失忆，只能把同一段分析从头再推一遍——
+    实测连续三轮各 8 万字符，而且这部分的 token 照常计费。
+
+    这里取头部（任务复述）和尾部（收敛后的结论/下一步），中间标注省略。只在
+    **没有任何工具调用**的轮次使用：正常轮次的结论已经通过工具参数落账，再回放
+    一遍反而会让模型以为自己已经做过了。
+    """
+    blocks = getattr(response, "content", None) or []
+    raw = "\n".join(
+        block.text.strip()
+        for block in blocks
+        if getattr(block, "type", None) == ContentType.THINKING
+        and getattr(block, "text", "")
+    ).strip()
+    if not raw:
+        return ""
+
+    limit = max(200, int(max_chars or 1200))
+    if len(raw) > limit:
+        head_len = limit // 4
+        tail_len = limit - head_len
+        head = raw[:head_len].strip()
+        tail = raw[-tail_len:].strip()
+        omitted = len(raw) - len(head) - len(tail)
+        body = f"{head}\n…（中间省略 {omitted} 字符）…\n{tail}"
+    else:
+        body = raw
+
+    return (
+        "【上一轮你的分析笔记（只思考、未执行；过长已截断）】\n"
+        f"{body}\n"
+        "【这段分析已经在这里了，不要再从头推导；直接调用工具执行下一步。】"
+    )
+
+
+def _with_thinking_note(prompt: str, note: str) -> str:
+    """把分析笔记拼在指令前面；没有笔记时原样返回。"""
+    if not note:
+        return prompt
+    return f"{note}\n\n{prompt}"
+
+
 #: 从被截断的中段里"抢救"出来的行：报错、失败用例、编译器诊断。
 #: 只认明确的错误标记——``line 12`` 这种太泛，会把正常代码行也算进来。
 _ERROR_LINE_RE = re.compile(
@@ -229,6 +276,12 @@ class LoopConfig:
     # 单条工具输出保留的字符上限（可用 TOOL_RESULT_MAX_CHARS 覆盖）
     tool_result_max_chars: int = int(os.environ.get("TOOL_RESULT_MAX_CHARS", "6000") or 6000)
 
+    # ── 单个工具的执行上限 ──
+    # 工具自己超时是一回事，"工具卡住根本不返回"是另一回事（MCP 阻塞、
+    # 进程挂起、前台服务器）。外层兜底：到点就放弃并让 turn 收尾，
+    # 否则整个任务会一直显示"运行中"，用户只能关程序。
+    tool_timeout: float = float(os.environ.get("TOOL_TIMEOUT", "900") or 900)
+
     # ── Tool-call argument trimming ──
     # write_file 的正文跟随着 assistant 消息留在历史里，之后每次请求都会重发。
     # 文件已经落盘、工具结果也确认过，旧副本纯粹重复计费，read_file 可以取回。
@@ -236,6 +289,22 @@ class LoopConfig:
     tool_use_arg_max_chars: int = int(os.environ.get("TOOL_USE_ARG_MAX_CHARS", "2000") or 2000)
     # 最近几轮不动：模型可能正基于刚写的内容继续编辑
     tool_use_arg_keep_rounds: int = 2
+
+    # ── Idle round (thinking without action) ──
+    # reasoning 按协议不回传（见 openai_compat 的注释），所以"只想不做"的那一轮
+    # 在下一轮上下文里什么都不剩，模型会把同一段分析从头再推一遍。实测连续
+    # 三轮各 8 万字符，占了全部输出 token 的一半以上。
+    #
+    # 处理：把这一轮思考的"头部（任务复述）+ 尾部（结论/下一步）"压成一条
+    # user 消息注入，让下一轮基于它继续；同时限制连续空转次数，避免无限重想。
+    enable_thinking_carryover: bool = os.environ.get(
+        "THINKING_CARRYOVER", "1"
+    ).strip().lower() not in ("0", "false", "off", "no")
+    thinking_carryover_max_chars: int = int(
+        os.environ.get("THINKING_CARRYOVER_MAX_CHARS", "1200") or 1200
+    )
+    #: 连续多少轮"只思考、不调工具"后收尾（可在 .env 用 MAX_IDLE_ROUNDS 覆盖）。
+    max_idle_rounds: int = int(os.environ.get("MAX_IDLE_ROUNDS", "2") or 2)
 
     # ── Lazy project map: only inject full index on first round ──
     enable_lazy_project_map: bool = True
@@ -1874,7 +1943,7 @@ class AgenticLoop:
                 continue
 
             started = time.monotonic()
-            result = await self._invoke_tool(name, arguments, tool_call.id)
+            result = await self._invoke_tool_guarded(name, arguments, tool_call.id)
             elapsed_ms = int((time.monotonic() - started) * 1000)
 
             output = self._truncate_tool_output(result.output)
@@ -2012,6 +2081,77 @@ class AgenticLoop:
             return await self.tool_service.execute(name, arguments, call_id)
 
         return await self.tools.execute(name, arguments)
+
+    async def _invoke_tool_guarded(
+        self, name: str, arguments: dict[str, Any], call_id: str
+    ) -> ToolResult:
+        """工具级超时 + 取消感知。
+
+        以前 ``_invoke_tool`` 是裸 await：一个不返回的工具（前台起的服务器、
+        卡住的 MCP 调用）会让整个 turn 永远停在"运行中"，用户只能关程序，
+        而且关闭前什么都没入库。这里加一层上限，并在收到取消时主动回收
+        本会话的子进程——阻塞在 ``reader.join`` 的 bash 会因此立刻 EOF。
+        """
+        timeout = max(1.0, float(self.config.tool_timeout or 0))
+        task = asyncio.ensure_future(self._invoke_tool(name, arguments, call_id))
+        deadline = time.monotonic() + timeout
+
+        def _settle() -> ToolResult:
+            try:
+                return task.result()
+            except asyncio.CancelledError:
+                # 用户中断/外层取消必须继续往上抛。这里是 BaseException 的
+                # 第一个分支：吞掉 CancelledError 会把它变成一条普通的
+                # "[工具异常]"，循环继续跑，Ctrl+C 就失效了。
+                raise
+            except BaseException as exc:
+                return ToolResult(output=f"[工具异常] {name}: {exc}", is_error=True)
+
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.5)
+            if done:
+                return _settle()
+
+            cancelled = bool(self._cancel_check and self._cancel_check())
+            if not cancelled and time.monotonic() < deadline:
+                continue
+
+            # 回收子进程，让阻塞中的工具立刻拿到 EOF 返回。
+            self._reclaim_background_processes()
+            done, _ = await asyncio.wait({task}, timeout=3.0)
+            if done:
+                # 进程是我们刚杀掉的，工具本身只会返回 "(无输出) [exit 1]"。
+                # 不补一句说明，模型会以为命令写错了，换个写法再试一次。
+                settled = _settle()
+                reason = (
+                    f"[已取消] 工具 {name} 在执行中被用户取消，子进程已回收。"
+                    if cancelled
+                    else (
+                        f"[工具超时] {name} 超过 {int(timeout)} 秒未返回，子进程已回收。"
+                        "如果是服务器或常驻进程，请改成后台启动。"
+                    )
+                )
+                return ToolResult(
+                    output=f"{settled.output}\n{reason}".strip(), is_error=True
+                )
+
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+            if cancelled:
+                return ToolResult(
+                    output=f"[已取消] 工具 {name} 执行被用户中止", is_error=True
+                )
+            return ToolResult(
+                output=(
+                    f"[工具超时] {name} 超过 {int(timeout)} 秒没有返回，已放弃。\n"
+                    "如果是服务器或常驻进程，请改成后台启动；"
+                    "bash 会自动识别常见的服务命令（http.server / npm run dev / uvicorn 等）。"
+                ),
+                is_error=True,
+            )
 
     def _truncate_tool_output(self, output: str) -> str:
         """Cap long output, keeping the head, the tail, **and every error line**.
@@ -2275,7 +2415,7 @@ class AgenticLoop:
         self.tools.set_profile(profile)
         profile_desc = {
             "coding": "编程", "novel": "小说创作", "research": "研究搜索",
-            "media": "演示视频",
+            "media": "演示视频", "office": "文档处理",
         }.get(profile, profile)
         logger.info(f"[Loop] Agent profile: {profile} ({profile_desc})")
 
@@ -2359,6 +2499,8 @@ class AgenticLoop:
         any_tool_succeeded = False
         consecutive_readonly_rounds = 0  # Track rounds with only read tools
         stalled_rounds = 0  # Consecutive rounds without productive output
+        idle_rounds = 0  # 连续"只思考、不调工具"的轮数（有工具调用的轮次会清零）
+        truncation_warned = False  # 输出被 max_tokens 截断时只提醒一次
         file_registry = dict(self.config.file_registry)  # mutable copy
         reads_cache: dict[str, int] = {}  # path -> round_number for de-dup
         memory_bank_update = ""  # extracted from LLM's final response
@@ -2637,8 +2779,29 @@ class AgenticLoop:
             # 4. If no tool calls → check if done, then exit
             # Core principle: the model decides when to stop by not calling tools.
             has_tool_call = response.stop_reason == "tool_use" and response.tool_calls
+            if has_tool_call:
+                idle_rounds = 0
             if not has_tool_call:
                 text = response.text or ""
+                truncated = response.stop_reason == "max_tokens"
+                if truncated and not truncation_warned:
+                    truncation_warned = True
+                    limit = getattr(self.llm, "max_tokens", "") or "?"
+                    warning = (
+                        f"⚠️ 单次输出上限 {limit} 被推理用尽，回复在思考中途被截断"
+                        "（finish_reason=length）。正在从断点续写；频繁出现时把 "
+                        "MAX_TOKENS 调大，或用 LLM_REASONING_EFFORT=low 降低思考强度。"
+                    )
+                    logger.warning(warning)
+                    self.emitter.emit(EventType.WARNING, warning)
+                    await self._emit(ContentBlock(type=ContentType.TEXT, text=warning + "\n"))
+                # 只思考、没行动：reasoning 不回传，不落一条笔记的话下一轮等于
+                # 失忆，模型会把同一段分析从头再推一遍（实测 8 万字符 × 3 轮）。
+                idle_note = (
+                    thinking_carryover_note(response, self.config.thinking_carryover_max_chars)
+                    if self.config.enable_thinking_carryover
+                    else ""
+                )
 
                 # ── Check Todo state: if all tasks completed, exit immediately ──
                 todo_pending = todo_state.get_pending()
@@ -2656,6 +2819,7 @@ class AgenticLoop:
                 # again just repeats the same message one round later.
                 elif round_num <= 1 and not executions and not has_modified_files:
                     # Early rounds with no tool use — give a nudge
+                    idle_rounds += 1
                     self.emitter.emit(EventType.WARNING,
                                       f"第 {round_num+1} 轮未调用工具，正在引导")
                     await self._emit(ContentBlock(
@@ -2674,15 +2838,19 @@ class AgenticLoop:
                         )
                     messages.append(Message(
                         role=Role.USER,
-                        content=[ContentBlock(type=ContentType.TEXT, text=force_msg)],
+                        content=[ContentBlock(
+                            type=ContentType.TEXT,
+                            text=_with_thinking_note(force_msg, idle_note),
+                        )],
                     ))
                     continue
 
                 # ── Model answered with meaningful text — not a task, just a Q&A ──
                 # If the model produced a substantial response (>100 chars) without
                 # calling tools, it likely answered a question (like "解释一下").
-                # Don't force tool use — exit normally.
-                if not todo_state.get_all() and len(text) > 100:
+                # Don't force tool use — exit normally. 但被 max_tokens 截断的回复
+                # 不算"回答完了"：它可能正想到一半，必须继续而不是收尾。
+                if not todo_state.get_all() and len(text) > 100 and not truncated:
                     self._is_new_task = False
                     # 前置换行：模型最后一句常常不带换行，直接追加会粘成
                     # "🎉 任务完📋 已收到回答"，看起来像输出坏了。
@@ -2698,6 +2866,7 @@ class AgenticLoop:
                 # ── New task, no todos created yet — force model to plan ──
                 if self._is_new_task and not todo_state.get_all():
                     self._is_new_task = False  # prevent infinite nudging
+                    idle_rounds += 1
                     self.emitter.emit(EventType.WARNING,
                                       f"第 {round_num+1} 轮未调用工具，新任务需要先规划")
                     await self._emit(ContentBlock(
@@ -2710,11 +2879,43 @@ class AgenticLoop:
                     )
                     messages.append(Message(
                         role=Role.USER,
-                        content=[ContentBlock(type=ContentType.TEXT, text=force_msg)],
+                        content=[ContentBlock(
+                            type=ContentType.TEXT,
+                            text=_with_thinking_note(force_msg, idle_note),
+                        )],
                     ))
                     continue
 
                 if todo_pending:
+                    idle_rounds += 1
+                    # 连续空转有上限：再想下去只是把同一段分析重写一遍。
+                    # 保留未完成待办交给下一次"继续"，而不是假装做完了。
+                    if idle_rounds > max(1, int(self.config.max_idle_rounds)):
+                        self.emitter.emit(
+                            EventType.WARNING,
+                            f"连续 {idle_rounds} 轮只思考未调用工具，已收尾",
+                        )
+                        await self._emit(ContentBlock(
+                            type=ContentType.TEXT,
+                            text=(
+                                f"📋 连续 {idle_rounds} 轮只输出分析、未调用工具，"
+                                "已收尾并保留未完成项\n"
+                            ),
+                        ))
+                        detail = await self._emit_unfinished(
+                            "⚠️ 尚未完成（模型连续多轮未执行）："
+                        )
+                        return self._finalize(
+                            final_response=(
+                                "模型连续多轮只输出分析、没有调用工具，任务已收尾。"
+                                + (f"\n\n{detail}" if detail else "")
+                            ),
+                            executions=executions,
+                            rounds=round_num + 1,
+                            total_tokens=total_tokens,
+                            completion_reason="idle_no_action",
+                        )
+
                     next_todo = todo_state.get_current()
                     todo_hint = f" 当前待办: {next_todo['content']}" if next_todo else ""
                     self.emitter.emit(EventType.WARNING,
@@ -2723,10 +2924,20 @@ class AgenticLoop:
                         type=ContentType.TEXT,
                         text=f"⚠️ AI 未使用工具，仍有待办任务{todo_hint}\n",
                     ))
-                    force_msg = "请立即调用工具执行当前待办任务，不要只输出文字。"
+                    if truncated:
+                        force_msg = (
+                            "你上一条回复在推理中途触发输出上限被截断，没有产生工具调用。"
+                            "请从分析笔记的末尾接着想，不要从头重写；"
+                            "结论已经足够就立刻调用工具执行。"
+                        )
+                    else:
+                        force_msg = "请立即调用工具执行当前待办任务，不要只输出文字。"
                     messages.append(Message(
                         role=Role.USER,
-                        content=[ContentBlock(type=ContentType.TEXT, text=force_msg)],
+                        content=[ContentBlock(
+                            type=ContentType.TEXT,
+                            text=_with_thinking_note(force_msg, idle_note),
+                        )],
                     ))
                     continue
 

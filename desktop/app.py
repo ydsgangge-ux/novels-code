@@ -126,6 +126,15 @@ from git_panel import GitRepo, SourceControlPanel, confirm_security
 from pet import PetWindow
 
 # ── LLM Provider definitions ─────────────────────────────────────
+# 思考强度档位：default = 不发任何参数，沿用厂商默认（多数推理模型默认开着）。
+THINKING_LEVELS: tuple[tuple[str, str], ...] = (
+    ("default", "跟随厂商默认"),
+    ("off", "关闭思考"),
+    ("low", "低（省 token）"),
+    ("medium", "中（推荐）"),
+    ("high", "高（最慢最准）"),
+)
+
 PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
     "deepseek": {
         "label": "DeepSeek",
@@ -6899,6 +6908,11 @@ class GanggeDesktop(QMainWindow):
         self._thinking_mode_cb = QCheckBox("思考模式", self)
         self._thinking_mode_cb.hide()
 
+        self._thinking_level_combo = QComboBox(self)
+        for _lv, _lv_label in THINKING_LEVELS:
+            self._thinking_level_combo.addItem(_lv_label, _lv)
+        self._thinking_level_combo.hide()
+
         self._mm_enable_cb = QCheckBox("启用多模态模型", self)
         self._mm_enable_cb.hide()
 
@@ -7488,6 +7502,37 @@ class GanggeDesktop(QMainWindow):
         _thinking_mode.setToolTip("启用后使用推理模型（如 DeepSeek-R1 / OpenAI o1），响应更慢但推理更强")
         lf.addRow("", _thinking_mode)
 
+        _thinking_level = QComboBox()
+        for _lv, _lv_label in THINKING_LEVELS:
+            _thinking_level.addItem(_lv_label, _lv)
+        _lv_idx = _thinking_level.findData(self._thinking_level_combo.currentData())
+        _thinking_level.setCurrentIndex(max(0, _lv_idx))
+        _thinking_level.setToolTip("该档位只在支持思考参数的厂商/模型上生效，其余厂商直接忽略")
+        _think_note = QLabel("")
+        _think_note.setWordWrap(True)
+        _think_note.setStyleSheet("color:#8b949e;font-size:11px;")
+
+        def _refresh_think_note(*_args: Any) -> None:
+            """把"这一档在当前的厂商/模型上会发生什么"直接说清楚，别让人猜。"""
+            from gangge.layer5_llm.thinking import plan_thinking
+
+            _plan = plan_thinking(
+                self._provider_combo.currentData() or "",
+                _model.currentText().strip(),
+                _thinking_level.currentData(),
+                self._max_output_tokens(),
+            )
+            _think_note.setText(_plan.note or "")
+            _think_note.setStyleSheet(
+                f"color:{'#3fb950' if _plan.supported else '#d29922'};font-size:11px;"
+            )
+
+        _thinking_level.currentIndexChanged.connect(_refresh_think_note)
+        _model.currentTextChanged.connect(_refresh_think_note)
+        _refresh_think_note()
+        lf.addRow("思考强度", _thinking_level)
+        lf.addRow("", _think_note)
+
         form.addWidget(llm_g)
 
         # ── Multimodal LLM ──
@@ -7879,6 +7924,8 @@ class GanggeDesktop(QMainWindow):
             self._model_combo.setCurrentText(_model.currentText())
             self._base_url_input.setText(_base_url.text())
             self._thinking_mode_cb.setChecked(_thinking_mode.isChecked())
+            _lv_idx2 = self._thinking_level_combo.findData(_thinking_level.currentData())
+            self._thinking_level_combo.setCurrentIndex(max(0, _lv_idx2))
             self._mm_enable_cb.setChecked(_mm_enable.isChecked())
             self._mm_provider_combo.setCurrentIndex(_mm_provider.currentIndex())
             self._mm_api_key_input.setText(_mm_api_key.text())
@@ -8014,6 +8061,11 @@ class GanggeDesktop(QMainWindow):
         # ── Thinking mode ──
         if self._thinking_mode_cb.isChecked():
             updates["THINKING_MODE"] = "true"
+
+        # ── 思考强度 ──（写进 .env，CLI 那边也能读到同一份配置）
+        thinking_level = self._thinking_level()
+        updates["LLM_THINKING_LEVEL"] = thinking_level
+        os.environ["LLM_THINKING_LEVEL"] = thinking_level
 
         try:
             # Read existing .env
@@ -9630,6 +9682,9 @@ class GanggeDesktop(QMainWindow):
         if self._thinking_mode_cb.isChecked() and provider_key in ("openai", "deepseek"):
             temperature = 1.0  # reasoning models require temp=1
 
+        # 思考强度交给各适配器按厂商落地（thinking.py），这里只负责把档位传下去。
+        thinking_level = self._thinking_level()
+
         if provider_key == "anthropic":
             if not api_key:
                 api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -9637,11 +9692,11 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 请输入 Anthropic API Key")
                 return None
             from gangge.layer5_llm.anthropic import AnthropicLLM
-            return self._apply_llm_limits(AnthropicLLM(api_key=api_key, model=model, max_tokens=self._max_output_tokens(), temperature=temperature))
+            return self._apply_llm_limits(AnthropicLLM(api_key=api_key, model=model, max_tokens=self._max_output_tokens(), temperature=temperature, thinking_level=thinking_level))
         elif provider_key == "ollama":
             url = self._base_url_input.text().strip() or "http://localhost:11434/v1"
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return self._apply_llm_limits(OpenAICompatLLM(base_url=url, api_key="ollama", model=model, max_tokens=self._max_output_tokens(), temperature=temperature))
+            return self._apply_llm_limits(OpenAICompatLLM(base_url=url, api_key="ollama", model=model, max_tokens=self._max_output_tokens(), temperature=temperature, provider="ollama", thinking_level=thinking_level))
         elif provider_key == "custom":
             base_url = self._base_url_input.text().strip()
             if not base_url:
@@ -9651,7 +9706,7 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 自定义模式需要填写模型名称")
                 return None
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return self._apply_llm_limits(OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=self._max_output_tokens(), temperature=temperature))
+            return self._apply_llm_limits(OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=self._max_output_tokens(), temperature=temperature, provider=provider_key, thinking_level=thinking_level))
         else:
             api_key_env = cfg.get("api_key_env", "")
             if not api_key and api_key_env:
@@ -9665,7 +9720,7 @@ class GanggeDesktop(QMainWindow):
                 self._status_label.setText("⚠️ 请填写 Base URL")
                 return None
             from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-            return self._apply_llm_limits(OpenAICompatLLM(base_url=base_url, api_key=api_key, model=model, max_tokens=self._max_output_tokens(), temperature=temperature))
+            return self._apply_llm_limits(OpenAICompatLLM(base_url=base_url, api_key=api_key, model=model, max_tokens=self._max_output_tokens(), temperature=temperature, provider=provider_key, thinking_level=thinking_level))
 
     def _build_multimodal_llm(self) -> BaseLLM | None:
         """Build a separate multimodal LLM for image recognition tasks."""
@@ -9691,7 +9746,8 @@ class GanggeDesktop(QMainWindow):
         if not api_key and provider_key not in ("ollama",):
             return None
         from gangge.layer5_llm.openai_compat import OpenAICompatLLM
-        return OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=4096, temperature=0.0)
+        # 多模态只做识图：显式钉死 default，别把主模型的思考强度带进来。
+        return OpenAICompatLLM(base_url=base_url, api_key=api_key or "not-needed", model=model, max_tokens=4096, temperature=0.0, thinking_level="default")
 
     # ── Run / Batch / Cancel ──────────────────────────────────
     _NOVEL_TOOL_NAMES = frozenset([
@@ -10591,6 +10647,10 @@ class GanggeDesktop(QMainWindow):
         except (TypeError, ValueError):
             return 6000
 
+    def _thinking_level(self) -> str:
+        """当前思考强度档位（default/off/low/medium/high）。"""
+        return str(self._thinking_level_combo.currentData() or "default")
+
     def _apply_llm_limits(self, llm: BaseLLM) -> BaseLLM:
         """把设置页里的上下文窗口套到实例上（不覆盖 provider 默认值以外的东西）。"""
         try:
@@ -10635,6 +10695,7 @@ class GanggeDesktop(QMainWindow):
         self._settings.setValue("max_rounds", self._max_rounds_spin.value())
         self._settings.setValue("plan_mode", self._plan_mode_cb.isChecked())
         self._settings.setValue("thinking_mode", self._thinking_mode_cb.isChecked())
+        self._settings.setValue("thinking_level", self._thinking_level())
         self._settings.setValue("auto_allow", self._auto_allow_cb.isChecked())
         self._settings.setValue("auto_inject", self._auto_inject_cb.isChecked())
         self._settings.setValue("test_verify", self._test_verify_cb.isChecked())
@@ -10693,6 +10754,9 @@ class GanggeDesktop(QMainWindow):
         self._max_rounds_spin.setValue(int(self._settings.value("max_rounds", 30)))
         self._plan_mode_cb.setChecked(self._settings.value("plan_mode", "false") == "true")
         self._thinking_mode_cb.setChecked(self._settings.value("thinking_mode", "false") == "true")
+        _saved_level = str(self._settings.value("thinking_level", "default") or "default")
+        _saved_idx = self._thinking_level_combo.findData(_saved_level)
+        self._thinking_level_combo.setCurrentIndex(_saved_idx if _saved_idx >= 0 else 0)
         self._auto_allow_cb.setChecked(self._settings.value("auto_allow", "false") == "true")
         self._auto_inject_cb.setChecked(self._settings.value("auto_inject", "true") != "false")
         self._test_verify_cb.setChecked(self._settings.value("test_verify", "true") != "false")

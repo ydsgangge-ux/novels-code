@@ -1,0 +1,16 @@
+# Office 模式：工具面收敛到 docx / xlsx / pptx 的结构化读写与校验。
+#
+# 和 novel 一样，"运行模式"是组合，不是代码分支：这个文件加一个 patch
+# 就是一条新路，registry 里只有一行"office 为真才注册"。
+#
+# 解决的问题：通用 read_file 把 docx 当文本读，会把 zip 二进制当正文返回
+# （11KB 文件能吐出 4000+ 字符乱码，且 is_error=False）；write_file 写出的
+# .docx 是坏文件。这条路上换成 office_info / office_read / office_check。
+name: office
+description: 文档处理 —— docx / xlsx / pptx 结构化读取与校验
+bundles:
+  - base
+  - guardrails
+  - full-tools
+  - memory-bank
+patch: office.patch.yml

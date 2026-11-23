@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -44,6 +45,10 @@ class ContentBlock:
     #: True = 流式增量片段（只用于"实时思考"窗口）；
     #: False = 本次调用结束后的完整块（用于主界面的折叠卡片）。
     partial: bool = False
+    #: 只用于流式末帧：服务端返回的结束原因。``"length"`` 表示被 max_tokens
+    #: 截断——流式只有 ContentBlock 一种载体，不在这里带出来，调用方就只能把
+    #: "想到一半被截断"当成"模型自己说完了"，既丢上下文又白花 token。
+    stop_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"type": self.type.value}
@@ -197,12 +202,24 @@ class BaseLLM(ABC):
         model: str,
         max_tokens: int = 8192,
         temperature: float = 0.0,
+        thinking_level: str = "",
         **kwargs: Any,
     ):
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.kwargs = kwargs
+
+        # 思考强度：显式参数 > LLM_THINKING_LEVEL > 旧的 LLM_REASONING_EFFORT。
+        # 只做归一化，具体怎么落到请求参数由各适配器按厂商决定
+        # （见 layer5_llm/thinking.py），这里不假设任何厂商的字段名。
+        from gangge.layer5_llm.thinking import normalize_level
+
+        self.thinking_level = normalize_level(
+            thinking_level
+            or os.environ.get("LLM_THINKING_LEVEL", "")
+            or os.environ.get("LLM_REASONING_EFFORT", "")
+        )
 
     @property
     def max_context_tokens(self) -> int:
@@ -252,10 +269,14 @@ class BaseLLM(ABC):
         thinking_parts: list[str] = []
         tool_blocks: list[ContentBlock] = []
         usage: dict[str, int] = {}
+        reported_stop = ""
 
         async for delta in self.stream(messages, tools=tools, system=system):
             if delta.usage:
                 usage.update(delta.usage)
+            if delta.stop_reason:
+                # 末帧的 finish_reason（如被 max_tokens 截断）优先于推断值。
+                reported_stop = delta.stop_reason
             if delta.type == ContentType.TEXT:
                 if not delta.text:
                     continue
@@ -282,7 +303,7 @@ class BaseLLM(ABC):
 
         return LLMResponse(
             content=content,
-            stop_reason="tool_use" if tool_blocks else "end_turn",
+            stop_reason=reported_stop or ("tool_use" if tool_blocks else "end_turn"),
             usage=usage,
             model=self.model,
         )

@@ -247,5 +247,11 @@ def apply(ctx: Context, config: dict[str, Any]) -> None:
     if config.get("novel") is False:
         for tool_name in [t.name for t in registry.list_tools() if t.name.startswith("novel_")]:
             registry.unregister(tool_name)
+    if config.get("office") is False:
+        # 默认保持注册但隐藏（coding profile 里不可见，tool_search 可揭示）；
+        # 显式关掉时连注册都不要，tool_search 也就搜不到。
+        for tool_name in ("office_info", "office_read", "office_check",
+                          "office_recalc", "office_render"):
+            registry.unregister(tool_name)
 
     logger.info("[tools] %d tools registered", len(registry))
