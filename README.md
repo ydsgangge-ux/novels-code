@@ -7,6 +7,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-blue?logo=python" />
   <img src="https://img.shields.io/badge/license-MIT-green" />
+  <a href="https://github.com/ydsgangge-ux/novels-code/actions/workflows/ci.yml"><img src="https://github.com/ydsgangge-ux/novels-code/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/LLM-14%20providers%20%7C%20Ollama%20local-orange" />
 </p>
 
