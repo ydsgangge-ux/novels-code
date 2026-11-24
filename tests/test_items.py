@@ -1,6 +1,19 @@
+"""``app/`` 演示项目（FastAPI）的端到端用例。
+
+注意：fastapi / httpx 是这个演示项目自己的依赖，不是本仓库的依赖。CI 上没装
+时必须跳过——以前这里是裸 import，收集阶段直接抛 ModuleNotFoundError，pytest
+以 exit code 2 结束，整个测试会话里一个用例都不会跑（CI 只显示 "collection
+failure"，看不出真正坏在哪）。
+"""
+
 import pytest
-from httpx import AsyncClient, ASGITransport
-from app.main import app
+
+pytest.importorskip("fastapi", reason="app/ 是演示项目，fastapi 不在本仓库依赖里")
+pytest.importorskip("httpx", reason="app/ 的验收用例需要 httpx")
+
+from httpx import AsyncClient, ASGITransport  # noqa: E402
+
+from app.main import app  # noqa: E402
 
 
 @pytest.fixture
