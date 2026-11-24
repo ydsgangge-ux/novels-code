@@ -69,7 +69,39 @@ jobs:
         run: python -m ruff check src tests desktop
 
       - name: Test
-        run: python -m pytest -q --cov --cov-report=term-missing
+        run: python -m pytest -q --tb=short --cov --cov-report=term-missing --junitxml=pytest-report.xml
+
+      # pytest 的失败明细只写在日志里，而日志要登录才能看。把 JUnit XML 转成
+      # check-run annotations：失败会直接出现在 PR 的 Checks 面板，也能通过
+      # 公开的 /check-runs/*/annotations 接口读到——排查 CI 不用再靠猜。
+      - name: Annotate failures
+        if: failure()
+        shell: python
+        run: |
+          import os
+          import xml.etree.ElementTree as ET
+
+          report = "pytest-report.xml"
+          if not os.path.exists(report):
+              print("::error::pytest 没有产出 junit 报告，测试在收集阶段就挂了")
+              raise SystemExit(0)
+
+          rows = []
+          for case in ET.parse(report).iter("testcase"):
+              problems = list(case.findall("failure")) + list(case.findall("error"))
+              if not problems:
+                  continue
+              name = f"{case.get('classname', '')}::{case.get('name', '')}"
+              message = (problems[0].get("message") or "").strip().splitlines()
+              text = message[0][:300] if message else problems[0].get("type", "失败")
+              rows.append(f"- `{name}` — {text}")
+              print(f"::error title={case.get('name', 'pytest')}::{name} — {text}")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write(f"## 失败用例（{len(rows)}）\n\n")
+                  fh.write("\n".join(rows[:50]) + "\n")
 
       # Snapshots are generated on first run, so the suite can pass locally with
       # a stale (or missing) snapshot. CI must notice: a dirty snapshot dir means
