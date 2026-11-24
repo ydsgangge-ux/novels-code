@@ -205,6 +205,41 @@ def build_system_prompt(
     return "\n".join(parts)
 
 
+#: 问答（只读）模式的系统提示。
+#:
+#: 刻意不复用主线提示：主线第 1 条是"每次回复必须包含工具调用"，而问答路径
+#: 大多数问题根本不需要工具。带着那条规则，模型会硬造一个调用；如果请求里
+#: 又没有工具 schema，它就把调用写成正文里的 <tool_call>…，用户收到的是一坨
+#: XML（2026-11-23"没做解卦吗？为什么要摇8次？"连续三轮都是这样）。
+QA_SYSTEM_PROMPT = """你是 Novels Code，正在回答用户关于当前项目的提问。
+
+工作目录：`{workspace_path}`
+项目状态：{project_status}
+
+## 这一轮是提问，不是改造
+1. 不要修改或创建任何文件。确实需要改的话，先说清楚改哪里、为什么，等用户点头。
+2. 需要看代码或资料时，直接调用只读工具（read_file / grep / glob / list_dir /
+   everything_search / find_symbol / find_references / web_search / web_fetch），
+   读完再答。不要凭印象编造文件名、函数名或行为。
+3. 不需要工具就直接回答，不要写"我将调用…"然后停下；也不要在正文里输出
+   工具调用标签、XML 或 JSON 片段——这些不会被解析，只会原样显示给用户。
+4. 结论要落到具体文件与具体行为。不确定就说不确定，别猜。"""
+
+
+def build_qa_system_prompt(workspace_dir: str = "", project_context: str = "") -> str:
+    """构建问答模式的系统提示：只读、不催工具、不带"必须调用工具"的硬规则。"""
+    if not workspace_dir or detect_empty_workspace(workspace_dir):
+        project_status = "空目录，从零开始构建"
+    else:
+        project_status = f"已有项目，{count_project_files(workspace_dir)} 个文件"
+
+    prompt = QA_SYSTEM_PROMPT.replace("{workspace_path}", workspace_dir or ".")
+    prompt = prompt.replace("{project_status}", project_status)
+    if project_context:
+        prompt += f"\n\n## 项目信息\n\n{_clip_block(project_context, 2000)}"
+    return prompt
+
+
 #: 动态状态注入的字符预算。这些数字曾经是 200/200/300——progress.md 是代码
 #: 生成的结构化文本，前 200 字只够写到“### 已完成的文件”下的第一条，等于
 #: 每轮都告诉模型“改了 10 个文件”，却只让它看见其中 1 个。

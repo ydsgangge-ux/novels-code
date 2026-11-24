@@ -21,9 +21,14 @@ from typing import Any, AsyncIterator, Callable, Awaitable
 
 from gangge.layer3_agent.tools.registry import ToolRegistry
 from gangge.layer3_agent.tools.base import ToolResult
-from gangge.layer3_agent.prompts.system import build_system_prompt, build_dynamic_state_text, detect_empty_workspace
+from gangge.layer3_agent.prompts.system import (
+    build_system_prompt,
+    build_dynamic_state_text,
+    build_qa_system_prompt,
+    detect_empty_workspace,
+)
 from gangge.layer3_agent.progress_emitter import ProgressEmitter, EventType
-from gangge.runtime.intent import classify
+from gangge.runtime.intent import READ_ONLY_TOOLS, tool_policy
 from gangge.runtime.intent import last_user_text as _last_user_text
 from gangge.i18n import t
 from gangge.layer4_tools.mcp_client import MCPClientManager
@@ -227,6 +232,38 @@ def _error_lines(text: str, budget: int) -> str:
         out.append(line)
         used += len(line) + 1
     return "\n".join(out)
+
+
+#: 模型在"想调工具但没有工具"时会把这些标签写进正文。它们不是答案，
+#: 原样交给用户就是 2026-11-23 那三轮看到的一坨 XML。
+_PSEUDO_TOOL_CALL_MARKERS = (
+    "<tool_call>",
+    "</tool_call>",
+    "<function=",
+    "<parameter=",
+    '"tool_calls"',
+    '"tool_call"',
+)
+
+
+def looks_like_pseudo_tool_call(text: str) -> bool:
+    """正文里是不是伪装成答案的工具调用。"""
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _PSEUDO_TOOL_CALL_MARKERS)
+
+
+def usage_totals(usage: Any) -> dict[str, int]:
+    """把适配器的 usage 归一化成 ``{"input": …, "output": …}``。
+
+    适配器统一用 ``input_tokens/output_tokens``（和 Anthropic 一致），而
+    ``LoopResult.total_tokens`` 与桌面端读的是 ``input/output``。问答路径以前
+    直接把原始 dict 塞进去，界面就一直显示"输入=0, 输出=0"。
+    """
+    data = usage if isinstance(usage, dict) else {}
+    return {
+        "input": int(data.get("input", data.get("input_tokens", 0)) or 0),
+        "output": int(data.get("output", data.get("output_tokens", 0)) or 0),
+    }
 
 
 @dataclass
@@ -845,6 +882,17 @@ class AgenticLoop:
         ):
             defs.extend(self.mcp_manager.build_tool_definitions())
         return defs
+
+    def _build_qa_system_prompt(self) -> str:
+        """问答模式的系统提示：只读、不催工具。
+
+        刻意不用主线提示——那条写着"每次回复必须包含工具调用"，在只读场景里
+        会把模型逼出伪工具调用（正文里的 ``<tool_call>``）。
+        """
+        return build_qa_system_prompt(
+            workspace_dir=self.config.workspace_dir,
+            project_context=self.config.project_context or "",
+        )
 
     def _build_static_system_prompt(self) -> str:
         """Build static system prompt — called once, byte-identical across rounds.
@@ -2419,36 +2467,70 @@ class AgenticLoop:
         }.get(profile, profile)
         logger.info(f"[Loop] Agent profile: {profile} ({profile_desc})")
 
-        # ── Quick Q&A pre-check: skip tool loop for pure explanation questions ──
+        # ── Quick Q&A pre-check: skip the write loop for explanation questions ──
         # 判定统一走 gangge.runtime.intent：loop 与 stop_guard 共用一份词表，
         # 否则"创建一个 HTML"会在两条路径上得到相反结论（这里算任务、护栏算闲聊）。
+        #
+        # 注意这里给的是**只读**工具面，不是空列表。以前的 tools=[] 让模型看不见
+        # 任何文件，而系统提示仍要求"每次回复必须包含工具调用"，于是它把调用写成
+        # 正文里的 <tool_call>…，用户收到的是一坨 XML，整轮 0 次工具调用结束。
         last_user_text = _last_user_text(messages)
-        if classify(last_user_text) == "answer":
+        qa_seed_tokens: dict[str, int] = {"input": 0, "output": 0}
+        # 从问答路径掉回工具循环时，这仍然是个提问——别拿"新任务要先用
+        # TodoWrite 制定计划"去催它（用户只是问了一句为什么）。
+        qa_fallback = False
+        if tool_policy(last_user_text) == "read_only":
             await self._emit(ContentBlock(
                 type=ContentType.TEXT,
-                text="📋 检测到问答请求，直接回答\n",
+                text="📋 检测到问答请求，先查再答\n",
             ))
             qa_step = self._begin_step(0, len(messages), 0)
+            # 直接按名字从 registry 取，不套 profile 过滤：问答里"联网查一下"
+            # 是刚需（版本差异、平台行为都在项目之外），而只读集合本身没有
+            # 破坏性，不该因为当前 profile 是 novel/coding 就被挡掉。
+            qa_tools = [
+                qa_tool.to_definition()
+                for name in READ_ONLY_TOOLS
+                if (qa_tool := self.tools.get(name)) is not None
+            ]
             response = await self._chat(
                 messages=messages,
-                tools=[],
-                system=self._build_static_system_prompt(),
+                tools=qa_tools,
+                system=self._build_qa_system_prompt(),
             )
-            # Show the answer. Without this the Q&A path returned text the host
-            # was expected to print itself — which the desktop UI never did, so
-            # "解释一下…" asked and then appeared to hang.
-            if not self._last_streamed:
-                for block in response.content:
-                    if block.type in (ContentType.TEXT, ContentType.THINKING):
-                        await self._emit(block)
-            self._end_step(qa_step, response=response)
-            return self._finalize(
-                final_response=response.text or "",
-                executions=[],
-                rounds=1,
-                total_tokens=response.usage,
-                completion_reason="single_turn_answer",
-            )
+            answer_text = (response.text or "").strip()
+            if not answer_text or looks_like_pseudo_tool_call(answer_text):
+                # 兜底：没答出来，或者答的是伪装成正文的工具调用。别把这种东西
+                # 交给用户，也别赌第二次——直接转回正常工具循环。
+                qa_seed_tokens = usage_totals(response.usage)
+                qa_fallback = True
+                self._end_step(qa_step, response=response)
+                logger.warning(
+                    "[Loop] Q&A path produced no usable answer (empty=%s, pseudo_call=%s); "
+                    "falling back to the tool loop",
+                    not answer_text,
+                    bool(answer_text),
+                )
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="↩️ 这个问题需要看代码，改用工具模式继续\n",
+                ))
+            else:
+                # Show the answer. Without this the Q&A path returned text the host
+                # was expected to print itself — which the desktop UI never did, so
+                # "解释一下…" asked and then appeared to hang.
+                if not self._last_streamed:
+                    for block in response.content:
+                        if block.type in (ContentType.TEXT, ContentType.THINKING):
+                            await self._emit(block)
+                self._end_step(qa_step, response=response)
+                return self._finalize(
+                    final_response=answer_text,
+                    executions=[],
+                    rounds=1,
+                    total_tokens=usage_totals(response.usage),
+                    completion_reason="single_turn_answer",
+                )
 
         # ── Build static system prompt (once, byte-identical for caching) ──
         # All dynamic state is injected as user messages per round
@@ -2468,7 +2550,9 @@ class AgenticLoop:
         self._last_verification_note = ""
         if not _should_keep_todos:
             todo_state.clear()
-            self._is_new_task = True  # new task: don't exit until model creates at least one todo
+            # new task: don't exit until model creates at least one todo。
+            # 但"问答掉回来的"不算新任务——它只是问了一句，催它建 todo 很奇怪。
+            self._is_new_task = not qa_fallback
 
         # ── Load Memory Bank from .gangge/ files ──
         self._ensure_memory_bank()
@@ -2491,7 +2575,8 @@ class AgenticLoop:
         tool_defs = self._get_all_tool_defs(phase=self.tools.get_current_phase())
         is_empty_dir = detect_empty_workspace(self.config.workspace_dir)
         executions: list[ToolExecution] = []
-        total_tokens: dict[str, int] = {"input": 0, "output": 0}
+        # 问答路径先花掉的那次请求也算数（它没答成，但 token 是真花了）。
+        total_tokens: dict[str, int] = dict(qa_seed_tokens)
         # 最近一次请求的输入 token 数 ≈ 当前上下文占用。压缩阈值必须看它，
         # 不能看 total_tokens（那是全程累计值，只会单调上涨）。
         last_request_tokens = 0
@@ -2817,7 +2902,12 @@ class AgenticLoop:
                 # succeeded": if the model's only call was denied or failed, it
                 # already knows and has decided to stop and report. Nudging it
                 # again just repeats the same message one round later.
-                elif round_num <= 1 and not executions and not has_modified_files:
+                elif (
+                    round_num <= 1
+                    and not executions
+                    and not has_modified_files
+                    and not qa_fallback  # 问答掉回来的：它本来就该直接回答
+                ):
                     # Early rounds with no tool use — give a nudge
                     idle_rounds += 1
                     self.emitter.emit(EventType.WARNING,

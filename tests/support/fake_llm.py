@@ -74,6 +74,10 @@ class ScriptedLLM(BaseLLM):
         self.requests: list[list[Message]] = []
         self.stream_calls = 0
         self.chat_calls = 0
+        # What the loop actually exposed per request — the Q&A path is only
+        # correct if it offers read-only tools instead of nothing.
+        self.tool_requests: list[list[str]] = []
+        self.systems: list[str] = []
 
     # -- helpers -----------------------------------------------
 
@@ -115,6 +119,8 @@ class ScriptedLLM(BaseLLM):
     ) -> LLMResponse:
         self.chat_calls += 1
         self.requests.append(list(messages))
+        self.tool_requests.append([t.name for t in (tools or [])])
+        self.systems.append(system)
         turn = self._next()
         return LLMResponse(
             content=self._blocks(turn),
@@ -131,6 +137,8 @@ class ScriptedLLM(BaseLLM):
     ) -> AsyncIterator[ContentBlock]:
         self.stream_calls += 1
         self.requests.append(list(messages))
+        self.tool_requests.append([t.name for t in (tools or [])])
+        self.systems.append(system)
         turn = self._next()
 
         if turn.thinking:

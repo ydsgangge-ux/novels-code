@@ -96,3 +96,39 @@ def classify(text: str) -> str:
 def wants_change(text: str) -> bool:
     """便捷包装：这条消息是否要求改动工作区。"""
     return classify(text) == "change"
+
+
+#: 问答路径允许带上的只读工具：能看、能查、能上网，改不了东西。
+#:
+#: 刻意包含 ``web_search`` / ``web_fetch``：很多"为什么/怎么回事"的答案在
+#: 项目之外（版本差异、平台行为），不给联网就只能猜。也包含 ``tool_search``，
+#: 让它能自己找到没在核心集里的只读工具。
+READ_ONLY_TOOLS: tuple[str, ...] = (
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "everything_search",
+    "find_symbol",
+    "find_references",
+    "tool_search",
+    "web_search",
+    "web_fetch",
+    "recall_conversation",
+    "chat_log",
+)
+
+
+def tool_policy(text: str) -> str:
+    """这一轮该给模型什么工具面：``"all"`` 还是 ``"read_only"``。
+
+    和 :func:`classify` 分开是有意的。``classify`` 的结论还被 stop_guard 拿去
+    判断"要不要催模型动手"，那里的误判代价是"少催一次"；这里的决定是
+    "给不给手"，误判的代价是整轮断线——模型看不见文件，只能把工具调用写成
+    正文里的 ``<tool_call>``（2026-11-23 的"没做解卦吗？为什么要摇8次？"
+    就是这么死的）。两种代价差一个数量级，不该共用同一个结论。
+
+    只读集合不是零成本（仍要带 schema），但它把"判错"从断线降级成多看两个
+    文件；这是有意选择的偏保守方向。
+    """
+    return "read_only" if classify(text) == "answer" else "all"
