@@ -31,6 +31,13 @@ jobs:
     name: test (${{ matrix.os }} / py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    # Windows runner 的默认区域是 en-US，子进程的 stdout 编码是 cp1252：
+    # 测试里 `python -c "print('只读')"` 这种委派替身会直接 UnicodeEncodeError，
+    # 于是 qoder 委派用例在 CI 上"失败"、在本机通过。整个仓库都是 UTF-8，
+    # 就让解释器也按 UTF-8 跑。
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +71,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,office,gui]"
+          # 技能预览的"内存不足就别拉 Chromium"那两条用例，只有在装了 WebEngine
+          # 时才会走到被测分支；不装就会命中"没装 WebEngine"的早退，测了个寂寞。
+          python -m pip install PyQt6-WebEngine
 
       - name: Lint
         run: python -m ruff check src tests desktop
