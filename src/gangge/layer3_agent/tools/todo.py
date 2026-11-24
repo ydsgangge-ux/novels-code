@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from gangge.layer3_agent.tools.base import BaseTool, ToolResult
@@ -24,20 +25,52 @@ logger = logging.getLogger(__name__)
 # ── Global todo state (shared across tool instance and loop) ──
 
 class TodoState:
-    """Singleton-like state holder for the current todo list.
+    """State holder for the current todo list.
 
     The loop reads from this every round to inject into the system prompt.
     The model writes to this via the TodoWrite tool.
-    The runtime auto-advances state when tools succeed — model doesn't need to update manually.
+
+    ``storage_path`` is optional. When given, every mutation is mirrored to disk
+    so the list survives a restart — and, more importantly, survives the
+    next-request loop rebuild that used to reset it to empty.
     """
 
-    def __init__(self):
+    def __init__(self, storage_path: str | Path | None = None):
         self._todos: list[dict] = []
+        self._storage = Path(storage_path) if storage_path else None
         # Each todo: {"id": str, "content": str, "status": "pending"|"in_progress"|"completed", "priority": "high"|"medium"|"low"}
+        if self._storage is not None:
+            self._load()
+
+    # ── persistence ──
+    def _load(self) -> None:
+        try:
+            if not self._storage or not self._storage.is_file():
+                return
+            data = json.loads(self._storage.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                self._todos = [t for t in data if isinstance(t, dict)]
+        except Exception:  # noqa: BLE001 - a corrupt file must not block a turn
+            logger.debug("[Todo] 读取清单失败: %s", self._storage, exc_info=True)
+
+    def _save(self) -> None:
+        if not self._storage:
+            return
+        try:
+            self._storage.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._storage.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(self._todos, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self._storage)
+        except Exception:  # noqa: BLE001 - read-only workspace, locked file…
+            logger.debug("[Todo] 写入清单失败: %s", self._storage, exc_info=True)
 
     def update(self, todos: list[dict]) -> None:
         """Replace the entire todo list (Claude Code style — no partial updates)."""
         self._todos = todos
+        self._save()
 
     def get_all(self) -> list[dict]:
         """Return current todo list."""
@@ -106,6 +139,7 @@ class TodoState:
     def clear(self) -> None:
         """Clear all todos."""
         self._todos = []
+        self._save()
 
     def mark_all_done(self) -> None:
         """Mark every remaining non-completed todo as completed.
@@ -116,6 +150,7 @@ class TodoState:
         for t in self._todos:
             if t.get("status") != "completed":
                 t["status"] = "completed"
+        self._save()
 
 
 # Module-level singleton — fallback for callers with no running loop.
@@ -123,12 +158,42 @@ _global_state = TodoState()
 
 #: 当前任务正在维护的清单。
 #:
-#: loop 现在是**每个实例一份** TodoState（否则取消后还在收尾的旧 worker，
-#: 会被新任务一启动就 clear 掉它正在维护的清单）。但界面仍然是按 500ms
-#: 轮询读取的：如果它还读上面的模块级单例，就会出现"工具写 A、界面读 B"，
-#: 右侧任务窗口永远是空的。所以由 loop 在构造时把这份 state 发布出来，
-#: 界面读"最新发布的那一份"。
+#: 界面是按 500ms 轮询读取的：如果它读上面的模块级单例，就会出现"工具写 A、
+#: 界面读 B"，右侧任务窗口永远是空的。所以由 loop 在构造时把这份 state
+#: 发布出来，界面读"最新发布的那一份"。
 _active_state: TodoState | None = None
+
+#: 按工作目录复用的清单。
+#:
+#: 宿主（desktop）每发一条消息都会新建一个 loop。以前 list 的生命周期绑在
+#: loop 上，于是用户说"继续"时新 loop 拿到的是空清单：界面被清空，注入给
+#: 模型的也是空字符串 —— 模型完全看不见自己上一轮规划过什么，只能从头
+#: 重新摸索。这里改成"同一工作目录共用一份"，并落盘到 .gangge/todos.json。
+_states_by_workspace: dict[str, TodoState] = {}
+
+
+def _workspace_key(workspace: str | Path | None) -> str | None:
+    if not workspace:
+        return None
+    try:
+        return str(Path(workspace).resolve())
+    except Exception:  # noqa: BLE001
+        return str(workspace)
+
+
+def get_state_for(workspace: str | Path | None) -> TodoState:
+    """同工作目录共用一份清单（跨消息、跨"继续"、跨重启）。
+
+    没有 workspace 时退回模块级单例，保持原有行为。
+    """
+    key = _workspace_key(workspace)
+    if key is None:
+        return _global_state
+    state = _states_by_workspace.get(key)
+    if state is None:
+        state = TodoState(storage_path=Path(key) / ".gangge" / "todos.json")
+        _states_by_workspace[key] = state
+    return state
 
 
 def get_todo_state() -> TodoState:

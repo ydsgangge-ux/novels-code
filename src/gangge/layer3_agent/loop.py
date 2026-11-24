@@ -507,6 +507,7 @@ class AgenticLoop:
         tool_service: Any | None = None,
         context: Any | None = None,
         llm_factory: Any | None = None,
+        todo_state: Any | None = None,
     ):
         self.llm = llm
         # Optional request gateway (``runtime.llm``). When present every model
@@ -535,13 +536,12 @@ class AgenticLoop:
         self.mcp_manager: MCPClientManager | None = None
         self._init_mcp()
         self._profile: str = ""  # set by run()
-        # ── Per-loop todo state ──
-        # 以前是模块级单例：取消只是请求，旧 worker 还会跑一段，而新任务一启动
-        # 就 clear() 掉它正在维护的清单，两个 worker 互相踩。每个 loop 一份，
-        # TodoWrite 工具绑定到同一份。
+        # ── Todo state ──
+        # 宿主可以传进来一份（desktop 按工作目录复用，见 todo.get_state_for），
+        # 这样"继续"时清单还在；不传则本 loop 自建一份，保持原有隔离语义。
         from gangge.layer3_agent.tools.todo import TodoState, publish_active_state
 
-        self.todo_state = TodoState()
+        self.todo_state = todo_state if todo_state is not None else TodoState()
         for _tool in getattr(self.tools, "_tools", {}).values():
             if getattr(_tool, "name", "") == "TodoWrite":
                 _tool._state = self.todo_state
@@ -2538,8 +2538,12 @@ class AgenticLoop:
 
         # ── Clear stale todo state ──
         todo_state = self.todo_state
-        # Clear previous task's todos unless user explicitly says "继续"
+        # 用户说"继续"意味着接着上次没做完的活干，所以清单一律保留。
         _should_keep_todos = "继续" in last_user_text or "continue" in last_user_text.lower()
+        # 但清单已经全做完时，"继续"指的是新需求：留着它会让本轮开头就命中
+        # "所有任务已完成，自动退出"，用户一句话就被弹回来。
+        if _should_keep_todos and not todo_state.get_pending():
+            _should_keep_todos = False
         self._is_new_task = False  # set below
         # 新任务：本任务的验证结论从零开始，但上一任务的结论要留一句话——
         # 它往往是"这个仓库里某条测试是坏的"这类跨任务仍然成立的事实。

@@ -1432,6 +1432,10 @@ class GanggeWorker(QThread):
                 pass
 
         # ── 3. Create loop ──
+        # 每条消息都会新建 loop。任务清单必须按工作目录复用：否则用户说"继续"
+        # 时新 loop 拿到空清单，界面被清空、注入给模型的也是空字符串。
+        from gangge.layer3_agent.tools.todo import get_state_for
+
         loop = AgenticLoop(
             llm=self.llm,
             tools=registry,
@@ -1441,6 +1445,7 @@ class GanggeWorker(QThread):
             tool_service=tool_service,
             context=self._pipeline_ctx,
             llm_factory=llm_factory,
+            todo_state=get_state_for(self.workspace),
         )
 
         # Streaming callback
