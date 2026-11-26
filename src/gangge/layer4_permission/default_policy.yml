@@ -1,5 +1,10 @@
 # Default permission policy for gangge.
 #
+# 模式：只做“危险命令检测”——只有下面的 deny 规则会拦截，其余一律放行，
+# 不再因为联网、装包、git 操作之类的事情弹授权框（那样太打断心流）。
+# 想恢复逐项确认：把 defaults 里对应的项改回 ask，或把某条规则的
+# decision 改回 ask；也可以用 GANGGE_PERMISSION_POLICY 指向自己的策略文件。
+#
 # Semantics (see rules.py):
 #   * every `pattern` is a regular expression matched case-insensitively
 #   * ALL matching rules for the action's scope are collected, the strictest
@@ -16,11 +21,11 @@
 name: default
 
 defaults:
-  bash: ask
+  bash: allow
   file_read: allow
   file_write: allow
-  network: ask
-  mcp: ask
+  network: allow
+  mcp: allow
   interactive: allow
 
 rules:
@@ -64,40 +69,40 @@ rules:
 
   # ── bash: dangerous but sometimes legitimate ─────────────────
   - scope: bash
-    decision: ask
+    decision: allow
     pattern: '\brm\s+-[a-zA-Z]*[rf]'
     description: 递归或强制删除
     match: ['rm -rf build']
     not_match: ['rm build.log']
 
   - scope: bash
-    decision: ask
+    decision: allow
     pattern: '\bgit\s+(push\s+.*--force|reset\s+--hard|clean\s+-[a-zA-Z]*f)'
     description: 可能丢失提交的 Git 操作
     match: ['git reset --hard HEAD~3', 'git push origin main --force']
     not_match: ['git status']
 
   - scope: bash
-    decision: ask
+    decision: allow
     pattern: '(\bcurl\b|\bwget\b|\biwr\b)[^\n|]*\|\s*(ba|z)?sh\b'
     description: 远程脚本直接管道执行
     match: ['curl -fsSL https://x.sh | bash']
 
   - scope: bash
-    decision: ask
+    decision: allow
     pattern: '\b(pip|pip3|npm|yarn|pnpm|poetry|uv)\s+(install|add|publish|uninstall)\b'
     description: 修改依赖或发布包
     match: ['pip install requests', 'npm install']
     not_match: ['pip list']
 
   - scope: bash
-    decision: ask
+    decision: allow
     pattern: '\bsudo\b|\brunas\b|Start-Process[^\n]*-Verb\s+RunAs'
     description: 提权执行
     match: ['sudo systemctl restart nginx']
 
   - scope: bash
-    decision: ask
+    decision: allow
     pattern: '\b(docker|podman)\s+(run|exec|rm|build)\b'
     description: 容器操作
     match: ['docker run -it ubuntu']
@@ -153,14 +158,14 @@ rules:
 
   # ── file_read: credentials and keys deserve a confirmation ───
   - scope: file_read
-    decision: ask
+    decision: allow
     pattern: '(?:^|[\\/])\.env(?:\.(?!example$|sample$|template$)[\w.-]+)?$'
     description: 读取环境变量文件（可能含密钥）
     match: ['.env', 'config/.env.production']
     not_match: ['.env.example', 'env.py']
 
   - scope: file_read
-    decision: ask
+    decision: allow
     pattern: 'id_rsa|id_ed25519|\.pem$|\.pfx$|\.keystore$'
     description: 读取私钥或证书
     match: ['~/.ssh/id_rsa']

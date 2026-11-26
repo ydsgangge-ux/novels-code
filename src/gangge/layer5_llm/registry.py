@@ -29,6 +29,47 @@ def _load_env() -> None:
         pass
 
 
+#: provider → (模型名所在的环境变量, 未配置时的默认模型)。
+#: 必须和 :func:`create_llm` 里各分支保持一致。
+_MODEL_ENV: dict[str, tuple[str, str]] = {
+    "anthropic": ("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+    "openai": ("OPENAI_MODEL", "gpt-4o"),
+    "deepseek": ("DEEPSEEK_MODEL", "deepseek-chat"),
+    "ollama": ("OLLAMA_MODEL", "llama3.1"),
+    "qwen": ("QWEN_MODEL", "qwen-max"),
+    "zhipu": ("ZHIPU_MODEL", "glm-4-plus"),
+    "moonshot": ("MOONSHOT_MODEL", "moonshot-v1-auto"),
+    "baichuan": ("BAICHUAN_MODEL", "Baichuan4"),
+    "yi": ("YI_MODEL", "yi-large"),
+    "minimax": ("MINIMAX_MODEL", "MiniMax-Text-01"),
+    "stepfun": ("STEPFUN_MODEL", "step-2-16k"),
+    "siliconflow": ("SILICONFLOW_MODEL", "deepseek-ai/DeepSeek-V3"),
+    "mimo": ("MIMO_MODEL", "mimo-v2.5-pro"),
+    "custom": ("CUSTOM_MODEL", ""),
+}
+
+
+def current_provider() -> str:
+    """当前生效的 provider（已读 .env，已套用 anthropic 兜底）。"""
+    _load_env()
+    return (_env("LLM_PROVIDER") or "anthropic").lower()
+
+
+def resolve_model(provider: str | None = None) -> str:
+    """当前 provider 用哪个模型 —— **不构造客户端**。
+
+    ``create_llm()`` 会在 :class:`AsyncOpenAI` 里建一个 httpx/SSL 连接池，
+    实测 ~220ms；Web 设置面板只是为了显示一行模型名，不该按请求付这笔钱。
+    """
+    _load_env()
+    provider = (provider or current_provider()).lower()
+    entry = _MODEL_ENV.get(provider)
+    if entry is None:
+        return ""
+    env_key, fallback = entry
+    return _env(env_key) or fallback
+
+
 def create_llm(provider: str | None = None) -> BaseLLM:
     """Create an LLM instance based on configuration.
 

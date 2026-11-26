@@ -95,18 +95,22 @@ def _print_info(text: str):
 def _print_summary(result: LoopResult, provider: str = "", model: str = ""):
     inp = result.total_tokens.get("input", 0)
     out = result.total_tokens.get("output", 0)
+    # 命中缓存的那部分要单独算钱：缓存价通常只有正价的 1/10 ~ 1/50，
+    # 不传下去就只能整段按正价估，费用会高估一个量级。
+    cached = int(result.total_tokens.get("cached", 0) or 0)
     cost = ""
     if provider:
         try:
             from gangge.pricing import estimate_cost
-            cost = estimate_cost(provider, model or "", inp, out)
+            cost = estimate_cost(provider, model or "", inp, out, cached)
         except Exception:
             pass
     cost_part = f"  费用: {cost}" if cost else ""
+    cache_part = f"（缓存命中 {cached}）" if cached else ""
     console.print(
         f"\n[dim]完成: {result.total_rounds} 轮, "
         f"{len(result.tool_executions)} 次工具调用, "
-        f"Token: {inp} → {out}{cost_part}[/dim]"
+        f"Token: {inp}{cache_part} → {out}{cost_part}[/dim]"
     )
 
 

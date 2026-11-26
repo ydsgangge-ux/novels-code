@@ -117,10 +117,12 @@ class RepeatGuard:
         logger.info("[repeat] same error %s seen %d times", fingerprint, count)
         return (
             f"\n\n⚠ 同一个错误已经出现 {count} 次（{fingerprint}）。"
-            "继续用同样的方式重试不会有不同结果。请从下面选一个动作：\n"
-            "1. 完整读一遍报错涉及的函数/文件，别只看报错那一行；\n"
-            "2. 换一种修复思路（改调用方而不是被调用方，或反过来）；\n"
-            "3. 用 ask_user 说明卡在哪里，请用户给一个方向。"
+            "继续用同样的方式重试不会有不同结果。按下面顺序判断：\n"
+            "1. 先分清是「代码错了」还是「验证方式不对」——"
+            "没有 pytest 用例时 `no tests ran` 不是代码错误，脚本式自测直接 "
+            "`python <文件>` 跑；\n"
+            "2. 别再反复重写测试文件或重复同一条命令，改看报错涉及的函数；\n"
+            "3. 仍无进展就用 ask_user 说明卡在哪，请用户给方向。"
         )
 
     @staticmethod

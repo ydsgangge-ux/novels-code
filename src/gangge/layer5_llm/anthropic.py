@@ -127,13 +127,25 @@ class AnthropicLLM(BaseLLM):
         if stop_reason == "stop_sequence":
             stop_reason = "end_turn"
 
+        # Anthropic 的口径与 OpenAI 不同：input_tokens **不含**缓存读写，
+        # 两者是分开计费的字段。这里归一化成"总输入 + 其中命中缓存多少"，
+        # 让上层的费用计算只认一套口径。
+        raw_usage = raw.usage
+        cache_read = int(getattr(raw_usage, "cache_read_input_tokens", 0) or 0)
+        cache_write = int(getattr(raw_usage, "cache_creation_input_tokens", 0) or 0)
+        usage = {
+            "input_tokens": int(raw_usage.input_tokens or 0) + cache_read + cache_write,
+            "output_tokens": raw_usage.output_tokens,
+        }
+        if cache_read:
+            usage["cached_input_tokens"] = cache_read
+        if cache_write:
+            usage["cache_write_input_tokens"] = cache_write
+
         return LLMResponse(
             content=blocks,
             stop_reason=stop_reason,
-            usage={
-                "input_tokens": raw.usage.input_tokens,
-                "output_tokens": raw.usage.output_tokens,
-            },
+            usage=usage,
             model=raw.model,
         )
 

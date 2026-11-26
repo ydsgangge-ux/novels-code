@@ -45,6 +45,9 @@ class ContentBlock:
     #: True = 流式增量片段（只用于"实时思考"窗口）；
     #: False = 本次调用结束后的完整块（用于主界面的折叠卡片）。
     partial: bool = False
+    #: 仅用于 UI 的 TOOL_RESULT 事件：这次工具调用花了多久。
+    #: 宿主需要一个"这一步是不是卡了 3 分钟"的数字，否则只能干等。
+    elapsed_ms: int = 0
     #: 只用于流式末帧：服务端返回的结束原因。``"length"`` 表示被 max_tokens
     #: 截断——流式只有 ContentBlock 一种载体，不在这里带出来，调用方就只能把
     #: "想到一半被截断"当成"模型自己说完了"，既丢上下文又白花 token。

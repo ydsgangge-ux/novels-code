@@ -39,14 +39,14 @@ inject = Inject()
 
 # tool → advice for the next move. Deliberately short: one line, imperative.
 HINTS: dict[str, str] = {
-    "read_file": "要修改就用 edit_file；要看去哪用 grep 找相关引用。",
+    "read_file": "要修改就用 edit_file；大文件用 offset/limit 分段读，别整份重读。",
     "grep": "用 read_file 打开命中的文件，再决定改哪一处。",
     "glob": "用 read_file 打开关键文件，不要只列文件。",
     "list_dir": "用 read_file 打开关键文件，不要停在列目录。",
     "find_symbol": "用 read_file 看定义，用 find_references 找调用方。",
     "find_references": "用 read_file 逐个确认调用方，再决定改哪处。",
-    "write_file": "如果是代码，用 bash 或 lint_check 验证能跑。",
-    "edit_file": "改完用 bash 或 lint_check 验证，再继续下一步。",
+    "write_file": "写完用 run_tests 验证；对应 TodoWrite 标完成。",
+    "edit_file": "改完用 run_tests 验证，再继续下一步。",
     "TodoWrite": "",
     "chat_log": "",
     "ask_user": "",

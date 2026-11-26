@@ -685,7 +685,7 @@ def create_tool_registry(
     try:
         from gangge.layer3_agent.tools.browser_debug import BrowserDebugTool, _BROWSER_AVAILABLE as _BD_AVAIL
         if _BD_AVAIL:
-            registry.register(BrowserDebugTool())
+            registry.register(BrowserDebugTool(workspace=workspace or ""))
             logger.info("[Registry] Browser debug tool activated — 前端验证闭环")
         else:
             logger.debug("[Registry] Playwright not installed — browser_debug skipped")

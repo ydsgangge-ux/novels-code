@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -215,6 +216,43 @@ _SYMBOL_RE = re.compile(
     re.MULTILINE,
 )
 
+#: progress.md 里“已完成的文件”条目：  - [x] `main.py` [write_file, 第9轮]
+_PROGRESS_FILE_RE = re.compile(r"^- \[x\] `([^`]+)`")
+
+
+def read_progress_files(progress_file: Path, workspace: Path) -> dict[str, dict]:
+    """从已有 progress.md 读回“已完成的文件”。
+
+    桌面端每次任务都用磁盘重建 file_registry，上一轮写过的文件因此丢掉
+    ``last_action``：于是“继续”时“上次的产出”是空的，progress.md 的
+    “已完成的文件”也只剩本轮动过的文件。继续的任务要把这份产出接回来。
+    """
+    try:
+        text = progress_file.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    found: dict[str, dict] = {}
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("### "):
+            in_section = "已完成的文件" in line
+            continue
+        if not in_section:
+            continue
+        match = _PROGRESS_FILE_RE.match(line)
+        if not match:
+            continue
+        rel = match.group(1)
+        if not (workspace / rel).is_file():
+            continue
+        round_match = re.search(r"第(\d+)轮", line)
+        found[rel] = {
+            "last_action": "write_file",
+            "round": int(round_match.group(1)) if round_match else "?",
+        }
+    return found
+
 
 def _error_lines(text: str, budget: int) -> str:
     """挑出报错行，最多占 ``budget`` 个字符。"""
@@ -252,6 +290,29 @@ def looks_like_pseudo_tool_call(text: str) -> bool:
     return any(marker in lowered for marker in _PSEUDO_TOOL_CALL_MARKERS)
 
 
+CONTINUE_KEYWORDS = ("继续", "接着做", "继续做", "continue", "go on", "keep going")
+
+
+def is_continue_text(text: str) -> bool:
+    """用户这句话是不是在说“继续”。GUI 和 loop 共用同一套判定。"""
+    lowered = (text or "").lower()
+    return any(kw in lowered for kw in CONTINUE_KEYWORDS)
+
+
+def _retry_after_seconds(exc: Exception) -> int | None:
+    """从 429 响应头里取 ``Retry-After``（秒）；拿不到就返回 None。"""
+    try:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) or {}
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        if raw is None:
+            return None
+        # 可能是秒数，也可能是 HTTP 日期；日期形式交给退避表处理
+        return max(1, min(300, int(float(str(raw).strip()))))
+    except Exception:
+        return None
+
+
 def usage_totals(usage: Any) -> dict[str, int]:
     """把适配器的 usage 归一化成 ``{"input": …, "output": …}``。
 
@@ -260,10 +321,17 @@ def usage_totals(usage: Any) -> dict[str, int]:
     直接把原始 dict 塞进去，界面就一直显示"输入=0, 输出=0"。
     """
     data = usage if isinstance(usage, dict) else {}
-    return {
+    out = {
         "input": int(data.get("input", data.get("input_tokens", 0)) or 0),
         "output": int(data.get("output", data.get("output_tokens", 0)) or 0),
     }
+    # 其中命中缓存的部分。有它才能按缓存价（便宜 10~50 倍）算费用，
+    # 不然整段按正价算，成本会高估一个量级。只在真有命中时带这个键，
+    # 免得没缓存的 provider 平白多出一个恒为 0 的字段。
+    cached = int(data.get("cached", data.get("cached_input_tokens", 0)) or 0)
+    if cached:
+        out["cached"] = cached
+    return out
 
 
 @dataclass
@@ -552,9 +620,15 @@ class AgenticLoop:
         self._last_streamed: int = 0  # chars already shown to the UI by streaming
         # 最近一次验证结果：滑窗/压缩会把它从历史里裁掉，所以每轮重新注入
         self._last_verification_note: str = ""
+        #: (path, offset, limit) → (mtime, round)。同一段被反复读时直接
+        #: 返回"未变化"，而不是把同样的内容再塞进上下文。
+        self._recent_reads: dict[tuple[str, int, int], tuple[float, int]] = {}
         # 上一个任务留下的验证结论。以前新任务直接把它清空，于是"上一次跑
         # 测试挂了"这件事跨任务就消失了，模型换个任务继续踩同一个坑。
         self._carryover_verification_note: str = ""
+        #: 最近一次验证的一行结论（``run_tests 未通过：1 failed ...``），
+        #: 写进 progress.md 的"验证状态"。进度百分比看不出质量，这一行能。
+        self._last_validation: str = ""
 
     def set_stream_callback(self, callback: StreamCallback) -> None:
         """Set callback for streaming content blocks."""
@@ -686,6 +760,60 @@ class AgenticLoop:
                 except Exception as e:
                     logger.warning(f"[Memory Bank] 写入 decisions.md 失败: {e}")
 
+    @staticmethod
+    def _validation_summary(executions: list["ToolExecution"]) -> str:
+        """把最近一次验证结果压成一行，写进 progress.md。
+
+        以前 progress 只报“85%”，但那一项恰恰是失败的；进度不等于质量。
+        """
+        for ex in reversed(executions):
+            # bash 里跑的 pytest/编译也算验证：模型经常不用 run_tests 而是直接
+            # 拼 bash 命令，只看工具名会让“验证状态”一行永远写不出来。
+            is_verify = ex.tool_name in ("run_tests", "lint_check")
+            if not is_verify and ex.tool_name == "bash":
+                is_verify = is_verification_command(
+                    str((ex.input or {}).get("command") or "")
+                )
+            if not is_verify:
+                continue
+            text = (ex.output or "").strip()
+            line = ""
+            for raw in text.splitlines():
+                candidate = raw.strip()
+                if candidate and any(
+                    kw in candidate
+                    for kw in ("FAILED", "通过", "失败", "没有收集到", "failed", "passed")
+                ):
+                    line = candidate
+                    break
+            if not line:
+                line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+            verdict = "未通过" if ex.is_error else "通过"
+            return f"{ex.tool_name} {verdict}：{line[:120]}"
+        return ""
+
+    def _patch_progress_validation(self, validation: str) -> None:
+        """只更新 progress.md 里的“验证状态”一行，不动其他内容。"""
+        if not self.config.workspace_dir:
+            return
+        path = Path(self.config.workspace_dir) / ".gangge" / "progress.md"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        lines = [ln for ln in lines if not ln.startswith("验证状态:")]
+        insert_at = 1
+        for i, ln in enumerate(lines):
+            if ln.startswith("最后更新:"):
+                insert_at = i + 1
+                break
+        lines.insert(insert_at, f"验证状态: {validation}")
+        try:
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.config.memory_bank_progress = "\n".join(lines)
+        except OSError:
+            logger.debug("[Memory Bank] 写入验证状态失败", exc_info=True)
+
     def _current_todos(self) -> list[dict]:
         """当前任务清单（由 TodoWrite 维护）。取不到时返回空列表。"""
         try:
@@ -734,7 +862,11 @@ class AgenticLoop:
             p for p, info in file_registry.items()
             if info.get("last_action") in ("write_file", "edit_file")
         )
+        validation = getattr(self, "_last_validation", "")
         if not written_files:
+            # 没有新文件也要落验证状态：测试通常在最后一次写盘之后才跑。
+            if validation:
+                self._patch_progress_validation(validation)
             return
 
         total = len(written_files)
@@ -751,6 +883,10 @@ class AgenticLoop:
             progress_line,
             f"已修改文件数: {total}",
             f"最后更新: 第 {round_num + 1} 轮",
+        ]
+        if validation:
+            lines.append(f"验证状态: {validation}")
+        lines += [
             "",
             "### 已完成的文件",
         ]
@@ -825,11 +961,22 @@ class AgenticLoop:
         try:
             from gangge.layer3_agent.tools.bash import cleanup_tracked_processes
 
-            count = cleanup_tracked_processes()
+            # 只回收本任务起的子进程：另一个任务（另一个标签/另一个 loop）
+            # 正在用的 dev server 不能被这次收尾顺手杀掉。
+            count = cleanup_tracked_processes(self.config.workspace_dir)
             if count:
                 logger.warning("[Loop] 任务结束，已回收 %d 个残留子进程", count)
         except Exception:
             logger.debug("[Loop] 回收子进程失败", exc_info=True)
+
+        # 浏览器同理：一个 workspace 一个实例，收尾时放掉自己那个，
+        # 别把别的标签正在验证的页面一起关了。
+        try:
+            from gangge.layer3_agent.tools.browser_debug import _BrowserSession
+
+            _BrowserSession.close_instance(self.config.workspace_dir)
+        except Exception:
+            logger.debug("[Loop] 关闭浏览器会话失败", exc_info=True)
 
     async def _sleep_unless_cancelled(self, seconds: float, slice_seconds: float = 0.5) -> bool:
         """Sleep in slices, returning True as soon as a cancel is requested.
@@ -1104,6 +1251,61 @@ class AgenticLoop:
                 return True
             start = idx + 1
 
+    def _repeated_read_note(
+        self, name: str, arguments: dict[str, Any], round_num: int
+    ) -> str:
+        """拦下"同一段代码连着读好几轮"。
+
+        实测里这类空转很常见：连着 4 轮读 400 行附近、4 轮读 175 行、4 轮读
+        20 行，内容一个字没变，却每轮都整段进上下文，最后 stalled 收尾。
+
+        被拦时**不刷新**记录，所以间隔会自然变大：连读第 4 次就放行了。这样
+        既压掉空转，又不会把"确实需要重看"的路彻底堵死。
+        """
+        if name != "read_file":
+            return ""
+        path = str(arguments.get("path") or "")
+        if not path:
+            return ""
+
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            return ""
+
+        key = (path, int(arguments.get("offset") or 0), int(arguments.get("limit") or 0))
+        previous = self._recent_reads.get(key)
+        if previous is None:
+            return ""
+
+        prev_mtime, prev_round, prev_output = previous
+        if prev_mtime != mtime or round_num - prev_round > 2:
+            return ""
+
+        snippet = (prev_output or "").strip()
+        if len(snippet) > 1500:
+            snippet = snippet[:1500] + "\n…(更早的内容已截断)"
+        return (
+            f"[未执行] 与第 {prev_round + 1} 轮的调用完全相同：`{path}` 这一段已经读过，"
+            f"文件此后没有改动。直接复用上次的结果，省下一次读取和一份重复上下文：\n"
+            f"---\n{snippet}\n---\n"
+            f"需要看别的区间请换 offset/limit；否则请基于上面的内容动手修改。"
+        )
+
+    def _remember_read(
+        self, arguments: dict[str, Any], round_num: int, output: str
+    ) -> None:
+        """记下这次读取，供 ``_repeated_read_note`` 判断"刚读过、没变"。"""
+        path = str(arguments.get("path") or "")
+        if not path:
+            return
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            return
+        key = (path, int(arguments.get("offset") or 0), int(arguments.get("limit") or 0))
+        self._recent_reads[key] = (mtime, round_num, output)
+
     def _deduplicate_reads(
         self, messages: list[Message], reads_cache: dict[str, int], current_round: int
     ) -> list[Message]:
@@ -1331,6 +1533,38 @@ class AgenticLoop:
             ):
                 boundaries.append(i)
         return boundaries
+
+    @staticmethod
+    def compact_history_for_continue(messages: list[Message]) -> list[Message]:
+        """“继续”用的极简历史：任务锚点 + 最后一段纯文本结论。
+
+        保留原始工具输出会让模型重新消化旧过程（实测第二次“继续”第一轮
+        就撞满 32768 输出上限）。真正的续接信息——待办、已改文件——由
+        ``_build_dynamic_state_text`` 和 file_registry 另外注入。
+        """
+        if not messages:
+            return messages
+        compact: list[Message] = []
+        if messages[0].role == Role.USER:
+            compact.append(messages[0])
+        last_text = ""
+        for msg in reversed(messages):
+            if msg.role != Role.ASSISTANT:
+                continue
+            if any(b.type == ContentType.TOOL_USE for b in msg.content):
+                continue
+            text = (msg.get_text() or "").strip()
+            if text:
+                last_text = text
+                break
+        if last_text:
+            if not last_text.startswith("[上次结论]"):
+                last_text = f"[上次结论]\n{last_text[:1500]}"
+            compact.append(Message(
+                role=Role.ASSISTANT,
+                content=[ContentBlock(type=ContentType.TEXT, text=last_text)],
+            ))
+        return compact
 
     def _trim_history(self, messages: list[Message]) -> list[Message]:
         """Sliding window: keep only recent N rounds, discard older messages.
@@ -1990,9 +2224,23 @@ class AgenticLoop:
                 ))
                 continue
 
-            started = time.monotonic()
-            result = await self._invoke_tool_guarded(name, arguments, tool_call.id)
-            elapsed_ms = int((time.monotonic() - started) * 1000)
+            repeated_read = self._repeated_read_note(name, arguments, round_num)
+            if repeated_read:
+                result = ToolResult(output=repeated_read)
+                elapsed_ms = 0
+            else:
+                # 把本任务写过的文件告诉 run_tests，让它只跑受影响的测试。
+                # 工具本身拿不到 file_registry，这一层注入比让模型自己猜可靠。
+                if name == "run_tests":
+                    run_tests_tool = self.tools.get("run_tests")
+                    if run_tests_tool is not None:
+                        run_tests_tool.changed_files = [
+                            str(p) for p, info in file_registry.items()
+                            if info.get("last_action") in ("write_file", "edit_file")
+                        ]
+                started = time.monotonic()
+                result = await self._invoke_tool_guarded(name, arguments, tool_call.id)
+                elapsed_ms = int((time.monotonic() - started) * 1000)
 
             output = self._truncate_tool_output(result.output)
 
@@ -2036,6 +2284,13 @@ class AgenticLoop:
                 permission=permission.decision.value,
                 metadata=result.metadata,
             ))
+            # 验证结果一落地就记进 progress.md：跑测试的轮次通常不写文件，
+            # 只在写盘时保存的话，"未通过"这一行永远等不到下一次保存。
+            if self._is_verification_call(name, arguments):
+                validation = self._validation_summary(executions)
+                if validation:
+                    self._last_validation = validation
+                    self._patch_progress_validation(validation)
             self.emitter.emit_tool_end(name, not result.is_error, elapsed_ms)
 
             # Productive = something changed on disk, a command ran, or the work was
@@ -2057,6 +2312,16 @@ class AgenticLoop:
                     type=ContentType.TEXT,
                     text=f"  ✗ {self._display_tool_name(name)}: {result.output[:100]}...\n",
                 ))
+                # 结构化结果：宿主用它画工具卡（参数 / 完整输出 / 耗时 / 报错）。
+                # 上面那行纯文本只够在终端里扫一眼，网页端需要可折叠的完整信息。
+                await self._emit(ContentBlock(
+                    type=ContentType.TOOL_RESULT,
+                    tool_call_id=tool_call.id,
+                    tool_name=name,
+                    text=output,
+                    is_error=True,
+                    elapsed_ms=elapsed_ms,
+                ))
                 continue
 
             any_tool_succeeded = True
@@ -2076,10 +2341,19 @@ class AgenticLoop:
                 path = arguments.get("path", "")
                 if path and path not in reads_cache:
                     reads_cache[path] = round_num + 1
+                self._remember_read(arguments, round_num, output)
 
             await self._emit(ContentBlock(
                 type=ContentType.TEXT,
                 text=f"  ✓ {self._display_tool_name(name)}: {result.output[:100]}...\n",
+            ))
+            await self._emit(ContentBlock(
+                type=ContentType.TOOL_RESULT,
+                tool_call_id=tool_call.id,
+                tool_name=name,
+                text=output,
+                is_error=False,
+                elapsed_ms=elapsed_ms,
             ))
 
         return _ToolRound(
@@ -2245,6 +2519,10 @@ class AgenticLoop:
             if lint_note:
                 # 自动检查失败 = 最近一次验证未通过，用它覆盖上一条"已通过"
                 self._last_verification_note = f"❌ 写入 {path} 后自动检查未通过\n{lint_note[:800]}"
+            elif self._last_verification_note.startswith(f"❌ 写入 {path}"):
+                # 同一个文件后来改好了。留着旧失败会让收尾报告说"验证未通过"，
+                # 而下一轮"继续"时模型会拿着这个过期前提去修一个已经不存在的错误。
+                self._last_verification_note = ""
             try:
                 source = Path(path)
                 classes: list[str] = []
@@ -2316,8 +2594,8 @@ class AgenticLoop:
         * **read-only grace** — files are done and the model has spent three
           rounds only reading; it is reviewing, not working.
         * **stall guard** — something was delivered but nothing productive
-          happened for four rounds (typically a self-imposed todo the
-          environment cannot satisfy, like "run the tests" with no bash).
+          happened for four rounds (eight when todos are still pending, since
+          reading one's own output is legitimate self-checking).
         * **todos complete** — the model's own plan says it is finished, even if
           it keeps calling tools.
 
@@ -2372,8 +2650,18 @@ class AgenticLoop:
             stalled_rounds = 0
         else:
             stalled_rounds += 1
-            if stalled_rounds >= 4 and has_modified_files:
-                pending = self.todo_state.get_pending()
+            pending_now = self.todo_state.get_pending()
+            # 有待办时，读文件多为"写完之后自查"，不该按摸鱼处理：2026-11-25
+            # 那次任务刚读完自己写的三个文件就被判 4 轮无进展收尾，用户被迫
+            # 连说三次"继续"。这里把阈值放宽到 8，并在第 4 轮先提醒一次。
+            stall_limit = 8 if pending_now else 4
+            if pending_now and stalled_rounds == 4:
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="⚠️ 只读操作不算进展；还有待办未完成，请直接用 write_file/edit_file 落地改动\n",
+                ))
+            if stalled_rounds >= stall_limit and has_modified_files:
+                pending = pending_now
                 if pending:
                     # 不要替用户把待办涂成完成：界面上写着"未完成"，内部状态却是
                     # 6/6，下一次"继续"时模型读到的是"都做完了"，真正的收尾就被跳过了。
@@ -2552,6 +2840,7 @@ class AgenticLoop:
                 "（上一任务）" + self._last_verification_note.strip()
             )
         self._last_verification_note = ""
+        self._last_validation = ""
         if not _should_keep_todos:
             todo_state.clear()
             # new task: don't exit until model creates at least one todo。
@@ -2590,6 +2879,7 @@ class AgenticLoop:
         stalled_rounds = 0  # Consecutive rounds without productive output
         idle_rounds = 0  # 连续"只思考、不调工具"的轮数（有工具调用的轮次会清零）
         truncation_warned = False  # 输出被 max_tokens 截断时只提醒一次
+        truncation_streak = 0  # 连续被截断的轮数（成功一轮即清零）
         file_registry = dict(self.config.file_registry)  # mutable copy
         reads_cache: dict[str, int] = {}  # path -> round_number for de-dup
         memory_bank_update = ""  # extracted from LLM's final response
@@ -2599,12 +2889,28 @@ class AgenticLoop:
         for msg in reversed(messages):
             if msg.role == Role.USER:
                 last_user_text = msg.get_text().strip().lower()
-                continue_keywords = ["继续", "接着做", "继续做", "continue", "go on", "keep going"]
+                continue_keywords = list(CONTINUE_KEYWORDS)
                 is_continue = any(kw in last_user_text for kw in continue_keywords)
                 break
 
         if is_continue:
-            # Build dynamic state for continue context
+            # “继续”先给产出、再给状态：产物（写过哪些文件、验证过没有）
+            # 比处理过程更能说明“做到哪了”。工具调用/结果和中间正文全部丢掉，
+            # 只保留任务锚点和最后一段结论。
+            # 桌面端每次运行都会重建 registry，这里把上一轮的产出接回来，
+            # 否则“上次的产出”和 progress.md 的“已完成的文件”都会残缺。
+            workspace = Path(self.config.workspace_dir or ".")
+            for rel, prev in read_progress_files(
+                workspace / ".gangge" / "progress.md", workspace
+            ).items():
+                info = file_registry.get(rel)
+                # 初次扫描会把已有文件标成 last_action="existing"，不能直接
+                # setdefault —— 那样仍然会被“已完成的文件”过滤掉。
+                if not info or info.get("last_action") not in ("write_file", "edit_file"):
+                    merged = dict(info or {})
+                    merged.update(prev)
+                    file_registry[rel] = merged
+            messages[:] = self.compact_history_for_continue(messages)
             continue_state = self._build_dynamic_state_text(round_num=0)
             file_list_summary = ""
             if file_registry:
@@ -2614,18 +2920,19 @@ class AgenticLoop:
                 )
                 if modified:
                     file_list_summary = (
-                        f"\n\n### 已修改的文件（不需要再读取验证）\n"
+                        "### 上次的产出（已写入，不需要再读）\n"
                         + "\n".join(f"- `{p}`" for p in modified)
-                        + "\n"
+                        + "\n\n"
                     )
             inject_text = (
-                "\n\n[系统提示] 用户说'继续'，这意味着上次任务未完成。"
-                "请直接从上次中断的地方继续执行。"
-                "绝对不要从头 read_file 所有源文件来'了解项目'！"
-                "绝对不要读取 .gangge/changelog.md 或 .gangge/progress.md——进度信息已经直接提供在下面了！"
-                f"\n\n{continue_state}"
+                "\n\n[系统提示] 用户说'继续'，上次任务尚未完成。"
+                "下面是「产出」和「当前状态」，先看产出，再从中断的地方接着做。"
+                "不要从头 read_file 整个项目；"
+                "不要读取 .gangge/changelog.md 或 .gangge/progress.md——状态已经在这里了。"
+                "\n\n"
                 f"{file_list_summary}"
-                "\n\n请立刻继续执行下一步，不要再读取任何已完成的文件。"
+                f"{continue_state}"
+                "\n\n请立刻继续执行下一步，已经完成的文件不要再读。"
             )
             messages.append(Message(
                 role=Role.USER,
@@ -2634,7 +2941,13 @@ class AgenticLoop:
 
         cancelled_at_round: int | None = None
 
-        for round_num in range(self.config.max_tool_rounds):
+        # 用 while 而不是 for range：限流重试不该吃掉工具轮次。
+        # 之前 429 重试走 continue，range 照样前进一格 —— 实测三次会话 60 轮里
+        # 17 轮是纯重试（第三段 17 轮中 8 轮），真正能干活的被压掉一半。
+        budget = self.config.max_tool_rounds
+        round_num = -1
+        while round_num + 1 < budget:
+            round_num += 1
             logger.info(f"Agentic loop round {round_num + 1}")
 
             # ── Emit round indicator ──
@@ -2654,7 +2967,7 @@ class AgenticLoop:
                 break
 
             # ── Approaching max rounds: inject urgency hint ──
-            remaining = self.config.max_tool_rounds - round_num
+            remaining = budget - round_num
             if remaining <= 2:
                 await self._emit(ContentBlock(
                     type=ContentType.TEXT,
@@ -2787,12 +3100,18 @@ class AgenticLoop:
                     # Count consecutive failures to cap retries
                     consecutive_failures = getattr(self, "_llm_failures", 0) + 1
                     self._llm_failures = consecutive_failures
-                    max_retries = 3
+                    # 429 大多是按分钟计的 token 配额，5/15/30 三档经常还在同一个
+                    # 限流窗口里，第三次必然失败，整单任务就废了。放宽到 5 次、
+                    # 退避拉到 2 分钟，并优先采用服务端给的 Retry-After。
+                    max_retries = 5
+                    backoff_ladder = [5, 15, 30, 60, 120]
                     if consecutive_failures <= max_retries:
-                        backoff = [5, 15, 30][consecutive_failures - 1]
+                        base = _retry_after_seconds(e) or backoff_ladder[consecutive_failures - 1]
+                        # 加 ±20% 抖动，避免多个并发任务卡在同一秒同时重试
+                        backoff = max(1, int(base * random.uniform(0.8, 1.2)))
                         await self._emit(ContentBlock(
                             type=ContentType.TEXT,
-                            text=f"⏳ API 限流，{backoff} 秒后自动重试（第 {consecutive_failures}/{max_retries} 次）...\n",
+                            text=f"⏳ API 限流/服务繁忙，{backoff} 秒后自动重试（第 {consecutive_failures}/{max_retries} 次）...\n",
                         ))
                         if await self._sleep_unless_cancelled(backoff):
                             cancelled_at_round = round_num
@@ -2801,6 +3120,10 @@ class AgenticLoop:
                                 text="\n⏹ 任务已取消（限流等待中）\n",
                             ))
                             break
+                        # 这一轮是重试，不是工作：补回预算并回退编号。
+                        # 不回退的话，用户看到的"第 11 轮"其实什么都没做。
+                        budget += 1
+                        round_num -= 1
                         continue  # retry this round
                     else:
                         error_text = f"LLM 调用失败（已重试 {max_retries} 次仍限流）: {e}"
@@ -2824,8 +3147,11 @@ class AgenticLoop:
                 )
 
             # Track token usage
-            total_tokens["input"] += response.usage.get("input_tokens", 0)
-            total_tokens["output"] += response.usage.get("output_tokens", 0)
+            total_tokens["input"] = total_tokens.get("input", 0) + response.usage.get("input_tokens", 0)
+            total_tokens["output"] = total_tokens.get("output", 0) + response.usage.get("output_tokens", 0)
+            cached_now = int(response.usage.get("cached_input_tokens", 0) or 0)
+            if cached_now:
+                total_tokens["cached"] = total_tokens.get("cached", 0) + cached_now
             # 这一轮的 input_tokens 才是"当前上下文有多大"，压缩阈值用它。
             last_request_tokens = response.usage.get("input_tokens", 0)
 
@@ -2873,6 +3199,22 @@ class AgenticLoop:
             if not has_tool_call:
                 text = response.text or ""
                 truncated = response.stop_reason == "max_tokens"
+                truncation_streak = truncation_streak + 1 if truncated else 0
+                if truncated and truncation_streak >= 2:
+                    # 连续两轮都被思考吃光输出：自动降思考强度，否则下一轮
+                    # 大概率继续截断（实测同一任务连撞三次，白等几分钟）。
+                    if getattr(self.llm, "thinking_level", "") not in (
+                        "", "minimal", "low", "none",
+                    ):
+                        try:
+                            self.llm.thinking_level = "low"
+                            note = "🔧 已连续两次输出被截断，自动把思考强度降到 low"
+                            logger.warning(note)
+                            await self._emit(ContentBlock(
+                                type=ContentType.TEXT, text=note + "\n",
+                            ))
+                        except Exception:
+                            pass
                 if truncated and not truncation_warned:
                     truncation_warned = True
                     limit = getattr(self.llm, "max_tokens", "") or "?"

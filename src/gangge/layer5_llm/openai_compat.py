@@ -278,6 +278,13 @@ class OpenAICompatLLM(BaseLLM):
                 "input_tokens": raw.usage.prompt_tokens or 0,
                 "output_tokens": raw.usage.completion_tokens or 0,
             }
+            # 缓存命中量。OpenAI / DeepSeek 都放在 prompt_tokens_details.cached_tokens，
+            # 且它是 prompt_tokens 的**一部分**（不是额外量）。
+            # 不带出去的话只能整段按正价算 —— 而缓存价便宜 10~50 倍，成本会被高估一个量级。
+            details = getattr(raw.usage, "prompt_tokens_details", None)
+            cached = getattr(details, "cached_tokens", 0) if details else 0
+            if cached:
+                usage["cached_input_tokens"] = int(cached)
 
         return LLMResponse(
             content=blocks,

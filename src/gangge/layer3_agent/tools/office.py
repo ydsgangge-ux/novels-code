@@ -50,6 +50,7 @@ from gangge.layer3_agent.tools.base import BaseTool, ToolResult
 logger = logging.getLogger(__name__)
 
 #: 扩展名 → 格式族。.xlsm 与 .xlsx 的读取路径相同（宏内容不解析）。
+#: .pdf 单独一族：用 PyMuPDF 抽文字层，不需要 LibreOffice。
 _KIND_BY_EXT = {
     ".docx": "docx",
     ".docm": "docx",
@@ -57,6 +58,7 @@ _KIND_BY_EXT = {
     ".xlsm": "xlsx",
     ".pptx": "pptx",
     ".pptm": "pptx",
+    ".pdf": "pdf",
 }
 
 #: 旧二进制格式：没有对应解析库，直接说清楚怎么转。
@@ -181,7 +183,7 @@ def _kind_of(path: Path) -> tuple[str | None, str | None]:
         return None, _LEGACY_HINT[ext]
     return None, (
         f"不支持的文件类型 {ext or '(无扩展名)'}。"
-        "本工具只处理 .docx / .xlsx / .pptx（含 .docm/.xlsm/.pptm）。"
+        "本工具只处理 .docx / .xlsx / .pptx / .pdf（含 .docm/.xlsm/.pptm）。"
     )
 
 
@@ -191,6 +193,7 @@ def _dep_missing(kind: str) -> str | None:
         "docx": ("docx", "python-docx"),
         "xlsx": ("openpyxl", "openpyxl"),
         "pptx": ("pptx", "python-pptx"),
+        "pdf": ("fitz", "pymupdf"),
     }[kind]
     try:
         __import__(module)
@@ -842,6 +845,9 @@ def _lint_office(kind: str, path: Path) -> tuple[list[dict[str, Any]], str | Non
         return _lint_docx(path)
     if kind == "xlsx":
         return _lint_xlsx(path)
+    if kind == "pdf":
+        # PDF 是最终产物，没有可改的"源码"，排版检查无从谈起
+        return [], "PDF 没有可校验的源结构（它是成品），要核对内容请用 office_read(pages=...)。"
     return _lint_pptx(path)
 
 
@@ -863,8 +869,8 @@ class _OfficeToolBase(BaseTool):
 
     @property
     def tags(self) -> tuple[str, ...]:
-        return ("office", "docx", "xlsx", "pptx", "word", "excel", "ppt",
-                "文档", "表格", "幻灯片", "工作簿")
+        return ("office", "docx", "xlsx", "pptx", "pdf", "word", "excel", "ppt",
+                "文档", "表格", "幻灯片", "工作簿", "PDF")
 
 
 class OfficeInfoTool(_OfficeToolBase):
@@ -908,8 +914,10 @@ class OfficeInfoTool(_OfficeToolBase):
                 body = self._info_docx(path)
             elif kind == "xlsx":
                 body = self._info_xlsx(path)
-            else:
+            elif kind == "pptx":
                 body = self._info_pptx(path)
+            else:
+                body = self._info_pdf(path)
         except Exception as exc:  # noqa: BLE001 - 损坏文件要给出人话，不是 traceback
             return ToolResult(
                 output=(
@@ -1013,6 +1021,38 @@ class OfficeInfoTool(_OfficeToolBase):
         lines.append('提示: office_read(slides="1-5") 读指定页的文本框内容')
         return "\n".join(lines)
 
+    def _info_pdf(self, path: Path) -> str:
+        import fitz
+
+        document = fitz.open(str(path))
+        try:
+            total = document.page_count
+            chars = []
+            for index in range(total):
+                text = (document[index].get_text("text") or "").strip()
+                chars.append(_plain_len(text))
+            empty = sum(1 for c in chars if c == 0)
+
+            lines = [
+                f"[pdf] {path.name}（{_fmt_bytes(path.stat().st_size)}）",
+                f"页数: {total}，文字总量: {sum(chars)} 字",
+            ]
+            for index in range(min(15, total)):
+                lines.append(f"  {index + 1}. {chars[index]} 字")
+            if total > 15:
+                lines.append(f"  …另有 {total - 15} 页")
+            if total and empty == total:
+                lines.append(
+                    "⚠️ 整份 PDF 没有文字层（扫描件或图片导出）。office_read 读不到字，"
+                    "改用 office_render 渲染成 PNG 再交给 vision。"
+                )
+            elif empty:
+                lines.append(f"⚠️ 其中 {empty} 页没有文字层（插图页或扫描页）。")
+            lines.append('提示: office_read(pages="1-10") 读指定页的正文')
+            return "\n".join(lines)
+        finally:
+            document.close()
+
 
 class OfficeReadTool(_OfficeToolBase):
     """按范围取内容：只把需要的那一块放进上下文。"""
@@ -1024,10 +1064,10 @@ class OfficeReadTool(_OfficeToolBase):
     @property
     def description(self) -> str:
         return (
-            "按范围读取 Office 文件内容。docx 用 paragraphs=\"起始-结束\" 或 table=索引；"
+            "按范围读取文档内容。docx 用 paragraphs=\"起始-结束\" 或 table=索引；"
             "xlsx 用 sheet + range（如 range=\"A1:H20\"），values=true 读公式的缓存结果；"
-            "pptx 用 slides=\"1-5\"。"
-            "输出有字符上限，超出会提示缩小范围。读 docx/xlsx/pptx 必须用本工具，"
+            "pptx 用 slides=\"1-5\"；pdf 用 pages=\"1-10\"。"
+            "输出有字符上限，超出会提示缩小范围。读 docx/xlsx/pptx/pdf 必须用本工具，"
             "不要用 read_file（会得到二进制乱码）。"
         )
 
@@ -1058,6 +1098,10 @@ class OfficeReadTool(_OfficeToolBase):
                 "slides": {
                     "type": "string",
                     "description": "pptx：页码范围，如 \"1-5\"（默认 1-10）",
+                },
+                "pages": {
+                    "type": "string",
+                    "description": "pdf：页码范围，如 \"1-10\" 或 \"all\"（默认 1-10）",
                 },
                 "max_chars": {
                     "type": "integer",
@@ -1090,8 +1134,10 @@ class OfficeReadTool(_OfficeToolBase):
                 body = self._read_docx(path, kwargs)
             elif kind == "xlsx":
                 body = self._read_xlsx(path, kwargs)
-            else:
+            elif kind == "pptx":
                 body = self._read_pptx(path, kwargs)
+            else:
+                body = self._read_pdf(path, kwargs)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(
                 output=f"❌ 读取失败（{type(exc).__name__}: {exc}）。先用 office_info 看结构。",
@@ -1273,6 +1319,39 @@ class OfficeReadTool(_OfficeToolBase):
                 pass
         return "\n".join(lines)
 
+    def _read_pdf(self, path: Path, kwargs: dict[str, Any]) -> str:
+        """抽 PDF 的文字层。扫描件没有文字层，只能回头让 vision 看图。"""
+        import fitz
+
+        document = fitz.open(str(path))
+        try:
+            total = document.page_count
+            start, end = _parse_span(kwargs.get("pages"), total, 10)
+            if start > total:
+                # 不拦的话会输出"第 9-3 页"这种鬼话，然后正文一片空白
+                return f"❌ 页码超出范围：这份 PDF 只有 {total} 页，请求的是第 {start} 页起"
+            end = min(end, total)
+            lines = [f"[pdf] {path.name} 第 {start}-{end} 页 / 共 {total} 页"]
+            blank = 0
+            for index in range(start - 1, end):
+                text = (document[index].get_text("text") or "").strip()
+                lines.append(f"--- 第 {index + 1} 页 ---")
+                if not text:
+                    blank += 1
+                    lines.append("（无文字层）")
+                    continue
+                lines.append(text)
+            if blank and blank == end - start + 1:
+                lines.append(
+                    "\n⚠️ 这几页都没有文字层，多半是扫描件/图片版 PDF。"
+                    "内容读不到文字，请先用 office_render 渲染成 PNG，再用 vision 识别。"
+                )
+            elif blank:
+                lines.append(f"\n（其中 {blank} 页没有文字层，若要读图请用 office_render + vision）")
+            return "\n".join(lines)
+        finally:
+            document.close()
+
 
 class OfficeCheckTool(_OfficeToolBase):
     """结构校验 + 排版 lint：文件能打开，不等于能直接交出去。"""
@@ -1320,6 +1399,16 @@ class OfficeCheckTool(_OfficeToolBase):
             "kind": kind,
             "size": path.stat().st_size,
         }
+
+        if kind == "pdf":
+            # PDF 不是 zip 容器。不提前拦住的话，下面会报"不是有效的 Office 文件"
+            # 并暗示是 write_file 写坏了——完全误导。
+            result.update({
+                "ok": True,
+                "note": "PDF 是成品格式，没有可校验的源结构。"
+                        "读内容用 office_read(pages=...)，看版面用 office_render。",
+            })
+            return ToolResult(output=json.dumps(result, ensure_ascii=False))
 
         if not zipfile.is_zipfile(path):
             result.update({"ok": False, "issues": ["不是 zip 容器：这不是一个有效的 Office 文件（常见原因：用 write_file 写了文本）"]})
@@ -1727,7 +1816,8 @@ class OfficeRenderTool(_OfficeToolBase):
     @property
     def description(self) -> str:
         return (
-            "把 docx / xlsx / pptx 转成 PDF 并渲染为 PNG（需要装 LibreOffice + pymupdf）。"
+            "把 docx / xlsx / pptx 转成 PDF 并渲染为 PNG，也可以直接把现成的 .pdf 渲染成 PNG"
+            "（后者不需要 LibreOffice，只要 pymupdf）。"
             "只渲染指定页（默认前 3 页），返回 PDF 路径和每张 PNG 的绝对路径——"
             "接着用 vision 工具看 PNG，就能确认表格有没有溢出、文字有没有被裁、"
             "分页是否合理。这是唯一能真正'看到排版'的方式，不要靠读 XML 猜。"
@@ -1766,7 +1856,8 @@ class OfficeRenderTool(_OfficeToolBase):
         kind, err = _kind_of(path)
         if err:
             return ToolResult(output=f"❌ {err}", is_error=True)
-        if not _soffice_path():
+        # PDF 已经是最终格式，PyMuPDF 直接渲染，不需要 LibreOffice
+        if kind != "pdf" and not _soffice_path():
             return ToolResult(output=f"❌ {_LIBREOFFICE_HINT}", is_error=True)
         try:
             import fitz  # noqa: F401 - PyMuPDF
@@ -1798,26 +1889,29 @@ class OfficeRenderTool(_OfficeToolBase):
         except (TypeError, ValueError):
             timeout = _DEFAULT_LO_TIMEOUT
 
-        pdf_path = out_dir / f"{path.stem}.pdf"
-        if pdf_path.exists():
-            try:
-                pdf_path.unlink()
-            except OSError as exc:
-                return ToolResult(
-                    output=(
-                        f"❌ 无法覆盖旧的预览文件 {pdf_path}（{exc}）。"
-                        "它可能正被 PDF 阅读器打开，关闭后重试。"
-                    ),
-                    is_error=True,
-                )
+        if kind == "pdf":
+            pdf_path = path          # 本来就是 PDF，跳过转换
+        else:
+            pdf_path = out_dir / f"{path.stem}.pdf"
+            if pdf_path.exists():
+                try:
+                    pdf_path.unlink()
+                except OSError as exc:
+                    return ToolResult(
+                        output=(
+                            f"❌ 无法覆盖旧的预览文件 {pdf_path}（{exc}）。"
+                            "它可能正被 PDF 阅读器打开，关闭后重试。"
+                        ),
+                        is_error=True,
+                    )
 
-        converted, err = _soffice_convert(
-            path, _PDF_FILTER[kind], out_dir, timeout=timeout
-        )
-        if converted is None:
-            return ToolResult(output=f"❌ 转 PDF 失败。\n{err}", is_error=True)
-        if converted.resolve() != pdf_path.resolve():
-            shutil.move(str(converted), str(pdf_path))
+            converted, err = _soffice_convert(
+                path, _PDF_FILTER[kind], out_dir, timeout=timeout
+            )
+            if converted is None:
+                return ToolResult(output=f"❌ 转 PDF 失败。\n{err}", is_error=True)
+            if converted.resolve() != pdf_path.resolve():
+                shutil.move(str(converted), str(pdf_path))
 
         import fitz
 

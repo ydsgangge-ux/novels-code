@@ -54,6 +54,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -102,7 +103,13 @@ _DESKTOP = str(Path(__file__).resolve().parent)
 if _DESKTOP not in sys.path:
     sys.path.insert(0, _DESKTOP)
 
-from gangge.layer3_agent.loop import AgenticLoop, LoopConfig, ToolExecution
+import gangge.attachments as _att
+from gangge.layer3_agent.loop import (
+    AgenticLoop,
+    LoopConfig,
+    ToolExecution,
+    is_continue_text,
+)
 from gangge.layer3_agent.prompts.system import build_system_prompt
 from gangge.layer3_agent.tools.registry import ToolRegistry
 from gangge.layer5_llm.base import (
@@ -135,219 +142,26 @@ THINKING_LEVELS: tuple[tuple[str, str], ...] = (
     ("high", "高（最慢最准）"),
 )
 
-PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
-    "deepseek": {
-        "label": "DeepSeek",
-        "api_key_env": "DEEPSEEK_API_KEY",
-        "model_default": "deepseek-v4-flash",
-        "models": [
-            "deepseek-v4-pro", "deepseek-v4-flash",
-            "deepseek-chat", "deepseek-reasoner",
-            "deepseek-chat-v4", "deepseek-reasoner-v4",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://api.deepseek.com/v1",
-    },
-    "qwen": {
-        "label": _t("qwen_label"),
-        "api_key_env": "QWEN_API_KEY",
-        "model_default": "qwen3.6-plus",
-        "models": [
-            "qwen3.6-plus", "qwen3.6-35b-a3b", "qwen3.6-27b",
-            "qwen3.5-plus",
-            "qwen3-max", "qwen3-max-thinking",
-            "qwen3-plus", "qwen3-turbo",
-            "qwen3-coder-plus", "qwen3-coder-turbo",
-            "qwen-max", "qwen-max-latest",
-            "qwen-plus", "qwen-plus-latest",
-            "qwen-turbo", "qwen-turbo-latest",
-            "qwen-long",
-            "qwen-coder-plus", "qwen-coder-plus-latest",
-            "qwen-coder-turbo", "qwen-coder-turbo-latest",
-            "qwen2.5-72b-instruct", "qwen2.5-32b-instruct",
-            "qwen2.5-14b-instruct", "qwen2.5-7b-instruct",
-            "qwen2.5-coder-32b-instruct", "qwen2.5-coder-14b-instruct",
-            "qwen2.5-coder-7b-instruct",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    },
-    "zhipu": {
-        "label": _t("zhipu_label"),
-        "api_key_env": "ZHIPU_API_KEY",
-        "model_default": "glm-4-7-flash",
-        "models": [
-            "glm-5-1", "glm-5", "glm-5-turbo",
-            "glm-4-7", "glm-4-7-flash",
-            "glm-4-6", "glm-4-6v",
-            "glm-4-plus", "glm-4-0520", "glm-4", "glm-4-air", "glm-4-airx",
-            "glm-4-long", "glm-4-flash", "glm-4-flashx",
-            "glm-4v", "glm-4v-plus",
-            "codegeex-4",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://open.bigmodel.cn/api/paas/v4",
-    },
-    "moonshot": {
-        "label": _t("moonshot_label"),
-        "api_key_env": "MOONSHOT_API_KEY",
-        "model_default": "moonshot-v1-auto",
-        "models": [
-            "moonshot-v1-auto", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://api.moonshot.cn/v1",
-    },
-    "baichuan": {
-        "label": _t("baichuan_label"),
-        "api_key_env": "BAICHUAN_API_KEY",
-        "model_default": "Baichuan4",
-        "models": [
-            "Baichuan4", "Baichuan3-Turbo", "Baichuan3-Turbo-128k",
-            "Baichuan2-Turbo", "Baichuan2-53B",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://api.baichuan-ai.com/v1",
-    },
-    "yi": {
-        "label": _t("yi_label"),
-        "api_key_env": "YI_API_KEY",
-        "model_default": "yi-large",
-        "models": [
-            "yi-large", "yi-large-rag", "yi-large-turbo",
-            "yi-medium", "yi-medium-200k", "yi-spark",
-            "yi-lightning",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://api.lingyiwanwu.com/v1",
-    },
-    "minimax": {
-        "label": _t("minimax_label"),
-        "api_key_env": "MINIMAX_API_KEY",
-        "model_default": "MiniMax-Text-01",
-        "models": [
-            "MiniMax-Text-01", "abab6.5s-chat",
-            "abab6.5-chat", "abab6.5g-chat",
-            "abab5.5-chat", "abab5.5s-chat",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://api.minimax.chat/v1",
-    },
-    "stepfun": {
-        "label": _t("stepfun_label"),
-        "api_key_env": "STEPFUN_API_KEY",
-        "model_default": "step-2-16k",
-        "models": [
-            "step-2-16k", "step-2-flash",
-            "step-1-8k", "step-1-32k", "step-1-128k",
-            "step-1v-8k", "step-1v-32k",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://api.stepfun.com/v1",
-    },
-    "siliconflow": {
-        "label": _t("siliconflow_label"),
-        "api_key_env": "SILICONFLOW_API_KEY",
-        "model_default": "deepseek-ai/DeepSeek-V4-Pro",
-        "models": [
-            "deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Flash",
-            "deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1",
-            "Qwen/Qwen3.5-Plus", "Qwen/Qwen3.5-397B-A17B",
-            "Qwen/Qwen2.5-72B-Instruct", "Qwen/Qwen2.5-Coder-32B-Instruct",
-            "Qwen/Qwen2.5-7B-Instruct",
-            "THUDM/glm-5-9b", "THUDM/glm-4-9b-chat",
-            "meta-llama/Meta-Llama-3.1-405B-Instruct",
-            "meta-llama/Meta-Llama-3.1-70B-Instruct",
-            "Pro/Nex-N2-Pro",
-            "Pro/AI-MiniMax/M2.5",
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://api.siliconflow.cn/v1",
-    },
-    "mimo": {
-        "label": "小米 MiMo",
-        "api_key_env": "MIMO_API_KEY",
-        "model_default": "mimo-v2.5-pro",
-        "models": [
-            "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2.5-omni",
-            "mimo-v2-flash", "mimo-7b-instruct",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "https://api.xiaomimimo.com/v1",
-    },
-    "openai": {
-        "label": "OpenAI",
-        "api_key_env": "OPENAI_API_KEY",
-        "model_default": "gpt-5.5",
-        "models": [
-            "gpt-5.5", "gpt-5.5-pro", "gpt-5.5-instant",
-            "gpt-5.4", "gpt-5.4-thinking",
-            "o4-mini", "o3-mini",
-            "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo",
-        ],
-        "base_url_editable": False,
-        "base_url_default": "https://api.openai.com/v1",
-    },
-    "anthropic": {
-        "label": "Anthropic Claude",
-        "api_key_env": "ANTHROPIC_API_KEY",
-        "model_default": "claude-opus-4-7-20260601",
-        "models": [
-            "claude-opus-4-7-20260601",
-            "claude-opus-4-7-20260601:thinking",
-            "claude-opus-4-6-20260515",
-            "claude-opus-4-6-20260515:thinking",
-            "claude-sonnet-4-6-20260501",
-            "claude-sonnet-4-6-20260501:thinking",
-            "claude-haiku-4-5-20260301",
-            "claude-haiku-4-5-20260301:thinking",
-            "claude-sonnet-4-20250514",
-            "claude-sonnet-4-20250514:thinking",
-            "claude-4-20250514",
-            "claude-4-20250514:thinking",
-            "claude-3-5-sonnet-20241022",
-            "claude-3-5-haiku-20241022",
-            "claude-3-opus-20240229",
-            "claude-3-sonnet-20240229",
-            "claude-3-haiku-20240307",
-        ],
-        "base_url_editable": False,
-        "base_url_default": "",
-    },
-    "ollama": {
-        "label": _t("ollama_label"),
-        "api_key_env": "OLLAMA_API_KEY",
-        "model_default": "llama3.1",
-        "models": [
-            "llama3.1", "llama3.1:8b", "llama3.1:70b",
-            "llama3.2", "llama3.2:1b", "llama3.2:3b",
-            "llama3.3", "llama3.3:70b",
-            "llama3", "llama3:8b", "llama3:70b",
-            "mistral", "mistral:7b", "mistral-nemo",
-            "mixtral", "mixtral:8x7b", "mixtral:8x22b",
-            "qwen2.5", "qwen2.5:7b", "qwen2.5:14b", "qwen2.5:32b", "qwen2.5:72b",
-            "qwen2.5-coder", "qwen2.5-coder:7b", "qwen2.5-coder:14b", "qwen2.5-coder:32b",
-            "deepseek-coder", "deepseek-coder:6.7b", "deepseek-coder:33b",
-            "deepseek-r1", "deepseek-r1:8b", "deepseek-r1:14b", "deepseek-r1:32b", "deepseek-r1:70b",
-            "deepseek-v3", "deepseek-v3:24b",
-            "codellama", "codellama:7b", "codellama:13b", "codellama:34b",
-            "gemma2", "gemma2:9b", "gemma2:27b",
-            "phi3", "phi3:mini", "phi3:medium", "phi3:14b",
-            "mistral-large", "mixtral-large:123b",
-        ],
-        "base_url_editable": True,
-        "base_url_default": "http://localhost:11434/v1",
-    },
-    "custom": {
-        "label": _t("custom_label"),
-        "api_key_env": "CUSTOM_API_KEY",
-        "model_default": "",
-        "models": [],
-        "base_url_editable": True,
-        "base_url_default": "",
-    },
-}
+from gangge.layer5_llm.providers import PROVIDER_SPECS as _PROVIDER_SPECS
+
+
+def _localized_provider_configs() -> dict[str, dict[str, Any]]:
+    """把共享的厂商目录补上本地化标签。
+
+    模型清单只维护在 ``gangge.layer5_llm.providers`` 一处，GUI 和 Web
+    读到的是同一份，不会再出现“网页里没模型可选”这类两边不一致的问题。
+    """
+    configs: dict[str, dict[str, Any]] = {}
+    for key, spec in _PROVIDER_SPECS.items():
+        cfg = dict(spec)
+        label_key = cfg.pop("label_key", "")
+        if label_key:
+            cfg["label"] = _t(label_key)
+        configs[key] = cfg
+    return configs
+
+
+PROVIDER_CONFIGS: dict[str, dict[str, Any]] = _localized_provider_configs()
 
 DARK_STYLESHEET = """
 QMainWindow,QDialog,QWidget{background-color:#0d1117;color:#c9d1d9;font-family:"Segoe UI","Microsoft YaHei UI",sans-serif;font-size:13px}
@@ -403,475 +217,9 @@ QListWidget::item:selected{background-color:#1f6feb;color:#fff}
 # ═════════════════════════════════════════════════════════════════
 # 4. Session: SQLite-backed conversation persistence
 # ═════════════════════════════════════════════════════════════════
-class SessionDB:
-    """SQLite session store — saves/loads conversation history."""
-
-    MAX_LOAD_MESSAGES = 500  # Only load recent N messages to prevent UI freeze
-
-    def __init__(self, db_path: str = ""):
-        if not db_path:
-            # Try project-local first, fallback to home dir
-            local_dir = Path(__file__).resolve().parent.parent / ".gangge_data"
-            try:
-                local_dir.mkdir(parents=True, exist_ok=True)
-                db_path = str(local_dir / "sessions.db")
-                # Test write access
-                test_path = local_dir / ".write_test"
-                test_path.touch()
-                test_path.unlink()
-            except (OSError, PermissionError):
-                # Fallback to home directory
-                home_dir = Path.home() / ".gangge"
-                home_dir.mkdir(parents=True, exist_ok=True)
-                db_path = str(home_dir / "sessions.db")
-        self._db_path = db_path
-        self._conn: sqlite3.Connection | None = None
-        self._fts5_enabled = False
-
-    def connect(self):
-        try:
-            self._conn = sqlite3.connect(
-                self._db_path,
-                check_same_thread=False,  # 允许跨线程访问（Qt 多线程场景）
-            )
-            self._conn.row_factory = sqlite3.Row
-
-            # ── FIX 1: 性能 PRAGMA ───────────────────────────────
-            pragmas = [
-                "PRAGMA journal_mode=WAL",          # WAL 模式（已有，保留）
-                "PRAGMA synchronous=NORMAL",        # 从 FULL 降为 NORMAL，写入快 3-5x
-                "PRAGMA cache_size=-8000",          # 缓存 8MB（默认只有 2MB）
-                "PRAGMA temp_store=MEMORY",         # 临时表走内存，不走磁盘
-                "PRAGMA mmap_size=268435456",       # 256MB 内存映射 I/O
-                "PRAGMA busy_timeout=5000",         # 锁等待超时 5 秒，防止 OperationalError
-                "PRAGMA foreign_keys=ON",
-            ]
-            for pragma in pragmas:
-                self._conn.execute(pragma)
-            # ────────────────────────────────────────────────────
-            self._init_tables()
-        except sqlite3.OperationalError as e:
-            # Last resort: use a temp file
-            import tempfile
-            fallback = Path(tempfile.gettempdir()) / "gangge_sessions.db"
-            self._db_path = str(fallback)
-            self._conn = sqlite3.connect(self._db_path)
-            self._conn.execute("PRAGMA journal_mode=DELETE")  # safer mode
-            self._init_tables()
-
-    def close(self):
-        if self._conn:
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
-            self._conn.close()
-            self._conn = None
-
-    def _init_tables(self):
-        c = self._conn.cursor()
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL DEFAULT 'New Session',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                workspace TEXT DEFAULT '',
-                provider TEXT DEFAULT '',
-                model TEXT DEFAULT '',
-                task_count INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                content_type TEXT NOT NULL DEFAULT 'text',
-                tool_use_id TEXT,
-                is_error INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS tool_calls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                round_num INTEGER DEFAULT 0,
-                tool_name TEXT NOT NULL,
-                tool_input TEXT DEFAULT '',
-                tool_output TEXT DEFAULT '',
-                is_error INTEGER DEFAULT 0,
-                diff TEXT DEFAULT '',
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS turns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                turn_num INTEGER DEFAULT 0,
-                user_text TEXT DEFAULT '',
-                summary TEXT DEFAULT '',
-                tools_used TEXT DEFAULT '',
-                assistant_text TEXT DEFAULT '',
-                created_at TEXT NOT NULL
-            );
-        """)
-        # FTS5 全文搜索（try-except：某些 SQLite 构建可能不支持 FTS5）
-        try:
-            self._conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5("
-                "user_text, summary, tools_used, assistant_text, content='turns', content_rowid='id'"
-                ")"
-            )
-            self._fts5_enabled = True
-        except Exception as e:
-            logging.getLogger("gangge").warning("FTS5 不可用，降级到 LIKE 查询: %s", e)
-            self._fts5_enabled = False
-        self._conn.commit()
-        # 如果已有旧库，补全新字段
-        self._migrate_if_needed()
-
-    def _migrate_if_needed(self):
-        """为旧库补上后加的字段（messages 与 turns）。"""
-        try:
-            self._conn.execute(
-                "ALTER TABLE messages ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"
-            )
-        except Exception:
-            pass  # 字段已存在
-        try:
-            self._conn.execute(
-                "ALTER TABLE messages ADD COLUMN tool_use_id TEXT"
-            )
-        except Exception:
-            pass
-        try:
-            self._conn.execute(
-                "ALTER TABLE messages ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0"
-            )
-        except Exception:
-            pass
-        # 早期版本的 turns 表没有 assistant_text，而跨会话恢复现在会读它。
-        # 缺列会让整条摘要查询抛异常（被上层吞掉 → 静默失忆）。
-        try:
-            self._conn.execute(
-                "ALTER TABLE turns ADD COLUMN assistant_text TEXT DEFAULT ''"
-            )
-        except Exception:
-            pass
-
-    def create_session(self, title: str = "", workspace: str = "") -> str:
-        if not title:
-            title = _t("session_new")
-        sid = uuid.uuid4().hex[:8]
-        now = datetime.now().isoformat()
-        self._conn.execute(
-            "INSERT INTO sessions (id, title, created_at, updated_at, workspace) VALUES (?,?,?,?,?)",
-            (sid, title, now, now, workspace),
-        )
-        self._conn.commit()
-        return sid
-
-    def list_sessions(self, limit: int = 50, workspace: str = "") -> list[dict]:
-        """列出会话，可选按 workspace 过滤。"""
-        if workspace:
-            rows = self._conn.execute(
-                "SELECT id, title, created_at, updated_at, workspace, task_count "
-                "FROM sessions WHERE workspace=? ORDER BY updated_at DESC LIMIT ?",
-                (workspace, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT id, title, created_at, updated_at, workspace, task_count "
-                "FROM sessions ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [
-            {
-                "id": r[0],
-                "title": r[1],
-                "created_at": r[2],
-                "updated_at": r[3],
-                "workspace": r[4] or "",
-                "task_count": r[5] or 0,
-            }
-            for r in rows
-        ]
-
-    def get_session(self, sid: str) -> dict | None:
-        r = self._conn.execute(
-            "SELECT id, title, created_at, updated_at, workspace, provider, model, task_count FROM sessions WHERE id=?",
-            (sid,),
-        ).fetchone()
-        if not r:
-            return None
-        return {"id": r[0], "title": r[1], "created_at": r[2], "updated_at": r[3],
-                "workspace": r[4] or "", "provider": r[5] or "", "model": r[6] or "",
-                "task_count": r[7] or 0}
-
-    def update_session(self, sid: str, **kw):
-        sets = ", ".join(f"{k}=?" for k in kw)
-        vals = list(kw.values()) + [sid]
-        self._conn.execute(f"UPDATE sessions SET {sets} WHERE id=?", vals)
-        self._conn.commit()
-
-    # ── CHANGE: 方案C — save_turn 替换 save_message ────────────
-    def save_turn(self, sid: str, messages: list[dict]):
-        """
-        保存一轮对话的所有聚合消息。
-
-        messages 格式：
-        [
-          {"role": "user", "content": "帮我写SaaS"},
-          {"role": "assistant", "content": [...]},  # list=含tool_use，str=纯文字
-          {"role": "tool", "tool_use_id": "...", "content": "...", "is_error": False},
-        ]
-        """
-        now = datetime.now().isoformat()
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            tool_use_id = msg.get("tool_use_id", None)
-
-            # content 如果是 list（assistant 含 tool_use），序列化为 JSON
-            if isinstance(content, list):
-                content_str = json.dumps(content, ensure_ascii=False)
-                content_type = "json"
-            else:
-                content_str = str(content)
-                content_type = "text"
-
-            is_error = 1 if msg.get("is_error", False) else 0
-
-            self._conn.execute(
-                "INSERT INTO messages (session_id, role, content, content_type, tool_use_id, is_error, created_at) VALUES (?,?,?,?,?,?,?)",
-                (sid, role, content_str, content_type, tool_use_id, is_error, now),
-            )
-        self._conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (now, sid))
-        self._conn.commit()
-
-    def count_messages(self, sid: str) -> int:
-        """快速查询总消息数（不加载内容），用于 UI 提示"""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id=?", (sid,)
-        ).fetchone()
-        return row[0] if row else 0
-
-    # ── CHANGE: 方案C — load_turns 替换 load_messages ───────────
-    def load_turns(self, sid: str, limit: int = 200) -> list[dict]:
-        """
-        加载会话消息，重建成 LLM API 标准消息格式。
-
-        返回的消息可直接作为 LLM 的 messages 参数。
-        tool 角色的消息显示简短摘要，不展开完整输出。
-        limit: 最多加载多少条
-        """
-        # 取最近 limit 条，按时间正序排列
-        rows = self._conn.execute(
-            """
-            SELECT role, content, content_type, tool_use_id, is_error
-            FROM (
-                SELECT id, role, content, content_type, tool_use_id, is_error
-                FROM messages
-                WHERE session_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-            ) ORDER BY id ASC
-            """,
-            (sid, limit),
-        ).fetchall()
-
-        messages = []
-        for r in rows:
-            role = r["role"]
-            content_str = r["content"]
-            content_type = r["content_type"]
-            tool_use_id = r["tool_use_id"]
-            is_error = r["is_error"]
-
-            if content_type == "json":
-                content = json.loads(content_str)
-            else:
-                content = content_str
-
-            msg = {"role": role, "content": content}
-            if tool_use_id:
-                msg["tool_use_id"] = tool_use_id
-                msg["is_error"] = bool(is_error)
-
-            messages.append(msg)
-
-        return messages
-
-    def save_tool_call(self, sid: str, round_num: int, tool_name: str, tool_input: str,
-                       tool_output: str, is_error: bool, diff: str = ""):
-        self._conn.execute(
-            "INSERT INTO tool_calls (session_id, round_num, tool_name, tool_input, tool_output, is_error, diff, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (sid, round_num, tool_name, tool_input, tool_output, 1 if is_error else 0, diff, datetime.now().isoformat()),
-        )
-        self._conn.commit()
-
-    def load_tool_calls(self, sid: str) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT round_num, tool_name, tool_input, tool_output, is_error, diff FROM tool_calls WHERE session_id=? ORDER BY id",
-            (sid,),
-        ).fetchall()
-        return [{"round": r[0], "tool_name": r[1], "input": r[2], "output": r[3],
-                 "is_error": bool(r[4]), "diff": r[5]} for r in rows]
-
-    def delete_session(self, sid: str):
-        self._conn.execute("DELETE FROM tool_calls WHERE session_id=?", (sid,))
-        self._conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
-        self._conn.execute("DELETE FROM turns WHERE session_id=?", (sid,))
-        if self._fts5_enabled:
-            self._conn.execute("DELETE FROM turns_fts WHERE rowid IN (SELECT id FROM turns WHERE session_id=?)", (sid,))
-        self._conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
-        self._conn.commit()
-
-    # ── Turn 摘要存储与搜索 ──────────────────────────────────────
-
-    def save_turn_summary(self, sid: str, msgs: list[dict]):
-        """从聚合消息中提取摘要，存入 turns 表 + FTS5 索引。
-
-        msgs 格式来自 _aggregate_turn_messages：
-          [{"role":"user","content":"..."},
-           {"role":"assistant","content":[...]},
-           {"role":"tool",...}]
-        """
-        user_text = ""
-        assistant_text = ""
-        tools_used: list[dict] = []
-
-        for msg in msgs:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "user":
-                # 一轮里可能有多条 user 消息（用户中途补一句"别动 X"）。
-                # 以前是覆盖，只留下最后一条，中途的约束连库都进不去。
-                _txt = ""
-                if isinstance(content, str):
-                    _txt = content
-                elif isinstance(content, list):
-                    texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-                    _txt = " ".join(texts)
-                if _txt.strip():
-                    user_text = f"{user_text}\n{_txt}".strip() if user_text else _txt
-            elif role == "assistant":
-                if isinstance(content, str):
-                    assistant_text = content
-                elif isinstance(content, list):
-                    for b in content:
-                        if not isinstance(b, dict):
-                            continue
-                        if b.get("type") == "text" and b.get("text"):
-                            assistant_text += b["text"]
-                        elif b.get("type") == "tool_use":
-                            inp = b.get("input", {})
-                            # 300 而不是 200：路径 + 关键参数常常刚好越过 200，
-                            # 结果搜索/恢复时只剩一个被切断的路径。
-                            inp_str = json.dumps(inp, ensure_ascii=False)[:300] if inp else ""
-                            tools_used.append({"name": b.get("name", ""), "input": inp_str})
-
-        # 600 而不是 300：摘要也用于 FTS5 检索和跨会话回放，
-        # 300 字经常只覆盖开场白，具体改了哪些文件反而被切掉。
-        summary = assistant_text[:600] + ("..." if len(assistant_text) > 600 else "")
-        tools_json = json.dumps(tools_used, ensure_ascii=False)
-
-        now = datetime.now().isoformat()
-        row = self._conn.execute("SELECT COUNT(*) FROM turns WHERE session_id=?", (sid,)).fetchone()
-        turn_num = (row[0] if row else 0) + 1
-
-        cursor = self._conn.execute(
-            "INSERT INTO turns (session_id, turn_num, user_text, summary, tools_used, assistant_text, created_at) VALUES (?,?,?,?,?,?,?)",
-            (sid, turn_num, user_text, summary, tools_json, assistant_text, now),
-        )
-        rowid = cursor.lastrowid
-        if self._fts5_enabled:
-            self._conn.execute(
-                "INSERT INTO turns_fts (rowid, user_text, summary, tools_used, assistant_text) VALUES (?,?,?,?,?)",
-                (rowid, user_text, summary, tools_json, assistant_text),
-            )
-        self._conn.commit()
-
-    def search_turns(self, query: str, sid: str = "", limit: int = 10) -> list[dict]:
-        """搜索历史对话轮次（FTS5 优先，降级 LIKE）。"""
-        if not query.strip():
-            return []
-        if self._fts5_enabled:
-            # FTS5 搜索
-            try:
-                sql = (
-                    "SELECT t.id, t.session_id, t.turn_num, t.user_text, t.summary, "
-                    "t.tools_used, t.assistant_text, t.created_at "
-                    "FROM turns_fts f JOIN turns t ON t.id = f.rowid "
-                    "WHERE turns_fts MATCH ? "
-                )
-                params: list = [query]
-                if sid:
-                    sql += " AND t.session_id = ?"
-                    params.append(sid)
-                sql += " ORDER BY t.id DESC LIMIT ?"
-                params.append(limit)
-                rows = self._conn.execute(sql, params).fetchall()
-            except Exception:
-                rows = self._like_search(query, sid, limit)
-        else:
-            rows = self._like_search(query, sid, limit)
-        return [dict(r) for r in rows]
-
-    def _like_search(self, query: str, sid: str, limit: int) -> list:
-        """LIKE 降级搜索。"""
-        pattern = f"%{query}%"
-        sql = (
-            "SELECT id, session_id, turn_num, user_text, summary, tools_used, assistant_text, created_at "
-            "FROM turns WHERE (user_text LIKE ? OR summary LIKE ? OR assistant_text LIKE ? OR tools_used LIKE ?) "
-        )
-        params = [pattern, pattern, pattern, pattern]
-        if sid:
-            sql += " AND session_id = ?"
-            params.append(sid)
-        sql += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-        return self._conn.execute(sql, params).fetchall()
-
-    def load_turn_summaries(self, sid: str, exclude_recent: int = 0) -> list[dict]:
-        """加载会话的 turn 摘要（用于注入历史上下文）。
-
-        exclude_recent: 排除最近 N 条（这些会用完整消息恢复）。
-        """
-        # 带上 assistant_text：summary 是压缩版，恢复时用它比用二次截断的
-        # summary 更能还原上一轮到底做了什么。
-        #
-        # 但要在 SQL 里就截断：assistant_text 是完整回复（可能上万字），
-        # 一个几百轮的会话直接 SELECT 全文会把几百 MB 拉进内存，切会话时
-        # 界面就会明显卡住。400 字是调用方实际使用的上限。
-        sql = ("SELECT turn_num, user_text, summary, tools_used, created_at, "
-               "substr(assistant_text, 1, 400) AS assistant_text "
-               "FROM turns WHERE session_id = ?")
-        params: list = [sid]
-        if exclude_recent > 0:
-            # 取总数，排除最近 exclude_recent 条
-            count_row = self._conn.execute(
-                "SELECT COUNT(*) FROM turns WHERE session_id=?", (sid,)
-            ).fetchone()
-            total = count_row[0] if count_row else 0
-            if total <= exclude_recent:
-                return []
-            sql += " ORDER BY id ASC LIMIT ?"
-            params.append(total - exclude_recent)
-        else:
-            sql += " ORDER BY id ASC"
-        try:
-            rows = self._conn.execute(sql, params).fetchall()
-        except Exception:
-            # 旧库还没迁移出 assistant_text：退回旧字段，别让整段历史消失。
-            fallback = sql.replace(
-                ", substr(assistant_text, 1, 400) AS assistant_text", ""
-            )
-            rows = self._conn.execute(fallback, params).fetchall()
-        return [dict(r) for r in rows]
-
-    def increment_task_count(self, sid: str):
-        self._conn.execute("UPDATE sessions SET task_count=task_count+1, updated_at=? WHERE id=?",
-                           (datetime.now().isoformat(), sid))
-        self._conn.commit()
+#: 会话库已搬到 gangge.runtime.session_db：桌面端与 Web 端要共用同一份历史，
+#: 而放在这里意味着 Web 后端必须 import PyQt6 才能读数据库。
+from gangge.runtime.session_db import SessionDB
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -1490,12 +838,18 @@ class GanggeWorker(QThread):
         full_task = f"{batch_prefix}{self.task}"
         # Restore previous session context if any
         messages = list(self.previous_messages)
+        # “继续”只带状态，不带过程：旧的工具输出/正文全部丢掉，只留任务
+        # 锚点和上次结论；待办与已改文件由 loop 的动态状态另外注入。
+        if is_continue_text(full_task):
+            messages = AgenticLoop.compact_history_for_continue(messages)
+        base_len = len(messages)
 
         if self._attachments:
             att_names = ", ".join(a["name"] for a in self._attachments)
             # Don't send image content to main LLM (it may not support images).
-            # Mention the attachment name and let the LLM call vision tool.
-            enhanced_task = f"{full_task}\n\n[附件: {att_names}] 如需识别图片内容，请使用 vision 工具。"
+            # Describe 会带上绝对路径 + 每类文件的读法：图片叫它用 vision，
+            # Office 叫它用 office_read（用 read_file 只会读到 zip 二进制）。
+            enhanced_task = full_task + _att.describe(self._attachments)
             messages.append(Message(role=Role.USER, content=enhanced_task))
             self.text_block.emit(f"\n📋 任务: {full_task}\n📎 附件: {att_names}\n", "user")
         else:
@@ -1523,7 +877,7 @@ class GanggeWorker(QThread):
         # ── CHANGE: 方案C — 聚合消息并发射到主线程 ──────────
         # messages 现在的格式：USER, ASSISTANT(含tool_use+text), TOOL 交替
         # 按 LLM API 协议格式聚合后通过 turn_complete 信号发射
-        turn_msgs = self._aggregate_turn_messages(messages, len(self.previous_messages))
+        turn_msgs = self._aggregate_turn_messages(messages, base_len)
         if turn_msgs:
             self.turn_complete.emit(turn_msgs)
         # ─────────────────────────────────────────────────────
@@ -1537,7 +891,8 @@ class GanggeWorker(QThread):
             from gangge.pricing import estimate_cost
             cost_display = estimate_cost(self._provider, self._model,
                                           result.total_tokens.get("input", 0),
-                                          result.total_tokens.get("output", 0))
+                                          result.total_tokens.get("output", 0),
+                                          result.total_tokens.get("cached", 0))
         except Exception:
             pass
         # ── 超时/失败必须透出到 UI ──
@@ -7803,6 +7158,128 @@ class GanggeDesktop(QMainWindow):
         cf.addRow("", _ctx_hint)
         form.addWidget(ctx_g)
 
+        # ── 模型定价 ──
+        # 内置价是手抄官方文档的表，新模型和调价必然对不上，所以留个口子自己填。
+        pr_g = QGroupBox("模型定价（每千 token = 官方每百万价 ÷ 1000）")
+        pr_g.setStyleSheet(llm_g.styleSheet())
+        pf = QFormLayout(pr_g)
+        pf.setSpacing(6)
+
+        from gangge.pricing import (
+            builtin_price,
+            load_custom_pricing,
+            pricing_file_path,
+            remove_model_price,
+            set_model_price,
+        )
+
+        # 定价跟着上面「LLM 配置」里正在编辑的那个模型走。写清楚是哪一对，
+        # 免得用户以为改的是别处的模型。
+        _pr_provider = (self._provider_combo.currentData() or "").strip().lower()
+        _pr_model = _model.currentText().strip()
+        _pr_builtin, _pr_src = builtin_price(_pr_provider, _pr_model)
+        _pr_builtin = _pr_builtin or {}
+        try:
+            _pr_custom = (load_custom_pricing().get(_pr_provider) or {}).get(_pr_model) or {}
+        except Exception:  # noqa: BLE001 - 定价文件坏了不该打不开设置页
+            _pr_custom = {}
+
+        _pr_which = QLabel(f"{_pr_provider or '—'} / {_pr_model or '—'}")
+        _pr_which.setStyleSheet("color:#f0f6fc;font-size:12px;")
+        pf.addRow("当前编辑", _pr_which)
+
+        def _pr_bval(cny_key: str, usd_key: str) -> float:
+            return float(_pr_builtin.get(cny_key, _pr_builtin.get(usd_key, 0.0)) or 0.0)
+
+        if _pr_builtin:
+            _pr_src_label = {
+                "exact": "精确匹配",
+                "prefix": "前缀匹配（估算）",
+                "provider_default": "厂商默认价（估算）",
+            }.get(_pr_src, _pr_src or "未匹配")
+            _pr_sym = "¥" if "input_cny" in _pr_builtin else "$"
+            _pr_builtin_text = (
+                f"输入 {_pr_sym}{_pr_bval('input_cny', 'input_usd')} / "
+                f"输出 {_pr_sym}{_pr_bval('output_cny', 'output_usd')}"
+                f"　{_pr_src_label}"
+            )
+        else:
+            _pr_builtin_text = "内置表里没有这个模型，只能手填"
+        _pr_builtin_label = QLabel(_pr_builtin_text)
+        _pr_builtin_label.setWordWrap(True)
+        _pr_builtin_label.setStyleSheet("color:#8b949e;font-size:11px;")
+        pf.addRow("内置价", _pr_builtin_label)
+
+        _pr_use = QCheckBox("使用自定义价（不勾则回到上面的内置价）")
+        _pr_use.setChecked(bool(_pr_custom))
+        pf.addRow("", _pr_use)
+
+        def _pr_spin(value: float) -> QDoubleSpinBox:
+            sp = QDoubleSpinBox()
+            sp.setDecimals(6)
+            sp.setRange(0.0, 1000.0)
+            sp.setSingleStep(0.0001)
+            sp.setValue(float(value or 0.0))
+            return sp
+
+        _pr_in = _pr_spin(
+            _pr_custom.get("input_cny", _pr_custom.get("input_usd", _pr_bval("input_cny", "input_usd")))
+        )
+        _pr_in.setToolTip("每千 token 的输入价。本地模型填 0。")
+        pf.addRow("输入价 / 千 tok", _pr_in)
+
+        _pr_out = _pr_spin(
+            _pr_custom.get("output_cny", _pr_custom.get("output_usd", _pr_bval("output_cny", "output_usd")))
+        )
+        _pr_out.setToolTip("每千 token 的输出价。")
+        pf.addRow("输出价 / 千 tok", _pr_out)
+
+        _pr_cached = _pr_spin(
+            _pr_custom.get(
+                "input_cache_hit_cny",
+                _pr_custom.get("input_cache_hit_usd", _pr_bval("input_cache_hit_cny", "input_cache_hit_usd")),
+            )
+        )
+        _pr_cached.setToolTip(
+            "命中缓存的输入单价。填 0 表示不单独指定，按输入价的比例折算"
+            "（DeepSeek 1/50、Anthropic 1/10、OpenAI 1/2）。"
+        )
+        pf.addRow("缓存命中价 / 千 tok", _pr_cached)
+
+        _pr_fill = QPushButton("回填内置价")
+        _pr_fill.setToolTip("把内置表的价填进上面三个框，再点保存就只覆盖内置价，不用自己算")
+        _pr_fill.setStyleSheet(
+            "QPushButton{background:#21262d;color:#c9d1d9;border:1px solid #30363d;"
+            "border-radius:6px;padding:5px 12px;font-size:12px;}"
+            "QPushButton:hover{background:#30363d;}"
+            "QPushButton:disabled{color:#484f58;}"
+        )
+
+        def _pr_fill_builtin() -> None:
+            if not _pr_builtin:
+                QMessageBox.information(dlg, "模型定价", "内置表里没有这个模型，只能手填。")
+                return
+            _pr_use.setChecked(True)
+            _pr_in.setValue(_pr_bval("input_cny", "input_usd"))
+            _pr_out.setValue(_pr_bval("output_cny", "output_usd"))
+            _pr_cached.setValue(_pr_bval("input_cache_hit_cny", "input_cache_hit_usd"))
+
+        _pr_fill.clicked.connect(_pr_fill_builtin)
+        pf.addRow("", _pr_fill)
+
+        _pr_hint = QLabel(f"写到 {pricing_file_path()}，保存后立即生效，不用重启。")
+        _pr_hint.setWordWrap(True)
+        _pr_hint.setStyleSheet("color:#8b949e;font-size:11px;")
+        pf.addRow("", _pr_hint)
+
+        def _pr_sync_enabled(checked: bool) -> None:
+            for _w in (_pr_in, _pr_out, _pr_cached, _pr_fill):
+                _w.setEnabled(checked)
+
+        _pr_use.toggled.connect(_pr_sync_enabled)
+        _pr_sync_enabled(_pr_use.isChecked())
+        form.addWidget(pr_g)
+
         # ── Advanced ──
         ad_g = QGroupBox(_t("settings_advanced"))
         ad_g.setStyleSheet(llm_g.styleSheet())
@@ -7957,6 +7434,22 @@ class GanggeDesktop(QMainWindow):
             self._settings.setValue("github_token", _gh_token.text())
             self._settings.setValue("github_username", _gh_username.text())
             self._settings.setValue("github_email", _gh_email.text())
+            # 模型定价：勾了才写盘；不勾就把自定义价删掉，回到内置价。
+            # 缓存价填 0 视为"不单独指定"，交给 pricing 按输入价的比例折算。
+            try:
+                if _pr_use.isChecked() and _pr_model:
+                    _pr_cache_v = round(_pr_cached.value(), 6)
+                    set_model_price(
+                        _pr_provider,
+                        _pr_model,
+                        round(_pr_in.value(), 6),
+                        round(_pr_out.value(), 6),
+                        _pr_cache_v if _pr_cache_v > 0 else None,
+                    )
+                else:
+                    remove_model_price(_pr_provider, _pr_model)
+            except Exception as _pr_exc:  # noqa: BLE001 - 定价写不进去不该丢掉其它设置
+                QMessageBox.warning(dlg, "模型定价", f"保存定价失败：{_pr_exc}")
             # Save multimodal settings
             self._settings.setValue("mm_enable", _mm_enable.isChecked())
             self._settings.setValue("mm_provider", _mm_provider.currentData())
@@ -8639,7 +8132,21 @@ class GanggeDesktop(QMainWindow):
         # Remember last used directory
         settings = QSettings("Gangge", "GanggeCode")
         last_dir = settings.value("attach_last_dir", "")
-        file_filter = "Media Files (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.mp4 *.avi *.mov *.mkv *.webm *.mp3 *.wav *.ogg *.flac *.aac *.m4a);;Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;Video (*.mp4 *.avi *.mov *.mkv *.webm);;Audio (*.mp3 *.wav *.ogg *.flac *.aac *.m4a);;All Files (*)"
+        # 以前只有媒体文件，.docx/.xlsx/.pptx 选不中，勉强用"所有文件"选中也会被
+        # _add_attachment 的 else 分支悄悄丢掉 —— 用户以为挂上了，模型什么都没收到。
+        file_filter = (
+            "常用文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp "
+            "*.docx *.docm *.xlsx *.xlsm *.pptx *.pptm *.pdf "
+            "*.txt *.md *.csv *.json *.log "
+            "*.mp4 *.avi *.mov *.mkv *.webm *.mp3 *.wav *.ogg *.flac *.aac *.m4a);;"
+            "Office 文档 (*.docx *.docm *.xlsx *.xlsm *.pptx *.pptm *.pdf);;"
+            "图片 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;"
+            "视频 (*.mp4 *.avi *.mov *.mkv *.webm);;"
+            "音频 (*.mp3 *.wav *.ogg *.flac *.aac *.m4a);;"
+            "文本 (*.txt *.md *.csv *.json *.log);;"
+            "旧版 Office（需另存） (*.doc *.xls *.ppt);;"
+            "All Files (*)"
+        )
         paths, _ = QFileDialog.getOpenFileNames(self, _t("attach_select"), last_dir, file_filter)
         if paths:
             # Save last directory
@@ -8651,33 +8158,46 @@ class GanggeDesktop(QMainWindow):
         p = Path(file_path)
         if not p.exists():
             return
-        ext = p.suffix.lower()
-        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
-        video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-        audio_exts = {".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a"}
-        if ext in image_exts:
-            media_type = f"image/{ext.lstrip('.')}"
-            if ext == ".jpg":
-                media_type = "image/jpeg"
-            icon = "🖼️"
-        elif ext in video_exts:
-            media_type = f"video/{ext.lstrip('.')}"
-            icon = "🎬"
-        elif ext in audio_exts:
-            media_type = f"audio/{ext.lstrip('.')}"
-            if ext == ".mp3":
-                media_type = "audio/mpeg"
-            icon = "🎵"
-        else:
+        kind = _att.kind_of(p.name)
+        if kind is None:
+            # 以前这里直接 return，用户完全没有反馈
+            QMessageBox.information(
+                self, "不支持的附件",
+                f"暂不认识「{p.suffix or p.name}」这种格式，没法挂上来。\n"
+                f"支持：图片、视频、音频、Word / Excel / PPT、PDF、纯文本。",
+            )
             return
+        if kind == "legacy":
+            QMessageBox.warning(
+                self, "旧版 Office 格式",
+                f"{p.name} 是 97-2003 的二进制格式，解析不了。\n"
+                f"请用 Word / Excel / PPT 另存为 .docx / .xlsx / .pptx 再挂。",
+            )
+            return
+        if any(a.get("path") == str(p) for a in self._attachments):
+            return  # 重复挂同一个文件
+
         size_kb = p.stat().st_size / 1024
-        if size_kb > 20480:
-            QMessageBox.warning(self, _t("attach_too_large_title"), _t("attach_too_large_msg", size=f"{size_kb:.0f}"))
+        # 文档不解码、不 base64，只把路径交给模型，让 office_read 去读，
+        # 所以体积上限放宽一些；媒体要塞进请求体，还是按原来的 20MB 卡。
+        limit_kb = 20480 if kind in ("image", "video", "audio") else 102400
+        if size_kb > limit_kb:
+            QMessageBox.warning(self, _t("attach_too_large_title"),
+                                _t("attach_too_large_msg", size=f"{size_kb:.0f}"))
             return
-        import base64
-        with open(file_path, "rb") as f:
-            b64_data = base64.b64encode(f.read()).decode("ascii")
-        att = {"path": file_path, "name": p.name, "media_type": media_type, "data": b64_data, "icon": icon}
+
+        att = {
+            "path": str(p),
+            "name": p.name,
+            "kind": kind,
+            "label": _att.label_of(p.name),
+            "icon": _att.icon_of(p.name),
+        }
+        if kind in ("image", "video", "audio"):
+            import base64
+            with open(file_path, "rb") as f:
+                att["data"] = base64.b64encode(f.read()).decode("ascii")
+            att["media_type"] = _att.media_type_of(p.name)
         self._attachments.append(att)
         self._refresh_attachment_bar()
 

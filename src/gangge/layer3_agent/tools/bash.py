@@ -24,10 +24,43 @@ from gangge.layer3_agent.tools.base import BaseTool, ToolResult
 
 logger = logging.getLogger(__name__)
 
-#: Commands started by this process that have not exited yet. A server the
-#: agent launched should not outlive the task that needed it.
-_TRACKED_PROCS: set[subprocess.Popen] = set()
+#: Commands started by this process that have not exited yet, grouped by the
+#: workspace (task) that started them. A server the agent launched should not
+#: outlive the task that needed it — but it also must not be killed by a
+#: *different* task ending. A flat set made that distinction impossible: with
+#: two tasks running, the first one to finish killed the second one's dev
+#: server, and the second task then reported "server died" for no reason.
+_TRACKED_PROCS: dict[str, set[subprocess.Popen]] = {}
 _TRACK_LOCK = threading.Lock()
+
+#: Scope used when a caller cannot say which task a command belongs to
+#: (single-task hosts, tests, CLI). Keeps the old all-or-nothing behaviour.
+_DEFAULT_SCOPE = ""
+
+
+def _norm_scope(scope: str | None) -> str:
+    """One canonical key per workspace, so ``.`` and its absolute path agree."""
+    if not scope:
+        return _DEFAULT_SCOPE
+    try:
+        return os.path.abspath(scope)
+    except Exception:  # noqa: BLE001 - a weird path must not break tracking
+        return scope
+
+
+def _track(scope: str, proc: subprocess.Popen) -> None:
+    with _TRACK_LOCK:
+        _TRACKED_PROCS.setdefault(_norm_scope(scope), set()).add(proc)
+
+
+def _untrack(scope: str, proc: subprocess.Popen) -> None:
+    key = _norm_scope(scope)
+    with _TRACK_LOCK:
+        bucket = _TRACKED_PROCS.get(key)
+        if bucket is not None:
+            bucket.discard(proc)
+            if not bucket:
+                _TRACKED_PROCS.pop(key, None)
 
 #: 命令超时的默认值与上限。
 #:
@@ -37,6 +70,8 @@ _TRACK_LOCK = threading.Lock()
 #: 上限，否则它会被当成"要等多久"。
 DEFAULT_TIMEOUT_SECONDS = 120
 MAX_TIMEOUT_SECONDS = 600
+#: 连续这么久没有任何输出 → 判定"卡住了"，转后台继续任务（验证/构建命令除外）。
+IDLE_DETACH_SECONDS = 90
 
 #: 常驻进程：启动成功后**不会退出**，前台等待等价于等死。
 #: 注意只匹配"服务/开发服务器"，``npm test`` / ``npm run build`` 不会被误伤。
@@ -87,6 +122,80 @@ def is_service_command(command: str) -> bool:
     if platform.system() != "Windows" and re.search(r"&\s*$", text):
         return False
     return bool(_SERVICE_CMD_RE.search(text))
+
+
+#: 裸跑一个 Python 脚本：`python xxx.py`（不带管道/参数）。
+_BARE_PY_RE = re.compile(
+    r"^\s*(?:python[0-9.]*|py)\s+(?:-\w+\s+)*[\"']?([^\s\"']+\.py)[\"']?\s*$",
+    re.IGNORECASE,
+)
+_GUI_MARKERS = (
+    "mainloop(", "tkinter", "PyQt", "PySide", "pygame", "turtle", "wx.App",
+    "cv2.imshow",
+)
+
+
+def interactive_reason(command: str, cwd: str) -> str:
+    """裸跑 GUI/等待输入的脚本 → 前台必然阻塞到超时。
+
+    实测一次 ``python gui.py`` 把 13 分钟的任务拖了 10 分钟，最后只拿到
+    "超时"。判的是脚本内容：开窗口（mainloop）或读 input()，都不该前台等。
+    带参数/管道的命令不在此列（比如 `echo x | python x.py` 是喂了输入的）。
+    """
+    match = _BARE_PY_RE.match(command or "")
+    if not match:
+        return ""
+    script = Path(match.group(1))
+    if not script.is_absolute():
+        script = Path(cwd) / script
+    try:
+        text = script.read_text(encoding="utf-8", errors="replace")[:20000]
+    except OSError:
+        return ""
+    for marker in _GUI_MARKERS:
+        if marker in text:
+            return f"包含 `{marker}`，会打开窗口并进入事件循环"
+    if "input(" in text:
+        return "会等待 input() 输入"
+    return ""
+
+
+#: PowerShell 里不存在、但模型常写的 Unix 命令 → 等价写法。
+_WIN_CMD_ALIASES = {
+    "head": "Get-Content <文件> -TotalCount 20",
+    "tail": "Get-Content <文件> -Tail 20",
+    "cat": "Get-Content <文件>",
+    "grep": "Select-String -Pattern <模式> <文件>",
+    "touch": "New-Item -ItemType File <文件>",
+    "ls": "Get-ChildItem",
+    "which": "Get-Command",
+    "pip": "python -m pip",
+    "python3": "python",
+}
+_NOT_RECOGNIZED_MARKERS = (
+    "is not recognized as the name",
+    "CommandNotFoundException",
+    "无法将",
+)
+
+
+def windows_command_hint(command: str, output: str) -> str:
+    """命令不存在时，给出 PowerShell 等价写法，别让模型反复试 Unix 命令。"""
+    if platform.system() != "Windows":
+        return ""
+    if not any(marker in output for marker in _NOT_RECOGNIZED_MARKERS):
+        return ""
+    parts = (command or "").strip().split()
+    if not parts:
+        return ""
+    name = parts[0].lower()
+    replacement = _WIN_CMD_ALIASES.get(name)
+    if not replacement:
+        return ""
+    return (
+        f"\n[Windows 提示] PowerShell 里没有 `{name}`，"
+        f"可改用 `{replacement}`；读文件优先用 read_file(offset/limit)。"
+    )
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -188,14 +297,26 @@ def describe_port_conflict(output: str) -> str:
     )
 
 
-def cleanup_tracked_processes() -> int:
-    """Kill commands this session started and never reaped.
+def cleanup_tracked_processes(scope: str | None = None) -> int:
+    """Kill commands started and never reaped.
 
-    Called at the end of a turn. Returns how many processes were reclaimed.
+    ``scope`` is the workspace of the task that is ending — only that task's
+    children are reclaimed, so a finishing task cannot kill the dev server a
+    sibling task is still using. ``scope=None`` (the old behaviour) drains
+    everything, which is what single-task hosts and tests want.
+
+    Returns how many processes were reclaimed.
     """
     with _TRACK_LOCK:
-        procs = [p for p in _TRACKED_PROCS if p.poll() is None]
-        _TRACKED_PROCS.clear()
+        if scope is None:
+            procs = [
+                p for bucket in _TRACKED_PROCS.values()
+                for p in bucket if p.poll() is None
+            ]
+            _TRACKED_PROCS.clear()
+        else:
+            bucket = _TRACKED_PROCS.pop(_norm_scope(scope), set())
+            procs = [p for p in bucket if p.poll() is None]
     for proc in procs:
         _kill_process_tree(proc)
     return len(procs)
@@ -269,7 +390,7 @@ def _probe_service(port: str, attempts: int = 2, interval: float = 0.4) -> tuple
     )
 
 
-def _start_service(command: str, cwd: str) -> tuple[str, int | None]:
+def _start_service(command: str, cwd: str, scope: str = _DEFAULT_SCOPE) -> tuple[str, int | None]:
     """后台启动常驻服务，确认它还活着就立刻返回。
 
     前台等一个永不退出的进程，结果只能是等满 timeout 后报"超时"——模型拿到
@@ -330,8 +451,7 @@ def _start_service(command: str, cwd: str) -> tuple[str, int | None]:
             code or 1,
         )
 
-    with _TRACK_LOCK:
-        _TRACKED_PROCS.add(proc)
+    _track(scope, proc)
 
     port = _guess_port(command)
     # 进程活着只是"起来了"；敲一次门才算"能用"。
@@ -368,7 +488,66 @@ def _start_service(command: str, cwd: str) -> tuple[str, int | None]:
     return ("\n".join(lines), 0)
 
 
-def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]:
+def _is_verification(command: str) -> bool:
+    """这条命令是不是测试/编译类（超时就该判失败，而不是转后台）。"""
+    try:
+        from gangge.layer3_agent.loop import is_verification_command
+
+        return is_verification_command(command)
+    except Exception:  # noqa: BLE001 - 判不出来时按普通命令处理
+        return False
+
+
+class _OutputSink:
+    """边读边写内存缓冲；转后台后同时写日志文件。
+
+    进程的 stdout 已经连在这个读取线程上，没法"重新挂载"到文件；
+    所以让 sink 带一个可切换的文件句柄：转后台之后，后续输出继续写进日志。
+    """
+
+    def __init__(self) -> None:
+        self.buffer = StringIO()
+        self._file = None
+        self._lock = threading.Lock()
+
+    def write(self, text: str) -> None:
+        with self._lock:
+            self.buffer.write(text)
+            if self._file is not None:
+                try:
+                    self._file.write(text)
+                    self._file.flush()
+                except Exception:
+                    pass
+
+    def redirect(self, path: Path) -> None:
+        """把已有输出和后续输出都落到日志文件。"""
+        with self._lock:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self._file = path.open("a", encoding="utf-8", errors="replace")
+                self._file.write(self.buffer.getvalue())
+                self._file.flush()
+            except Exception:
+                self._file = None
+
+    def close(self) -> None:
+        with self._lock:
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+                self._file = None
+
+    def getvalue(self) -> str:
+        with self._lock:
+            return self.buffer.getvalue()
+
+
+def _run_command(
+    command: str, cwd: str, timeout: int, scope: str = _DEFAULT_SCOPE
+) -> tuple[str, int | None]:
     """
     在线程中同步执行命令，流式读取防死锁。
 
@@ -400,7 +579,9 @@ def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]
     else:
         cmd = ["bash", "-c", command]
 
-    output_buf = StringIO()
+    sink = _OutputSink()
+    last_output = [time.monotonic()]
+    verification = _is_verification(command)
 
     try:
         proc = subprocess.Popen(
@@ -420,29 +601,64 @@ def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]
         def read_output():
             try:
                 for line in proc.stdout:
-                    output_buf.write(line)
+                    sink.write(line)
+                    last_output[0] = time.monotonic()
             except Exception:
                 pass
+            finally:
+                sink.close()
 
-        with _TRACK_LOCK:
-            _TRACKED_PROCS.add(proc)
+        _track(scope, proc)
+        detached = False
         try:
             reader = threading.Thread(target=read_output, daemon=True)
             reader.start()
-            reader.join(timeout=timeout)
+            started = time.monotonic()
 
-            if reader.is_alive():
-                _kill_process_tree(proc)
+            # 分片等待，同时盯两件事：总时长超时、以及长时间没有新输出。
+            while True:
+                reader.join(0.5)
+                if not reader.is_alive():
+                    break
+                now = time.monotonic()
+                timed_out = (now - started) >= timeout
+                idle_out = (
+                    (not verification)
+                    and (now - last_output[0]) >= IDLE_DETACH_SECONDS
+                )
+                if not (timed_out or idle_out):
+                    continue
+                if verification:
+                    # 测试/构建超时 = 没通过：杀掉并如实报告，不能转后台让模型
+                    # 误以为"验证还在跑、大概没问题"。
+                    _kill_process_tree(proc)
+                    return (
+                        f"[超时] 命令执行超过 {timeout} 秒被终止\n"
+                        f"已获取输出:\n{sink.getvalue()[:500]}",
+                        None,
+                    )
+                # 普通命令：留在后台继续跑，本次先返回，任务不用陪着卡住。
+                log_path = Path(cwd) / ".gangge" / f"bg_{proc.pid}.log"
+                sink.redirect(log_path)
+                detached = True
+                reason = (
+                    f"超过 {timeout} 秒仍未结束"
+                    if timed_out
+                    else f"连续 {IDLE_DETACH_SECONDS} 秒没有任何输出"
+                )
                 return (
-                    f"[超时] 命令执行超过 {timeout} 秒被终止\n"
-                    f"已获取输出:\n{output_buf.getvalue()[:500]}",
-                    None,
+                    f"[已转入后台] 命令{reason}，已留在后台继续运行（PID {proc.pid}）。\n"
+                    f"日志: {log_path}（后续输出会写到这里）\n"
+                    f"停止: {_service_stop_hint(proc.pid)}\n"
+                    "注意：这是“没等到结果”，不等于成功；需要结果就稍后读日志，"
+                    "不要重复前台跑同一条命令。",
+                    0,
                 )
 
             proc.wait()
         finally:
-            with _TRACK_LOCK:
-                _TRACKED_PROCS.discard(proc)
+            if not detached:
+                _untrack(scope, proc)
 
     except FileNotFoundError:
         return ("[错误] 找不到命令执行器（powershell/bash）", None)
@@ -450,7 +666,7 @@ def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]
         return (f"[错误] {e}", None)
 
     exit_code = proc.returncode
-    result = output_buf.getvalue().strip()
+    result = sink.getvalue().strip()
 
     MAX_OUTPUT = 8000
     if len(result) > MAX_OUTPUT:
@@ -468,6 +684,7 @@ def _run_command(command: str, cwd: str, timeout: int) -> tuple[str, int | None]
         result = (result + diagnosis) if result else f"(无输出){diagnosis}"
 
     result += describe_port_conflict(result)
+    result += windows_command_hint(command, result)
 
     return (result or "(无输出)", exit_code)
 
@@ -487,6 +704,9 @@ class BashTool(BaseTool):
         return (
             "执行 shell 命令。用于运行编译、测试、安装依赖、启动服务器等。命令在项目工作目录下执行。\n"
             "注意：命令超时（默认 120 秒，上限 600 秒）后会被强制终止。\n"
+            "普通命令超时或长时间没有输出时会自动转入后台继续运行（返回 PID 和日志路径），"
+            "不会卡住整个任务；测试/构建类命令超时则判为失败。"
+            "会弹窗或等待输入的脚本会被直接拦下，不要用 bash 前台跑它们。\n"
             "启动 Web 服务器时直接写普通命令即可（例如 `python -m http.server 8000`、"
             "`npm run dev`、`uvicorn app:app`）：这类常驻命令会被自动改成后台启动，"
             "日志写到 .gangge/service.log，并返回 PID / 验证命令 / 停止命令。\n"
@@ -542,6 +762,24 @@ class BashTool(BaseTool):
             )
             timeout = MAX_TIMEOUT_SECONDS
 
+        # GUI / 等 input() 的脚本：前台跑必然阻塞到超时。直接拦下并给替代做法，
+        # 别把十分钟耗在等一个不会自己结束的窗口上。
+        reason = interactive_reason(command, workdir)
+        if reason:
+            return ToolResult(
+                output=(
+                    f"⚠️ 检测到交互式/GUI 程序（{reason}），没有前台运行。\n"
+                    f"它会一直等输入或进入事件循环，直到底层超时（最长 {MAX_TIMEOUT_SECONDS}s），"
+                    "拿到的基本只有一句“超时”。\n"
+                    "正确做法：\n"
+                    "1) 自测：把逻辑拆成可直接调用的函数，用 run_tests 或 "
+                    "`python -c \"import <模块>; <模块>.<函数>()\"` 调用具体函数；\n"
+                    "2) 给用户看界面：Windows 用 `Start-Process pythonw <脚本>` 后台打开，不阻塞。\n"
+                    "这一步不算验证，也不要再重复前台运行。"
+                ),
+                metadata={"interactive_guard": True},
+            )
+
         try:
             # 在默认线程池中运行同步命令，不阻塞 asyncio 事件循环
             loop = asyncio.get_running_loop()
@@ -549,11 +787,11 @@ class BashTool(BaseTool):
                 # 常驻服务：分离进程 + 日志文件，确认存活就返回，
                 # 不再等一个永远不会退出的进程。
                 output, exit_code = await loop.run_in_executor(
-                    None, _start_service, command, workdir
+                    None, _start_service, command, workdir, workdir
                 )
             else:
                 output, exit_code = await loop.run_in_executor(
-                    None, _run_command, command, workdir, timeout
+                    None, _run_command, command, workdir, timeout, workdir
                 )
             if capped_note:
                 output += capped_note

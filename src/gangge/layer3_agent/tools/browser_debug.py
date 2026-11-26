@@ -58,13 +58,25 @@ def _is_unavailable() -> str:
     return ""
 
 
+def _scope_key(scope: str | None) -> str:
+    """One canonical key per workspace, so ``.`` and its absolute path agree."""
+    if not scope:
+        return ""
+    try:
+        return os.path.abspath(scope)
+    except Exception:  # noqa: BLE001
+        return scope
+
+
 class _BrowserSession:
     """持久化浏览器会话 — 跨工具调用复用，空闲超时自动回收。
 
-    单例设计：同一时间只有一个浏览器实例，避免多 Agent 任务抢占资源。
+    按 workspace 隔离：以前是进程级单例，两个任务同时跑时共用一个 page，
+    导航和截图互相打断（A 截到的图可能是 B 刚打开的页面）。一个 workspace
+    仍然只用一个浏览器，资源不会随工具调用次数增长。
     """
 
-    _instance: _BrowserSession | None = None
+    _instances: dict[str, _BrowserSession] = {}
 
     def __init__(self) -> None:
         self._playwright = None
@@ -76,10 +88,25 @@ class _BrowserSession:
         self._cleanup_task: asyncio.Task | None = None
 
     @classmethod
-    def get_instance(cls) -> _BrowserSession:
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+    def get_instance(cls, scope: str = "") -> _BrowserSession:
+        key = _scope_key(scope)
+        session = cls._instances.get(key)
+        if session is None:
+            session = cls()
+            cls._instances[key] = session
+        return session
+
+    @classmethod
+    def close_instance(cls, scope: str = "") -> bool:
+        """Drop one workspace's browser (called when its task ends)."""
+        session = cls._instances.pop(_scope_key(scope), None)
+        if session is None:
+            return False
+        try:
+            asyncio.get_running_loop().create_task(session.close())
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            pass
+        return True
 
     def _touch(self) -> None:
         """更新最后活动时间。"""
@@ -184,6 +211,10 @@ class BrowserDebugTool(BaseTool):
     ⚠️ 仅允许访问 localhost / 127.0.0.1（任意端口），禁止外部 URL。
     """
 
+    def __init__(self, workspace: str = "") -> None:
+        # 浏览器会话按 workspace 隔离，这个字段就是那把钥匙。
+        self.workspace = workspace
+
     @property
     def name(self) -> str:
         return "browser_debug"
@@ -268,7 +299,7 @@ class BrowserDebugTool(BaseTool):
             return ToolResult(output=unavailable, is_error=True)
 
         action = kwargs["action"]
-        session = _BrowserSession.get_instance()
+        session = _BrowserSession.get_instance(self.workspace)
 
         try:
             if action == "navigate":

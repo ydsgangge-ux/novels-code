@@ -122,11 +122,70 @@ def write_text_preserving(
     path.write_bytes(bom + data.encode(encoding))
 
 
+#: read_file 的显示格式：`123: 代码` 或 `123| 代码`。
+_NUMBERED_LINE_RE = re.compile(r"^\s*\d+\s*[:|]\s?")
+
+_NUMBERED_DUMP_HINT = (
+    "❌ 你写入的内容每一行都带着行号前缀（形如 `123: `）。\n"
+    "那是 read_file 的显示格式，原样写进源码会立刻变成语法错误"
+    "（典型报错：Expected ',' found ':'）。\n"
+    "请去掉行号前缀重新提交，只保留真正的代码内容。"
+)
+
+
+def looks_like_numbered_dump(text: str) -> bool:
+    """内容是不是把 read_file 的输出整段回写了。
+
+    实测踩过：模型把带行号的文件片段当 content 写回，428 行的文件因此报
+    ``Expected ',' found ':'``，然后下一轮整文件重写一遍来"修"。检测成本
+    几乎为零，代价却是一整轮输出。
+
+    阈值取"至少 4 行且过半带前缀"，避免把 `1: 说明` 这类正文误判成污染。
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return False
+    hits = sum(1 for ln in lines if _NUMBERED_LINE_RE.match(ln))
+    return hits >= 4 and hits >= len(lines) * 0.5
+
+
+_SYMBOL_LINE_RE = re.compile(
+    r"^\s*(?:export\s+|pub(?:\([^)]*\))?\s+|async\s+|static\s+|public\s+|"
+    r"private\s+|protected\s+|final\s+|abstract\s+)*"
+    r"(?:def|fn|class|struct|interface|enum|trait|impl|function|type)\s+"
+    r"([A-Za-z_$][\w$]*)"
+)
+
+
+def _outline_of(text: str, limit: int = 40) -> str:
+    """给一个文件的“目录”：定义了哪些函数/类，带行号。
+
+    重复读取时不再只回“已读过”——历史滑窗可能已经把正文裁掉了，模型手里
+    其实什么都没有，只回一句提示会让它反复重读。给目录足够它决定改哪里。
+    """
+    lines = text.splitlines()
+    picked = [
+        f"{i:>6}: {ln.strip()[:100]}"
+        for i, ln in enumerate(lines, 1)
+        if _SYMBOL_LINE_RE.match(ln)
+    ]
+    if not picked:
+        # 没有可识别的定义（JSON/纯文本）：退回开头几行，别给空目录。
+        picked = [f"{i:>6}: {ln[:100]}" for i, ln in enumerate(lines[:12], 1)]
+    if len(picked) > limit:
+        picked = picked[:limit] + [f"…（其余 {len(picked) - limit} 个定义省略）"]
+    return "\n".join(picked)
+
+
 class ReadFileTool(BaseTool):
     """Read file contents."""
 
     def __init__(self, workspace: str = ""):
         self.workspace = workspace
+        # 同一任务里对同一文件、同一范围的重复读取先回目录；再重复就重新给
+        # 正文——历史滑窗裁掉后，模型手里其实没有内容，一味省略只会逼它死读。
+        # key -> (mtime_ns, size, total_lines, show_lines, duplicate_hits)
+        self._read_cache: dict[tuple[str, int, int], tuple[int, int, int, int, int]] = {}
 
     @property
     def name(self) -> str:
@@ -205,6 +264,41 @@ class ReadFileTool(BaseTool):
                     output=f"[图片文件] {path}\n格式: {ext}\n大小: {size} bytes",
                 )
 
+            cache_key = (
+                str(file_path.resolve()),
+                int(offset or 1),
+                -1 if limit is None else int(limit),
+            )
+            try:
+                stat = file_path.stat()
+                stamp = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                stamp = None
+            if stamp is not None:
+                cached = self._read_cache.get(cache_key)
+                if cached and cached[0] == stamp[0] and cached[1] == stamp[1]:
+                    if cached[4] < 1:
+                        # 第一次重复：回目录而不是空话。历史滑窗可能已经把上次的
+                        # 正文裁掉，只回“已读过”会让模型反复重读、直到被判定停滞。
+                        try:
+                            preview, *_ = read_text_preserving(file_path)
+                        except TextEncodingError:
+                            preview = file_path.read_text(encoding="utf-8", errors="replace")
+                        self._read_cache[cache_key] = (
+                            cached[0], cached[1], cached[2], cached[3], cached[4] + 1,
+                        )
+                        return ToolResult(
+                            output=(
+                                f"ℹ️ {path} 共 {cached[2]} 行，本次任务已读过、文件未修改。"
+                                "正文不再重复，下面是它的结构目录：\n"
+                                f"{_outline_of(preview)}\n\n"
+                                "改动直接 edit_file；确需某段正文就用 offset/limit 读该区间"
+                                "（同一区间再次请求会返回全文）。"
+                            ),
+                            metadata={"total_lines": cached[2], "duplicate_read": True},
+                        )
+                    # 第二次重复：模型显然没拿到正文，重新返回全文，别让它卡死。
+
             try:
                 content, *_ = read_text_preserving(file_path)
             except TextEncodingError:
@@ -222,6 +316,10 @@ class ReadFileTool(BaseTool):
             ]
             result = "\n".join(numbered)
             total_lines = len(lines)
+            if stamp is not None:
+                self._read_cache[cache_key] = (
+                    stamp[0], stamp[1], total_lines, len(selected), 0,
+                )
             metadata = {
                 "total_lines": total_lines,
                 "show_lines": len(selected),
@@ -296,6 +394,8 @@ class WriteFileTool(BaseTool):
                 output=f"❌ write_file 缺少内容参数。收到的参数: {list(kwargs.keys())}。请使用 path=\"{path}\", content=\"文件内容\"。",
                 is_error=True,
             )
+        if looks_like_numbered_dump(content):
+            return ToolResult(output=_NUMBERED_DUMP_HINT, is_error=True)
 
         try:
             # ── Force relative paths to resolve against workspace ──
@@ -406,6 +506,9 @@ class EditFileTool(BaseTool):
                 output=f"❌ edit_file 缺少 old_str 参数。收到的参数: {list(kwargs.keys())}。请使用 old_str=\"要替换的文本\"。",
                 is_error=True,
             )
+        # old_str 允许带行号（用于匹配已经被污染的文件），但写回去的必须是干净代码。
+        if new_str and looks_like_numbered_dump(new_str):
+            return ToolResult(output=_NUMBERED_DUMP_HINT, is_error=True)
 
         try:
             file_path = Path(path)

@@ -145,7 +145,7 @@ async def test_plain_read_only_command_is_allowed():
 @pytest.mark.asyncio
 async def test_ask_without_callback_stays_ask():
     """No callback must NOT silently become ALLOW — it stays a question."""
-    guard = PermissionGuard()
+    guard = PermissionGuard(policy=_policy((r"^python train", "ask")))
     result = await guard.check("bash", "python train.py")
     assert result.decision is PermissionDecision.ASK_USER
 
@@ -158,7 +158,7 @@ async def test_callback_is_consulted_and_can_deny():
         seen.append(request.action)
         return PermissionDecision.DENY
 
-    guard = PermissionGuard(ask_callback=ask)
+    guard = PermissionGuard(ask_callback=ask, policy=_policy((r"^python train", "ask")))
     result = await guard.check("bash", "python train.py")
     assert result.decision is PermissionDecision.DENY
     assert seen == ["python train.py"]
@@ -199,10 +199,11 @@ def test_scope_mapping_covers_tool_families():
 
 
 @pytest.mark.asyncio
-async def test_credential_read_asks():
+async def test_credential_read_is_allowed_in_danger_only_mode():
+    """当前默认策略只拦危险操作，读 .env 不再中断任务。"""
     guard = PermissionGuard()
     result = await guard.check("read_file", ".env")
-    assert result.decision is PermissionDecision.ASK_USER
+    assert result.decision is PermissionDecision.ALLOW
 
 
 @pytest.mark.asyncio

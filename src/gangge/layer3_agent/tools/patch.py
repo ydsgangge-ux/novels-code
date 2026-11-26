@@ -325,6 +325,11 @@ def _apply_update(op: FileOp, target: Path, workspace: Path) -> dict[str, Any]:
     for chunk in op.chunks:
         position, strategy = seek_sequence(lines, chunk.old, cursor)
         if position < 0:
+            if not chunk.old:
+                raise PatchError(
+                    f"{op.path} 的补丁块没有可定位的原文（old 部分为空）。\n"
+                    "请在补丁块里写出要替换的原始行，或改用 edit_file 指定 old_string。"
+                )
             hint = "\n".join(chunk.old[:8])
             raise PatchError(
                 f"{op.path} 的补丁块无法定位（上下文与文件内容不匹配）。\n"
