@@ -620,6 +620,9 @@ class AgenticLoop:
         self._last_streamed: int = 0  # chars already shown to the UI by streaming
         # 最近一次验证结果：滑窗/压缩会把它从历史里裁掉，所以每轮重新注入
         self._last_verification_note: str = ""
+        #: 待办全勾完但最近一次验证没过时，先拦一次收尾，把“修失败用例”喂回去。
+        self._pending_verification_fix: str = ""
+        self._verification_block_count: int = 0
         #: (path, offset, limit) → (mtime, round)。同一段被反复读时直接
         #: 返回"未变化"，而不是把同样的内容再塞进上下文。
         self._recent_reads: dict[tuple[str, int, int], tuple[float, int]] = {}
@@ -2573,6 +2576,10 @@ class AgenticLoop:
             return f"[MCP:{server}] {name}"
         return tool_name
 
+    def _verification_failed(self) -> bool:
+        """最近一次验证是不是失败状态（``❌`` 开头）。"""
+        return (self._last_verification_note or "").strip().startswith("❌")
+
     async def _post_round_outcome(
         self,
         *,
@@ -2695,9 +2702,29 @@ class AgenticLoop:
 
         todo_state = self.todo_state
         if todo_state.get_all() and not todo_state.get_pending():
+            # 待办全勾完 ≠ 任务完成：最近一次验证如果没过，不能就这么收尾。
+            # 实测一次 53 轮的运行，结束时测试还是 "6 failed"，模型却把所有
+            # 待办勾完直接退出——用户只能自己回来问“为什么坏了”。
+            if self._verification_failed() and self._verification_block_count < 2:
+                self._verification_block_count += 1
+                self._pending_verification_fix = (
+                    "最近一次验证没有通过，不能把待办全部标记为完成。"
+                    "先修掉失败的用例/报错，再重新验证；确实验证不了，就如实说明卡在哪。"
+                )
+                await self._emit(ContentBlock(
+                    type=ContentType.TEXT,
+                    text="⚠️ 最近一次验证未通过，暂不收尾，继续修复\n",
+                ))
+                return None, consecutive_readonly_rounds, stalled_rounds
+
+            still_failing = self._verification_failed()
             await self._emit(ContentBlock(
                 type=ContentType.TEXT,
-                text="📋 所有任务已完成，自动退出\n",
+                text=(
+                    "⚠️ 验证仍未通过，已按待办完成收尾\n"
+                    if still_failing
+                    else "📋 所有任务已完成，自动退出\n"
+                ),
             ))
             return (
                 await self._finish_turn(
@@ -2705,7 +2732,9 @@ class AgenticLoop:
                     executions=executions,
                     round_num=round_num,
                     total_tokens=total_tokens,
-                    completion_reason="all_todos_done",
+                    completion_reason=(
+                        "verification_failed" if still_failing else "all_todos_done"
+                    ),
                     has_modified_files=has_modified_files,
                     shadow_checkpoint=shadow_checkpoint,
                 ),
@@ -2841,6 +2870,8 @@ class AgenticLoop:
             )
         self._last_verification_note = ""
         self._last_validation = ""
+        self._pending_verification_fix = ""
+        self._verification_block_count = 0
         if not _should_keep_todos:
             todo_state.clear()
             # new task: don't exit until model creates at least one todo。
@@ -2956,6 +2987,15 @@ class AgenticLoop:
                 type=ContentType.TEXT,
                 text=f"\n[dim]── 第 {round_num + 1} 轮 ──[/dim]\n",
             ))
+
+            # 待办勾完但验证没过：上一轮已拦下收尾，这里把修复指令喂回去。
+            if self._pending_verification_fix:
+                note = self._pending_verification_fix
+                self._pending_verification_fix = ""
+                messages.append(Message(
+                    role=Role.USER,
+                    content=[ContentBlock(type=ContentType.TEXT, text=note)],
+                ))
 
             # ── Cancel check: allow external stop button to interrupt ──
             if self._cancel_check and self._cancel_check():
@@ -3237,7 +3277,25 @@ class AgenticLoop:
                 # ── Check Todo state: if all tasks completed, exit immediately ──
                 todo_pending = todo_state.get_pending()
                 if not todo_pending and todo_state.get_all():
-                    # All todos completed — exit regardless of what model says
+                    # All todos completed —但验证没过时先别收尾（见 _post_round_outcome）
+                    if self._verification_failed() and self._verification_block_count < 2:
+                        self._verification_block_count += 1
+                        await self._emit(ContentBlock(
+                            type=ContentType.TEXT,
+                            text="⚠️ 最近一次验证未通过，暂不收尾，继续修复\n",
+                        ))
+                        messages.append(Message(
+                            role=Role.USER,
+                            content=[ContentBlock(
+                                type=ContentType.TEXT,
+                                text=(
+                                    "最近一次验证没有通过。不要收尾，先修掉失败的用例/报错，"
+                                    "再重新验证一次，确认通过后再结束。"
+                                ),
+                            )],
+                        ))
+                        idle_rounds = 0
+                        continue
                     await self._emit(ContentBlock(
                         type=ContentType.TEXT,
                         text="📋 所有任务已完成，自动退出\n",
