@@ -126,7 +126,7 @@ def is_service_command(command: str) -> bool:
 
 #: 裸跑一个 Python 脚本：`python xxx.py`（不带管道/参数）。
 _BARE_PY_RE = re.compile(
-    r"^\s*(?:python[0-9.]*|py)\s+(?:-\w+\s+)*[\"']?([^\s\"']+\.py)[\"']?\s*$",
+    r"^\s*(?:python[0-9.]*w?|pyw?)\s+(?:-\w+\s+)*[\"']?([^\s\"']+\.py)[\"']?\s*$",
     re.IGNORECASE,
 )
 _GUI_MARKERS = (
@@ -171,6 +171,11 @@ _WIN_CMD_ALIASES = {
     "which": "Get-Command",
     "pip": "python -m pip",
     "python3": "python",
+    "pythonw": "pythonw",
+    "wc": "(Get-Content <文件> | Measure-Object -Line).Lines",
+    "find": "Get-ChildItem -Recurse -Filter <模式>",
+    "mv": "Move-Item",
+    "cp": "Copy-Item",
 }
 _NOT_RECOGNIZED_MARKERS = (
     "is not recognized as the name",

@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, AsyncIterator
 
@@ -30,6 +31,28 @@ from gangge.layer5_llm.base import (
 from gangge.layer5_llm.thinking import deep_merge, infer_provider, plan_thinking
 
 logger = logging.getLogger(__name__)
+
+
+def _tail_is_repetitive(text: str, window: int = 6000) -> bool:
+    """最近一段推理是不是在复读：同一句反复出现，几乎没有新内容。
+
+    只看尾部（常数级开销）。真正的深度思考即使很长，尾段也在推进；
+    复读的尾段是同一组句子循环。用它配合"总长门槛"才掐断，避免误伤
+    正常的长推理（实测有 13 万字符的有效思考）。
+    """
+    tail = (text or "")[-window:]
+    parts = [
+        p.strip()
+        for p in re.split(r"[。！？!?\n]+", tail)
+        if len(p.strip()) >= 12
+    ]
+    if len(parts) < 8:
+        return False
+    counts: dict[str, int] = {}
+    for part in parts:
+        key = part[:60]
+        counts[key] = counts.get(key, 0) + 1
+    return max(counts.values()) >= 4 and len(counts) / len(parts) <= 0.5
 
 # ── Retry configuration ──
 MAX_RETRIES = 3
@@ -406,6 +429,19 @@ class OpenAICompatLLM(BaseLLM):
         stream = await self._open_stream(kwargs)
         iterator = stream.__aiter__()
         got_first = False
+        #: 单轮思考字符数，以及这一轮有没有产出正文/工具调用。
+        #: 只思考、不动手，又写到几万字符，基本就是复读（见下方 reasoning_loop）。
+        reasoning_chars = 0
+        saw_action = False
+        reasoning_parts: list[str] = []
+        try:
+            # 复读检查的最低总长；0 = 关闭流式掐断（只留轮末检测）。
+            reasoning_loop_min = int(
+                os.environ.get("LLM_REASONING_LOOP_MIN_CHARS", "30000") or 30000
+            )
+        except (TypeError, ValueError):
+            reasoning_loop_min = 30000
+        next_loop_check = reasoning_loop_min
         while True:
             # 按 chunk 间隔计时，而不是给整次调用设总时长：只要服务端还在发
             # （包括 reasoning 增量），就不算卡死。
@@ -445,14 +481,18 @@ class OpenAICompatLLM(BaseLLM):
             if delta is None:
                 continue
             if delta.content:
+                saw_action = True
                 yield ContentBlock(type=ContentType.TEXT, text=delta.content)
             reasoning = getattr(delta, "reasoning_content", None) or getattr(
                 delta, "reasoning", None
             )
             if reasoning:
+                reasoning_chars += len(reasoning)
+                reasoning_parts.append(reasoning)
                 yield ContentBlock(type=ContentType.THINKING, text=reasoning)
 
             for tc in getattr(delta, "tool_calls", None) or []:
+                saw_action = True
                 index = getattr(tc, "index", 0) or 0
                 slot = pending.setdefault(index, {"id": "", "name": "", "args": ""})
                 if tc.id:
@@ -463,6 +503,29 @@ class OpenAICompatLLM(BaseLLM):
                         slot["name"] += function.name
                     if function.arguments:
                         slot["args"] += function.arguments
+
+            # 只思考、没动作、尾段又在复读：在流式阶段掐断。
+            # 不设"多少字符就掐"的硬上限：max_tokens 本来就是总闸，
+            # 纯按长度会误伤有效的长推理（实测有 13 万字符的正常思考）。
+            if (
+                not saw_action
+                and reasoning_loop_min > 0
+                and reasoning_chars >= next_loop_check
+            ):
+                next_loop_check = reasoning_chars + 20000
+                if _tail_is_repetitive("".join(reasoning_parts)):
+                    try:
+                        closer = getattr(stream, "close", None)
+                        if closer is not None:
+                            result = closer()
+                            if hasattr(result, "__await__"):
+                                await result
+                    except Exception:  # noqa: BLE001 - 关闭失败不影响已拿到的内容
+                        logger.debug("[LLM] 关闭流失败", exc_info=True)
+                    yield ContentBlock(
+                        type=ContentType.TEXT, text="", stop_reason="reasoning_loop"
+                    )
+                    return
 
             if choice.finish_reason in ("tool_calls", "stop") and pending:
                 for block in _flush():

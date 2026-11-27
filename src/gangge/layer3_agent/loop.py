@@ -189,6 +189,65 @@ def thinking_carryover_note(response: Any, max_chars: int = 1200) -> str:
     )
 
 
+def _reasoning_text(response: Any) -> str:
+    """取一轮回复里的 reasoning 正文（可能为空）。"""
+    blocks = getattr(response, "content", None) or []
+    return "\n".join(
+        block.text.strip()
+        for block in blocks
+        if getattr(block, "type", None) == ContentType.THINKING
+        and getattr(block, "text", "")
+    ).strip()
+
+
+def reasoning_repeats_itself(text: str) -> bool:
+    """单轮内部就在复读：同一句出现多次，或唯一句占比过低。
+
+    实测 GLM-4.7-flash 会在一轮里把"我注意到转换过程中存在一些微妙的细节…"
+    这样的四句话原样重写十几遍，长度不算大，但一句新内容都没有。
+    """
+    raw = (text or "").strip()
+    if len(raw) < 600:
+        return False
+    parts = [
+        p.strip()
+        for p in re.split(r"[。！？!?\n]+", raw)
+        if len(p.strip()) >= 12
+    ]
+    if len(parts) < 6:
+        return False
+    counts: dict[str, int] = {}
+    for part in parts:
+        key = part[:60]
+        counts[key] = counts.get(key, 0) + 1
+    if max(counts.values()) >= 3:
+        return True
+    return len(counts) / len(parts) <= 0.35
+
+
+def reasoning_is_looping(prev: str, cur: str) -> bool:
+    """两轮推理是不是在绕同一段话，而不是往前推进。
+
+    弱模型（实测 GLM-4.7-flash）会把同一段分析反复重写：长度从 3 万涨到
+    11 万字符，结论一个字没变。它每轮都在"重新发现"同一个 KeyError。
+    按句子集合算重合度，比整段比较更稳——模型会换几个字，但句子几乎一样。
+    """
+    a = " ".join((prev or "").split())
+    b = " ".join((cur or "").split())
+    if len(a) < 800 or len(b) < 800:
+        return False
+
+    def sentences(text: str) -> set[str]:
+        parts = re.split(r"[。！？!?\n]+", text)
+        return {p.strip()[:60] for p in parts if len(p.strip()) >= 12}
+
+    sa, sb = sentences(a), sentences(b)
+    if not sa or not sb:
+        return False
+    overlap = len(sa & sb) / max(1, len(sa | sb))
+    return overlap >= 0.6
+
+
 def _with_thinking_note(prompt: str, note: str) -> str:
     """把分析笔记拼在指令前面；没有笔记时原样返回。"""
     if not note:
@@ -370,6 +429,23 @@ class LoopConfig:
     compression_threshold: float = float(
         os.environ.get("COMPRESSION_THRESHOLD", "0.80") or 0.80
     )
+
+    # ── Token-budget history（推荐）：高水位才压缩 ──
+    # 每轮裁剪/回缩都会改写历史前缀，让 prompt cache 失效；而命中价通常
+    # 只有未命中的 1/20–1/50。保留稳定的前缀（哪怕原始 prompt 更大）
+    # 比"每轮少发一点"更便宜。超过高水位时一次裁到低水位。
+    enable_token_budget_history: bool = os.environ.get(
+        "TOKEN_BUDGET_HISTORY", "1"
+    ).strip().lower() not in ("0", "false", "off", "no")
+    history_high_water_tokens: int = int(
+        os.environ.get("HISTORY_HIGH_WATER_TOKENS", "120000") or 120000
+    )
+    history_low_water_tokens: int = int(
+        os.environ.get("HISTORY_LOW_WATER_TOKENS", "60000") or 60000
+    )
+    #: 距上一轮超过这么久，前缀缓存多半已过期；这一轮做一次免费瘦身
+    #: （只回缩写入正文，不调 LLM），把必然未命中的 prompt 变小。
+    cache_ttl_seconds: int = int(os.environ.get("CACHE_TTL_SECONDS", "600") or 600)
 
     # ── Sliding window: keep only recent N rounds, discard older ──
     enable_sliding_window: bool = True
@@ -623,6 +699,9 @@ class AgenticLoop:
         #: 待办全勾完但最近一次验证没过时，先拦一次收尾，把“修失败用例”喂回去。
         self._pending_verification_fix: str = ""
         self._verification_block_count: int = 0
+        #: 思考循环检测：上一轮的 reasoning，以及连续重复的轮数。
+        self._last_reasoning_text: str = ""
+        self._thinking_loop_streak: int = 0
         #: (path, offset, limit) → (mtime, round)。同一段被反复读时直接
         #: 返回"未变化"，而不是把同样的内容再塞进上下文。
         self._recent_reads: dict[tuple[str, int, int], tuple[float, int]] = {}
@@ -1569,7 +1648,9 @@ class AgenticLoop:
             ))
         return compact
 
-    def _trim_history(self, messages: list[Message]) -> list[Message]:
+    def _trim_history(
+        self, messages: list[Message], keep_rounds: int | None = None
+    ) -> list[Message]:
         """Sliding window: keep only recent N rounds, discard older messages.
 
         A "round" is a boundary the model can act from (see
@@ -1580,7 +1661,9 @@ class AgenticLoop:
 
         This is simpler and more reliable than summary compression.
         """
-        max_rounds = self.config.max_history_rounds
+        max_rounds = (
+            self.config.max_history_rounds if keep_rounds is None else keep_rounds
+        )
         if max_rounds <= 0:
             return messages
 
@@ -1636,7 +1719,68 @@ class AgenticLoop:
     #: Tools whose arguments carry a whole file body worth compressing.
     _BULKY_TOOL_ARGS = ("write_file", "apply_patch")
 
-    def _shrink_tool_use_args(self, messages: list[Message]) -> list[Message]:
+    def _history_high_water(self) -> int:
+        """历史输入的高水位（token）。超过它才压缩；0 = 关闭。"""
+        high = int(self.config.history_high_water_tokens or 0)
+        if high <= 0:
+            return 0
+        window = int(getattr(self.llm, "max_context_tokens", 0) or 0)
+        if window > 0:
+            # 小窗口模型（32K/64K）不能等到 12 万；而且必须给输出上限留够
+            # 空间——128K 窗口配 64K 输出时，80% 的高水位会把它挤爆。
+            max_out = int(
+                getattr(self.llm, "max_tokens", 0) or self.config.max_tokens or 0
+            )
+            reserve = int(max_out * 1.1) + 8000
+            window_high = max(8000, window - reserve)
+            high = min(
+                high,
+                int(window * self.config.compression_threshold),
+                window_high,
+            )
+        return max(0, high)
+
+    def _history_low_water(self, high: int) -> int:
+        """压缩后要降到的目标（token）。一次裁一大块，别每轮挪一格。"""
+        low = int(self.config.history_low_water_tokens or 0)
+        if low <= 0 or (high > 0 and low >= high):
+            low = high // 2
+        return max(1, low)
+
+    def _compact_history(
+        self,
+        messages: list[Message],
+        target_tokens: int,
+        ref_tokens: int,
+        round_num: int,
+    ) -> list[Message]:
+        """一次压到位：回缩旧写入正文 + 裁到目标预算。
+
+        只在超过高水位时调用。平时不改历史，保持前缀稳定，让 prompt cache
+        在连续轮次之间命中——命中价通常只有未命中的 1/20–1/50。
+        """
+        boundaries = self._round_boundaries(messages)
+        if not boundaries:
+            return messages
+        # ``ref_tokens`` 是上一轮实际 prompt（含系统提示），拿它算每轮均值
+        # 会偏高，于是保留的轮数偏少；方向是"多裁一点"，可接受。
+        avg = ref_tokens / len(boundaries)
+        keep = max(2, int(target_tokens / avg)) if avg > 0 else self.config.max_history_rounds
+        keep = min(keep, max(1, len(boundaries) - 1))
+        compacted = self._trim_history(messages, keep_rounds=keep)
+        # 压缩本来就是一次大跳变，没必要再为缓存保留写入正文。
+        compacted = self._shrink_tool_use_args(compacted, keep_rounds=0)
+        logger.info(
+            "[Loop] 高水位压缩: 第 %d 轮，保留 %d 轮（目标 %d tok）",
+            round_num,
+            keep,
+            target_tokens,
+        )
+        return compacted
+
+    def _shrink_tool_use_args(
+        self, messages: list[Message], keep_rounds: int | None = None
+    ) -> list[Message]:
         """Replace file bodies inside older tool calls with a placeholder.
 
         ``write_file`` carries the entire file as an argument, which means the
@@ -1652,14 +1796,19 @@ class AgenticLoop:
         them appending to a history the loop no longer reads.
         """
         limit = self.config.tool_use_arg_max_chars
-        keep_rounds = max(0, self.config.tool_use_arg_keep_rounds)
+        keep = max(
+            0,
+            self.config.tool_use_arg_keep_rounds
+            if keep_rounds is None
+            else keep_rounds,
+        )
         if not self.config.enable_tool_use_arg_trim or limit <= 0:
             return messages
 
         boundaries = self._round_boundaries(messages)
-        if len(boundaries) <= keep_rounds:
+        if len(boundaries) <= keep:
             return messages
-        frozen_until = boundaries[-keep_rounds] if keep_rounds else len(messages)
+        frozen_until = boundaries[-keep] if keep else len(messages)
 
         shrunk = 0
         for i in range(frozen_until):
@@ -1691,7 +1840,7 @@ class AgenticLoop:
 
         if shrunk:
             logger.debug(
-                "[Loop] 已回缩 %d 处历史工具调用正文（保留最近 %d 轮完整）", shrunk, keep_rounds
+                "[Loop] 已回缩 %d 处历史工具调用正文（保留最近 %d 轮完整）", shrunk, keep
             )
         return messages
 
@@ -2872,6 +3021,8 @@ class AgenticLoop:
         self._last_validation = ""
         self._pending_verification_fix = ""
         self._verification_block_count = 0
+        self._last_reasoning_text = ""
+        self._thinking_loop_streak = 0
         if not _should_keep_todos:
             todo_state.clear()
             # new task: don't exit until model creates at least one todo。
@@ -2904,6 +3055,8 @@ class AgenticLoop:
         # 最近一次请求的输入 token 数 ≈ 当前上下文占用。压缩阈值必须看它，
         # 不能看 total_tokens（那是全程累计值，只会单调上涨）。
         last_request_tokens = 0
+        #: 上一轮开始的时间。用来判断"距上次请求是否超过缓存 TTL"。
+        self._last_round_at = 0.0
         has_modified_files = False
         any_tool_succeeded = False
         consecutive_readonly_rounds = 0  # Track rounds with only read tools
@@ -2942,6 +3095,9 @@ class AgenticLoop:
                     merged.update(prev)
                     file_registry[rel] = merged
             messages[:] = self.compact_history_for_continue(messages)
+            # 跨会话留下的历史里可能带着上一段任务的写入正文全文；
+            # 一次性瘦身，避免"继续"的第一发就带上几十个文件。
+            self._shrink_tool_use_args(messages, keep_rounds=0)
             continue_state = self._build_dynamic_state_text(round_num=0)
             file_list_summary = ""
             if file_registry:
@@ -3033,57 +3189,98 @@ class AgenticLoop:
             current_phase = self.tools.get_current_phase()
             tool_defs = self._get_all_tool_defs(phase=current_phase)
 
-            # ── Token-based auto compression ──
-            # 判据是"上一次请求实际占了窗口多少"，不是全程累计 token。
-            # 用累计值会得到单调上涨的比例（100%→200%→400%），于是每轮都压、
-            # 把历史压没了还继续报"使用率 454%"。
+            # ── History compaction: 高水位 / 缓存变冷时才动手 ──
+            # 平时不改历史：每轮裁剪/回缩会改写前缀，把可命中的内容变成
+            # 未命中。命中价通常只有未命中的 1/20–1/50，保留稳定前缀更划算。
             if round_num > 0:
-                if last_request_tokens > 0 and self.llm.max_context_tokens > 0:
-                    usage_ratio = last_request_tokens / self.llm.max_context_tokens
-                    if usage_ratio > self.config.compression_threshold:
+                if self.config.enable_token_budget_history:
+                    high = self._history_high_water()
+                    low = self._history_low_water(high)
+                    now = time.monotonic()
+                    gap = (now - self._last_round_at) if self._last_round_at else 0.0
+                    cold = (
+                        self.config.cache_ttl_seconds > 0
+                        and gap >= self.config.cache_ttl_seconds
+                    )
+                    if high > 0 and last_request_tokens >= high:
                         _before = len(messages)
-                        messages = await self._compress_history(messages, round_num)
-                        _after = len(messages)
-                        if _after < _before:
-                            await self._emit(ContentBlock(
-                                type=ContentType.TEXT,
-                                text=f"\n📦 上下文压缩: 使用率 {usage_ratio:.0%}，已自动压缩旧对话\n",
-                            ))
-                        else:
-                            # 压缩没生效（历史太短或没有安全切点）：退回滑窗。
-                            # 不然这一轮会带着超窗口的请求直接去撞 API。
-                            messages = self._trim_history(messages)
-                        # Experimental: record compression event
+                        messages = self._compact_history(
+                            messages, low, last_request_tokens, round_num
+                        )
+                        await self._emit(ContentBlock(
+                            type=ContentType.TEXT,
+                            text=(
+                                f"\n📦 上下文压缩: 上轮 {last_request_tokens} tok，"
+                                f"已裁到约 {low} tok（{_before}→{len(messages)} 条）\n"
+                            ),
+                        ))
                         self.emitter.emit_metrics(
                             round=round_num,
                             compression_before=_before,
-                            compression_after=_after,
+                            compression_after=len(messages),
                             compressed=True,
-                            usage_ratio=usage_ratio,
+                            usage_ratio=(
+                                last_request_tokens / self.llm.max_context_tokens
+                                if self.llm.max_context_tokens
+                                else 0.0
+                            ),
                         )
-                elif self.config.enable_sliding_window:
-                    # Fallback: sliding window
-                    messages = self._trim_history(messages)
-                elif (
-                    self.config.enable_summary_compression
-                    and round_num % self.config.summary_compression_interval == 0
-                ):
-                    messages = await self._compress_history(messages, round_num)
-                    await self._emit(ContentBlock(
-                        type=ContentType.TEXT,
-                        text=f"\n📦 历史压缩: 第 {round_num} 轮\n",
-                    ))
+                    elif cold:
+                        # 缓存多半已过期：下一发无论如何都是全量未命中。
+                        # 这时只做不花钱的本地瘦身，把必然未命中的 prompt 变小。
+                        messages = self._shrink_tool_use_args(messages, keep_rounds=0)
+                        if reads_cache:
+                            messages = self._deduplicate_reads(
+                                messages, reads_cache, round_num + 1
+                            )
+                        await self._emit(ContentBlock(
+                            type=ContentType.TEXT,
+                            text=(
+                                f"\n🧊 距上轮 {int(gap)}s，缓存可能已过期，"
+                                "已瘦身旧写入\n"
+                            ),
+                        ))
+                else:
+                    # 旧路径：每轮滑窗/摘要压缩（会打碎缓存，仅作回退）
+                    if last_request_tokens > 0 and self.llm.max_context_tokens > 0:
+                        usage_ratio = last_request_tokens / self.llm.max_context_tokens
+                        if usage_ratio > self.config.compression_threshold:
+                            _before = len(messages)
+                            messages = await self._compress_history(messages, round_num)
+                            _after = len(messages)
+                            if _after < _before:
+                                await self._emit(ContentBlock(
+                                    type=ContentType.TEXT,
+                                    text=f"\n📦 上下文压缩: 使用率 {usage_ratio:.0%}，已自动压缩旧对话\n",
+                                ))
+                            else:
+                                # 压缩没生效（历史太短或没有安全切点）：退回滑窗。
+                                messages = self._trim_history(messages)
+                            self.emitter.emit_metrics(
+                                round=round_num,
+                                compression_before=_before,
+                                compression_after=_after,
+                                compressed=True,
+                                usage_ratio=usage_ratio,
+                            )
+                    elif self.config.enable_sliding_window:
+                        messages = self._trim_history(messages)
+                    elif (
+                        self.config.enable_summary_compression
+                        and round_num % self.config.summary_compression_interval == 0
+                    ):
+                        messages = await self._compress_history(messages, round_num)
+                        await self._emit(ContentBlock(
+                            type=ContentType.TEXT,
+                            text=f"\n📦 历史压缩: 第 {round_num} 轮\n",
+                        ))
+                    messages = self._shrink_tool_use_args(messages)
+                    if reads_cache:
+                        messages = self._deduplicate_reads(
+                            messages, reads_cache, round_num + 1
+                        )
 
-            # ── Shrink bulky tool-call bodies in older rounds ──
-            # 与压缩/裁剪独立：即使没触发压缩，写过的文件正文也不该每轮重发。
-            # 每轮都跑，包括跨会话后的第一轮 —— 上一段会话留在历史里的
-            # write_file 正文（几十个文件的全文）同样要瘦，否则"继续"一句话
-            # 的第一发就要带上整段旧历史。
-            messages = self._shrink_tool_use_args(messages)
-
-            # ── Deduplicate repeated file reads to save tokens ──
-            if round_num > 0 and reads_cache:
-                messages = self._deduplicate_reads(messages, reads_cache, round_num + 1)
+            self._last_round_at = time.monotonic()
 
             # ── Inject dynamic state as a user message (NOT into system prompt) ──
             # This keeps the static system prompt byte-identical for API caching.
@@ -3240,6 +3437,33 @@ class AgenticLoop:
                 text = response.text or ""
                 truncated = response.stop_reason == "max_tokens"
                 truncation_streak = truncation_streak + 1 if truncated else 0
+
+                # 思考循环检测：同一段分析反复重写时，回放它只会让循环继续。
+                cur_reasoning = _reasoning_text(response)
+                # 适配器在流式阶段掐断的（思考超长且无动作）也算循环。
+                aborted_reasoning = response.stop_reason == "reasoning_loop"
+                loop_hit = (
+                    aborted_reasoning
+                    or reasoning_repeats_itself(cur_reasoning)
+                    or reasoning_is_looping(self._last_reasoning_text, cur_reasoning)
+                )
+                self._thinking_loop_streak = (
+                    self._thinking_loop_streak + 1 if loop_hit else 0
+                )
+                if cur_reasoning:
+                    self._last_reasoning_text = cur_reasoning
+                if loop_hit:
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text=(
+                            "🔁 思考复读被中止：本轮只输出推理、没有动作，已停止生成\n"
+                            if aborted_reasoning
+                            else (
+                                f"🔁 检测到思考重复（连续 {self._thinking_loop_streak} 轮），"
+                                "本轮不再回放分析\n"
+                            )
+                        ),
+                    ))
                 if truncated and truncation_streak >= 2:
                     # 连续两轮都被思考吃光输出：自动降思考强度，否则下一轮
                     # 大概率继续截断（实测同一任务连撞三次，白等几分钟）。
@@ -3273,6 +3497,12 @@ class AgenticLoop:
                     if self.config.enable_thinking_carryover
                     else ""
                 )
+                if loop_hit:
+                    # 重复的推理再喂回去就是"自我强化"：它会把同一段话再推一遍。
+                    idle_note = ""
+                elif len(cur_reasoning) > 20000:
+                    # 单轮就写了几万字符：只保留最后一点结论，别把整段分析带回下一轮。
+                    idle_note = thinking_carryover_note(response, 400)
 
                 # ── Check Todo state: if all tasks completed, exit immediately ──
                 todo_pending = todo_state.get_pending()
@@ -3418,7 +3648,21 @@ class AgenticLoop:
                         type=ContentType.TEXT,
                         text=f"⚠️ AI 未使用工具，仍有待办任务{todo_hint}\n",
                     ))
-                    if truncated:
+                    if self._thinking_loop_streak >= 2:
+                        # 光说"别重复"没用，得换一种定位方式：用运行结果说话。
+                        force_msg = (
+                            "你已经连续多轮重复同一段分析，而且这一轮又没有调用工具。"
+                            "停止推演，也不要再读同一段代码。换用数据定位："
+                            "用 bash 写一个 5 行以内的最小脚本，打印关键输入和中间值，"
+                            "根据实际输出判断问题，然后 edit_file 只改一处。"
+                        )
+                    elif self._thinking_loop_streak == 1:
+                        force_msg = (
+                            "你这一轮的分析和上一轮几乎一样，没有推进。"
+                            "停止重复分析，立刻执行一个具体动作："
+                            "bash 打印实际运行值，或 edit_file 改一处。"
+                        )
+                    elif truncated:
                         force_msg = (
                             "你上一条回复在推理中途触发输出上限被截断，没有产生工具调用。"
                             "请从分析笔记的末尾接着想，不要从头重写；"

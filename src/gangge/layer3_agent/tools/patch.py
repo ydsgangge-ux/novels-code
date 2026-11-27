@@ -306,6 +306,34 @@ def _apply_delete(op: FileOp, target: Path) -> dict[str, Any]:
     }
 
 
+def _nearest_hint(lines: list[str], old: list[str]) -> str:
+    """补丁没定位到时，告诉模型文件里最接近的实际行，省一次 read_file。"""
+    probes = [ln.strip() for ln in old if ln.strip()][:3]
+    if not probes:
+        return ""
+    for probe in probes:
+        for i, line in enumerate(lines):
+            if probe and probe in line:
+                return f"第 {i + 1} 行已有相同内容: {line.strip()[:120]}"
+    import difflib
+
+    best_ratio, best_no, best_line = 0.0, -1, ""
+    for probe in probes:
+        for i, line in enumerate(lines):
+            candidate = line.strip()
+            if not candidate:
+                continue
+            ratio = difflib.SequenceMatcher(None, probe, candidate).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_no, best_line = ratio, i + 1, candidate
+    if best_ratio >= 0.6:
+        return (
+            f"最接近的是第 {best_no} 行（相似度 {best_ratio:.0%}）: "
+            f"{best_line[:120]}"
+        )
+    return ""
+
+
 def _apply_update(op: FileOp, target: Path, workspace: Path) -> dict[str, Any]:
     if not target.exists():
         raise PatchError(
@@ -331,10 +359,12 @@ def _apply_update(op: FileOp, target: Path, workspace: Path) -> dict[str, Any]:
                     "请在补丁块里写出要替换的原始行，或改用 edit_file 指定 old_string。"
                 )
             hint = "\n".join(chunk.old[:8])
+            near = _nearest_hint(lines, chunk.old)
             raise PatchError(
                 f"{op.path} 的补丁块无法定位（上下文与文件内容不匹配）。\n"
                 f"期望的上下文片段:\n{hint}\n"
-                "请先用 read_file 查看当前内容，再按实际文本重写该块。"
+                + (f"{near}\n" if near else "")
+                + "请按上面的实际行重写该块，或直接用 edit_file。"
             )
         logger.debug("[patch] %s chunk at %s (%s)", op.path, position, strategy)
         lines[position : position + len(chunk.old)] = chunk.new
